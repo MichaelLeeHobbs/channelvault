@@ -27,7 +27,7 @@ A team running Mirth can keep every channel, code template and script in git, re
 
 1. ~~**Scoped push with a preview.**~~ Done (2026-09-24).
 2. **Per-environment values.**
-   - The same tree deploys to dev and prod, with values from `--env-file .env.dev` or `.env.prod`.
+   - The same tree deploys to dev and prod, with values from `--dotenv .env.dev` or `.env.prod`.
    - The mechanism already exists; what's missing is a documented promotion workflow and a test that promotes between two servers.
 3. **Global scripts as files.** Today they stay inline in `server/configuration.json`.
 4. **Safe to script.**
@@ -105,3 +105,7 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - Key-name matching missed credentials in URLs, connection strings, headers and scripts. The detector scans every value, and `pull`/`explode` write nothing until each finding is extracted (`--extract-secrets`) or allowed in the committed `channelvault.allow.json`. Refusing beats warning: a warning scrolls past and the secret lands in git.
 - Findings are reported by location and kind only. Extraction replaces just the secret substring, so scripts stay readable and `render` restores them exactly.
 - When a pull changes a value already in `.env`, the old file is copied to `.secrets/` (git-ignored) and only the newest 5 are kept. Rejected: unlimited history, which leaves every past password in plain text on disk.
+
+**2026-09-24: Findings from the first real-config trial (40 channels, 112 code templates, Mirth 4.5.2, isolated server).**
+- Round trip exact, 39 secrets moved to `.env`, scoped push and `diff` converge.
+- Fixed from the trial: a configuration-map value (JSON with CRLF) that no dotenv quoting can carry is stored as `cv-base64:`; `.env` is written before the tree, so a failed write never leaves placeholders without values; the default-value idiom `apiKey = apiKey || '…'` is detected, and a known secret repeated in plain text is warned about; a lone CR is treated like other line endings (Mirth rewrites it as LF on save, which made push re-send forever); `--env-file` became `--dotenv` because Node scans the whole command line for `--env-file`; unused arguments are an error (a script runner's literal `--` had silently dropped `--extract-secrets`); `channelvault.json` is not rewritten for a timestamp alone.

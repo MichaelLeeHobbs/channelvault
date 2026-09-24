@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { scanSecrets, type SecretKind } from '../src/secrets/detect.js';
-import { backupEnvFile, ENV_BACKUPS_KEPT } from '../src/secrets/envfile.js';
+import { findEchoes, scanSecrets, type SecretKind } from '../src/secrets/detect.js';
+import { backupEnvFile, ENV_BACKUPS_KEPT, formatValue, parseEnv, readEnvFile, updateEnvFile } from '../src/secrets/envfile.js';
 import { render, templatize } from '../src/secrets/index.js';
 import { XmlConfigAdapter } from '../src/xml/index.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
@@ -264,5 +264,73 @@ describe('CLI: explode with secrets inside values', () => {
     await writeFile(path.join(tree, 'channelvault.allow.json'), JSON.stringify({ ignore }));
     const r = cli('explode', backupXml, tree);
     expect(r.status, r.stderr).toBe(0);
+  });
+});
+
+describe('env values dotenv cannot carry', () => {
+  it('stores a CRLF value with quotes base64-encoded and reads it back exactly', async () => {
+    const value = '{\r\n  "alerts": ["a", "b"]\r\n}';
+    const formatted = formatValue(value);
+    expect(formatted).toMatch(/^cv-base64:/);
+    expect(parseEnv(`K=${formatted}`)['K']).toBe(value);
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-b64-'));
+    try {
+      const file = path.join(dir, '.env');
+      await updateEnvFile(file, { K: value, PLAIN: 'abc' });
+      expect(await readEnvFile(file)).toEqual({ K: value, PLAIN: 'abc' });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps plain values readable', () => {
+    expect(formatValue('abc123')).toBe('abc123');
+    expect(formatValue('has space')).toBe("'has space'");
+  });
+});
+
+describe('CLI safety', () => {
+  const repo = fileURLToPath(new URL('..', import.meta.url));
+  const fixture = path.join(repo, 'test', 'fixtures', 'serverConfiguration.sample.xml');
+  const cli = (...args: string[]) =>
+    spawnSync(process.execPath, ['--import', 'tsx', path.join(repo, 'src', 'cli.ts'), ...args], { cwd: repo, encoding: 'utf8' });
+
+  it('leaves the tree untouched when the env file cannot be written', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-order-'));
+    try {
+      const tree = path.join(dir, 'tree');
+      const envIsADirectory = path.join(dir, 'env-dir');
+      await mkdir(envIsADirectory);
+      const r = cli('explode', fixture, tree, '--dotenv', envIsADirectory);
+      expect(r.status).toBe(1);
+      expect(existsSync(path.join(tree, 'channels'))).toBe(false);
+      expect(existsSync(path.join(tree, 'server'))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('rejects an argument it would otherwise drop, such as a flag after a literal --', () => {
+    const r = cli('status', 'tree', '--', '--extract-secrets');
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('too many arguments');
+  });
+});
+
+describe('repeats of a known secret', () => {
+  it('finds the default-value idiom', () => {
+    const script = "apiKey = apiKey || 'k-1234567890abcdef';";
+    const { findings, config, envUpdates } = scanSecrets(withScript(script), { mode: 'extract' });
+    expect(findings.map((f) => f.kind)).toEqual(['assignment']);
+    expect(scriptOf(config)).toBe("apiKey = apiKey || '{{env:LAB_FEED__DEPLOYSCRIPT__PASSWORD}}';");
+    expect(scriptOf(render(config, envUpdates))).toBe(script);
+    expect(scanSecrets(withScript("token = opts.token ?? 'Hunter22!';"), { mode: 'find' }).findings).toHaveLength(1);
+  });
+
+  it('reports a known value still in plain text somewhere no rule matched', () => {
+    const cfg = withScript("callApi('https://x.example.org', 'k-1234567890abcdef');");
+    expect(findEchoes(cfg, { API_KEY: 'k-1234567890abcdef', SHORT: 'callApi' })).toEqual([
+      { name: 'API_KEY', where: 'Lab Feed › deployScript' },
+    ]);
   });
 });

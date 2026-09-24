@@ -67,7 +67,7 @@ channelvault status <dir>                   # summary of a tree
 `explode` and `pull` never write credentials into the tree. Connector passwords, tokens and secrets, and every configuration-map value, become `{{env:NAME}}` placeholders, and their values go to `<dir>/.env`, which is added to the tree's `.gitignore`. `push` and `implode` fill the placeholders back in and refuse to run if any are missing, naming each one.
 
 - You can add placeholders yourself anywhere, in JSON or in a `.js` file (for example `"host": "{{env:DB_HOST}}"`). A re-pull keeps them as long as they still resolve to what the server holds.
-- `--env-file .env.prod` selects another environment. Variables already set in the process environment take precedence over the file, so CI can supply them directly.
+- `--dotenv .env.prod` selects another environment. Variables already set in the process environment take precedence over the file, so CI can supply them directly.
 - A password rotated on the server updates `.env` on the next `pull`, and `diff` reports it by name only. The previous env file is kept in the tree's `.secrets/` (git-ignored, newest 5 only) whenever a value in it changes. An extracted secret inside a script survives server-side edits to the rest of that script.
 
 Secrets inside values are caught too: credentials in URLs and connection strings, `Authorization` headers, `createDatabaseConnection(…, 'password')` calls, password/key assignments in scripts, private keys, and AWS, GitHub, Slack and JWT tokens. If `pull` or `explode` finds one, it writes nothing and lists each finding by location and kind (never the value). Then either:

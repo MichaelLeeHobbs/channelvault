@@ -372,3 +372,11 @@ it('ignores tag and dependency fields that Mirth flips between absent and null',
   Object.assign(ch(remote, 0)['exportData'] as Obj, { channelTags: null, dependentIds: null, dependencyIds: null });
   expect(planPush(server(), remote).changes).toEqual([]);
 });
+
+it('treats a lone CR like any other line ending (Mirth rewrites both as LF on save)', () => {
+  const local = server();
+  ch(local, 0)['deployScript'] = '// ack\rhl7Listener(msg);';
+  const remote = server();
+  ch(remote, 0)['deployScript'] = '// ack\nhl7Listener(msg);';
+  expect(planPush(local, remote).changes).toEqual([]);
+});

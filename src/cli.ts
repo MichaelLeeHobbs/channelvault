@@ -22,11 +22,11 @@ import { Command } from 'commander';
 import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
 import { createMirthClient, type MirthClientExt } from './client/index.js';
-import { channelsOf, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
+import { channelsOf, normalizeEolDeep, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
 import { render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
-import { formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
+import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
 
 const engine = createExplodeEngine();
@@ -171,18 +171,25 @@ async function writeMeta(root: string, source: string, config: CanonicalConfig):
           : null,
     resources: resourceIds(config),
   };
-  await writeFile(path.join(root, 'channelvault.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8');
+  // A pull that changed nothing else must not leave a timestamp-only change
+  // for git to show.
+  const file = path.join(root, 'channelvault.json');
+  if (existsSync(file)) {
+    const previous = JSON.parse(await readFile(file, 'utf8')) as SyncMeta;
+    if (JSON.stringify({ ...previous, pulledAt: '' }) === JSON.stringify({ ...meta, pulledAt: '' })) return;
+  }
+  await writeFile(file, JSON.stringify(meta, null, 2) + '\n', 'utf8');
 }
 
 // --- secrets / env ----------------------------------------------------------
 
 interface EnvFlags {
-  envFile?: string;
+  dotenv?: string;
   extractSecrets?: boolean;
 }
 
 function envFilePath(root: string, flags: EnvFlags): string {
-  return flags.envFile ? path.resolve(flags.envFile) : path.join(root, '.env');
+  return flags.dotenv ? path.resolve(flags.dotenv) : path.join(root, '.env');
 }
 
 /** The env file overlaid with the process environment (which wins, as in CI). */
@@ -191,7 +198,9 @@ async function loadEnv(file: string): Promise<Record<string, string | undefined>
 }
 
 function addEnvFlag(cmd: Command): Command {
-  return cmd.option('--env-file <path>', 'env file holding secrets and per-environment values (default <dir>/.env)');
+  // Not --env-file: Node scans the whole command line for that name and parses
+  // the file itself (it fails on a directory and honours NODE_OPTIONS in it).
+  return cmd.option('--dotenv <path>', 'env file holding secrets and per-environment values (default <dir>/.env)');
 }
 
 function addExtractFlag(cmd: Command): Command {
@@ -245,19 +254,32 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   }
   const config = scan.config;
   const envUpdates = { ...templated.envUpdates, ...scan.envUpdates };
+  // A known secret repeated somewhere no rule recognised is still in plain
+  // text; say where (the env file's own values only, not all of process.env).
+  const echoes = findEchoes(config, { ...(await readEnvFile(envFile)), ...envUpdates });
+
+  // Secrets first: a tree whose placeholders have no values behind them is
+  // the one state a pull must never leave. If the env file can't be written,
+  // the tree is untouched.
+  await mkdir(root, { recursive: true });
+  await mkdir(path.dirname(envFile), { recursive: true });
+  const rel = path.relative(root, envFile);
+  const envInTree = !rel.startsWith('..') && !path.isAbsolute(rel);
+  const backup = await backupEnvFile(envFile, envUpdates, path.join(root, '.secrets'));
+  if (backup || (envInTree && Object.keys(envUpdates).length > 0)) await ensureEnvIgnored(root);
+  await updateEnvFile(envFile, envUpdates);
 
   await clearManaged(root);
   await engine.explode(config, { root });
   await writeMeta(root, source, config);
-  const backup = await backupEnvFile(envFile, envUpdates, path.join(root, '.secrets'));
-  await updateEnvFile(envFile, envUpdates);
-  const rel = path.relative(root, envFile);
-  if (backup || (existsSync(envFile) && !rel.startsWith('..') && !path.isAbsolute(rel))) await ensureEnvIgnored(root);
   if (scan.findings.length > 0) process.stdout.write(`extracted ${scan.findings.length} secret(s) found in values\n`);
   const updated = Object.keys(envUpdates).length;
   if (updated > 0) process.stdout.write(`stored ${updated} secret value(s) in ${envFile}\n`);
   if (backup) process.stdout.write(`previous env file kept as ${backup}\n`);
   for (const note of templated.notes) process.stderr.write(`note: ${note}\n`);
+  for (const e of echoes) {
+    process.stderr.write(`warning: the value of ${e.name} also appears in plain text at ${e.where}\n`);
+  }
 }
 
 async function clearManaged(root: string): Promise<void> {
@@ -511,7 +533,11 @@ const program = new Command();
 program
   .name('channelvault')
   .description('Git-style pull/push/diff for Mirth Connect')
-  .version('0.1.0');
+  .version('0.1.0')
+  // An unused argument is almost always a flag lost in transit (e.g. a script
+  // runner passing a literal `--`); fail rather than silently drop it.
+  // Subcommands defined below inherit this.
+  .allowExcessArguments(false);
 
 addExtractFlag(addEnvFlag(
   program
@@ -631,8 +657,9 @@ addEnvFlag(addConnectionFlags(
   // Redact both sides the same way, so neither can print a secret and a raw
   // secret held on both sides doesn't read as a difference.
   const allow = await readAllow(root);
-  const treeView = scanSecrets(tree, { mode: 'redact', allow });
-  const serverView = scanSecrets(templatedRemote, { mode: 'redact', allow });
+  // Line endings are normalised too: push ignores them because Mirth rewrites them on save.
+  const treeView = scanSecrets(normalizeEolDeep(tree), { mode: 'redact', allow });
+  const serverView = scanSecrets(normalizeEolDeep(templatedRemote), { mode: 'redact', allow });
   if (treeView.findings.length > 0) {
     process.stderr.write(`note: the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets\n`);
   }

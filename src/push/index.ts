@@ -37,13 +37,26 @@ const nameOf = (o: Obj): string => String(o['name'] ?? o['id']);
 const revisionOf = (o: Obj): number => Number(o['revision'] ?? 0);
 
 /**
- * Key-order-insensitive structural equality. CRLF and LF compare equal: Mirth
- * drops the CR when it saves a channel (seen on 4.5.2), so a CR-only
- * difference can never be pushed and would otherwise re-appear on every run.
+ * Mirth rewrites every line ending (CRLF, and a lone CR too) as LF when it
+ * saves a channel (seen on 4.5.2), so a line-ending-only difference can never
+ * be pushed and would otherwise re-appear on every run.
  */
+export function normalizeEol(s: string): string {
+  return s.replace(/\r\n?/g, '\n');
+}
+
+/** `normalizeEol` applied to every string in a config (for display, e.g. `diff`). */
+export function normalizeEolDeep<T extends Json>(value: T): T {
+  if (typeof value === 'string') return normalizeEol(value) as T;
+  if (Array.isArray(value)) return value.map((v) => normalizeEolDeep(v)) as T;
+  if (isObj(value)) return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, normalizeEolDeep(v)])) as T;
+  return value;
+}
+
+/** Key-order-insensitive structural equality, ignoring line-ending style. */
 function same(a: Json | undefined, b: Json | undefined): boolean {
   if (a === b) return true;
-  if (typeof a === 'string' && typeof b === 'string') return a.replace(/\r\n/g, '\n') === b.replace(/\r\n/g, '\n');
+  if (typeof a === 'string' && typeof b === 'string') return normalizeEol(a) === normalizeEol(b);
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => same(x, b[i]));
   if (isObj(a) && isObj(b)) {
     const ka = Object.keys(a);

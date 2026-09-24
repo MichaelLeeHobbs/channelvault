@@ -117,11 +117,12 @@ const RULES: Rule[] = [
   { kind: 'db-connection-call', suffix: 'DB_PASSWORD', spans: dbConnectionSpans },
   // name = 'literal' where the name ends in a secret word: password, dbPassword,
   // db_password, DB_PASSWORD, apiKey, authToken… (not tokenizer, not ==).
+  // Also the default-value idiom: apiKey = apiKey || 'literal' (or ??).
   {
     kind: 'assignment',
     suffix: 'PASSWORD',
     spans: regexSpans(
-      /(?<![\w$])[\w$]*?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|token)["']?\s*[:=]\s*(["'])([^"'{}\s]{4,})\1/gi,
+      /(?<![\w$])[\w$]*?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|token)["']?\s*[:=]\s*(?:[\w$.[\]'"]+\s*(?:\|\||\?\?)\s*)?(["'])([^"'{}\s]{4,})\1/gi,
       2,
     ),
   },
@@ -237,6 +238,25 @@ export function scanSecrets(config: CanonicalConfig, opts: { mode: ScanMode; all
   });
 
   return { config: out, findings, envUpdates };
+}
+
+/**
+ * Known secret values that still appear verbatim somewhere in `config`: a
+ * repeat no rule recognised (a default argument, a URL fragment). Values
+ * shorter than 8 characters are skipped; short ones such as a database name
+ * reused as a password match too much ordinary text.
+ */
+export function findEchoes(config: CanonicalConfig, secrets: Env): Array<{ name: string; where: string }> {
+  const values = Object.entries(secrets).filter((e): e is [string, string] => typeof e[1] === 'string' && e[1].length >= 8);
+  const out: Array<{ name: string; where: string }> = [];
+  if (values.length === 0) return out;
+  mapLeaves(config, (value, leaf) => {
+    for (const [name, secret] of values) {
+      if (value.includes(secret)) out.push({ name, where: [...leaf.labels, leaf.key].join(' › ') });
+    }
+    return value;
+  });
+  return out;
 }
 
 export function formatFindings(findings: Finding[]): string {

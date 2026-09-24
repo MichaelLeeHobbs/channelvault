@@ -8,26 +8,43 @@ import * as path from 'node:path';
 
 import { parse } from 'dotenv';
 
+/**
+ * Marks a value stored base64-encoded because no dotenv quoting can carry it
+ * exactly (dotenv turns CRLF into LF, and each quote style excludes some
+ * characters), e.g. a configuration-map JSON with Windows line endings.
+ */
+const BASE64_PREFIX = 'cv-base64:';
+
+/** Parse env-file text, decoding values channelvault had to store base64-encoded. */
+export function parseEnv(text: string): Record<string, string> {
+  const out = parse(text);
+  for (const [k, v] of Object.entries(out)) {
+    if (v.startsWith(BASE64_PREFIX)) out[k] = Buffer.from(v.slice(BASE64_PREFIX.length), 'base64').toString('utf8');
+  }
+  return out;
+}
+
 export async function readEnvFile(file: string): Promise<Record<string, string>> {
   if (!existsSync(file)) return {};
-  return parse(await readFile(file, 'utf8'));
+  return parseEnv(await readFile(file, 'utf8'));
 }
 
 /**
- * Serialize a value so dotenv parses it back unchanged. Tries bare, single,
- * backtick and double quotes in turn and proves the choice by parsing it.
+ * Serialize a value so it reads back unchanged. Tries bare, single, backtick
+ * and double quotes in turn and proves the choice by parsing it; falls back to
+ * base64 for values none of them can carry.
  */
 export function formatValue(value: string): string {
   const candidates = [
-    /^[\w@%+=:,./-]*$/.test(value) ? value : null,
+    /^[\w@%+=:,./-]*$/.test(value) && !value.startsWith(BASE64_PREFIX) ? value : null,
     value.includes("'") ? null : `'${value}'`,
     value.includes('`') ? null : `\`${value}\``,
     value.includes('"') ? null : `"${value.replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`,
   ];
   for (const c of candidates) {
-    if (c !== null && parse(`K=${c}`)['K'] === value) return c;
+    if (c !== null && parseEnv(`K=${c}`)['K'] === value) return c;
   }
-  throw new Error('value cannot be represented in a .env file (it mixes quote characters with escapes)');
+  return `${BASE64_PREFIX}${Buffer.from(value, 'utf8').toString('base64')}`;
 }
 
 /** Set `updates` in `file`, replacing existing assignments in place and appending new ones. */
@@ -73,7 +90,7 @@ export const ENV_BACKUPS_KEPT = 5;
  */
 export async function backupEnvFile(file: string, updates: Record<string, string>, dir: string): Promise<string | null> {
   if (!existsSync(file)) return null;
-  const current = parse(await readFile(file, 'utf8'));
+  const current = parseEnv(await readFile(file, 'utf8'));
   if (!Object.entries(updates).some(([k, v]) => current[k] !== undefined && current[k] !== v)) return null;
 
   await mkdir(dir, { recursive: true });
