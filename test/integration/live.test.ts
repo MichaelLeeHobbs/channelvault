@@ -16,6 +16,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createMirthClient, type MirthClientExt } from '../../src/client/index.js';
 import { createExplodeEngine } from '../../src/explode/index.js';
+import { channelsOf, findChannel, planPush } from '../../src/push/index.js';
+import { applyPlan } from '../../src/push/apply.js';
 import type { ClientConfig } from '../../src/types.js';
 
 const HOST = process.env.MIRTH_HOST;
@@ -85,6 +87,46 @@ maybe('live Mirth server', () => {
       await expect(
         client.putServerConfiguration(remote, { deploy: false, overwriteConfigMap: false }),
       ).resolves.toBeUndefined();
+    },
+    SERVER_TIMEOUT,
+  );
+
+  it(
+    'scoped push changes one channel script, keeps its tags, and then has nothing left to push',
+    async () => {
+      const remote = await client.getServerConfiguration();
+      // Use a tagged channel, or the tag assertion below would compare nothing.
+      let id: string | undefined;
+      let tagsBefore: unknown;
+      for (const c of channelsOf(remote)) {
+        const tags = ((await client.getChannel(String(c['id'])))?.['exportData'] as Record<string, unknown>)['channelTags'];
+        if (tags) {
+          id = String(c['id']);
+          tagsBefore = tags;
+          break;
+        }
+      }
+      if (!id) throw new Error('no tagged channel on the live server; load test/fixtures/serverConfiguration.sample.xml');
+
+      const local = structuredClone(remote);
+      const original = findChannel(local, id)!['deployScript'];
+      findChannel(local, id)!['deployScript'] = `// channelvault live test\n${String(original)}`;
+      try {
+        const plan = planPush(local, remote);
+        expect(plan.changes.map((c) => `${c.op} ${c.id}`)).toEqual([`update ${id}`]);
+        const result = await applyPlan(client, plan, local, remote, {});
+        expect(result.failed).toBeUndefined();
+
+        const after = await client.getServerConfiguration();
+        expect(findChannel(after, id)!['deployScript']).toBe(findChannel(local, id)!['deployScript']);
+        expect(planPush(local, after).changes).toEqual([]);
+        expect(((await client.getChannel(id))?.['exportData'] as Record<string, unknown>)['channelTags']).toEqual(tagsBefore);
+      } finally {
+        // The full GET copy carries the tags; the server-configuration copy would drop them.
+        const restore = (await client.getChannel(id))!;
+        restore['deployScript'] = original!;
+        await client.putChannel(restore);
+      }
     },
     SERVER_TIMEOUT,
   );

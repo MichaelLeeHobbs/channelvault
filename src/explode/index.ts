@@ -14,6 +14,7 @@
  * Invariant: `implode(explode(config))` deep-equals `config`.
  */
 
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
@@ -856,6 +857,9 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
   if (Array.isArray(value)) {
     const out: Json[] = [];
     for (const item of value) {
+      // A collection member whose file is gone was deleted from the tree
+      // (e.g. `rm -r channels/<name>`), so it is dropped, not an error.
+      if (isRefMarker(item) && !existsSync(resolveWithinRoot(root, jsonDir, item['@ref']))) continue;
       out.push(await resolveMarkers(item, jsonDir, root));
     }
     return out;
@@ -877,6 +881,8 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
   if (isPlainObject(value)) {
     const out: Record<string, Json> = {};
     for (const [k, v] of Object.entries(value)) {
+      // Same for a one-member collection, which explode stores as a bare marker.
+      if (isRefMarker(v) && !existsSync(resolveWithinRoot(root, jsonDir, v['@ref']))) continue;
       out[k] = await resolveMarkers(v, jsonDir, root);
     }
     return out;

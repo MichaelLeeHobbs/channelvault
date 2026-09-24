@@ -180,6 +180,17 @@ describe('createMirthClient', () => {
         body: 'boom',
       });
     });
+
+    it("puts a plain-text reason in the message, but not an HTML error page", async () => {
+      fetchMock
+        .mockResolvedValueOnce(loginResponse())
+        .mockResolvedValueOnce(new Response('Script compile error\n at line 3', { status: 500, statusText: 'Server Error' }))
+        .mockResolvedValueOnce(new Response('<html><body>Request failed.</body></html>', { status: 500, statusText: 'Server Error' }));
+
+      const client = createMirthClient(CONFIG);
+      await expect(client.deployChannel('c1')).rejects.toThrow('HTTP 500: Server Error: Script compile error at line 3');
+      await expect(client.deployChannel('c1')).rejects.toThrow(/^HTTP 500: Server Error$/);
+    });
   });
 
   describe('401 re-auth', () => {

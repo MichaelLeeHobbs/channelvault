@@ -55,7 +55,7 @@ Global scripts, server settings, alerts and the configuration map stay inline in
 channelvault explode <backup.xml> <dir>     # XML  -> tree
 channelvault implode <dir> <backup.xml>     # tree -> XML
 channelvault pull <dir>                     # live server -> tree
-channelvault push <dir>                     # tree -> live server (whole-server replace)
+channelvault push <dir>                     # changed channels/templates -> live server
 channelvault diff <dir>                     # tree vs live server
 channelvault status <dir>                   # summary of a tree
 ```
@@ -72,9 +72,21 @@ channelvault status <dir>                   # summary of a tree
 
 ## Pushing
 
-**`push` replaces the entire server configuration.** Anything on the server that is missing from your tree is deleted, and its confirmation prompt does not list deletions yet. Run `diff` first.
+`push` sends only what changed, one resource at a time: channels, code templates (and library membership), and global scripts. It prints the plan and asks before applying it.
 
-After a `push`, Mirth bumps each saved channel's `revision`, so re-`pull` to resync.
+```
+channelvault push ./mirth                                # everything that changed
+channelvault push ./mirth --channel "ADT Router"         # just this channel (repeat --channel for more)
+channelvault push ./mirth --library Formatting --deploy  # one library, then redeploy the channels using it
+```
+
+- **Deletions** (a channel directory or template you removed) need `--allow-deletes`. Something created on the server since your last pull is never treated as a deletion; `push` leaves it alone and says so.
+- **Conflicts**: if the server's copy has a newer revision than your tree (someone saved it in the Administrator since your last pull), `push` refuses. Pull, merge in git, and push again, or pass `--force`.
+- **`--deploy`** redeploys the channels that changed and the channels a changed code-template library is enabled for, but only those deployed on the server right now; it never starts a channel someone took down. Failures are reported per channel.
+- After a push the tree's revision numbers are updated from the server, so `diff` and the next `push` stay clean.
+- Server settings, the configuration map, channel groups and tags are **not** pushed; `push` names them if they differ. `--whole-server` replaces the entire server configuration instead. It shows the same change list and needs the same `--allow-deletes` / `--force`, and it can't be combined with `--channel` or `--library`.
+- A tree exploded from an XML backup is refused (its shape differs from the live API's); `--ignore-origin` overrides that.
+- Without a terminal, `push` needs `--yes`.
 
 ## Local test server
 

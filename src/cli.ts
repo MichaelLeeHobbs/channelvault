@@ -22,6 +22,8 @@ import { Command } from 'commander';
 import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
 import { createMirthClient, type MirthClientExt } from './client/index.js';
+import { channelsOf, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
+import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
 import { render, templatize } from './secrets/index.js';
 import { ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
@@ -31,9 +33,16 @@ const xml = new XmlConfigAdapter();
 
 // --- helpers --------------------------------------------------------------
 
+/** A user-facing error: printed without a stack trace. */
+class CliError extends Error {}
+
+/**
+ * Abort the command. Throws rather than calling process.exit so open
+ * connections close first; exiting while undici sockets are closing crashes
+ * Node on Windows with a libuv assertion.
+ */
 function fail(message: string): never {
-  process.stderr.write(`error: ${message}\n`);
-  process.exit(1);
+  throw new CliError(message);
 }
 
 /** Directories under a working tree that `explode` owns (cleared before a pull). */
@@ -97,6 +106,7 @@ async function withClient<T>(flags: ConnectionFlags, fn: (client: MirthClientExt
     return await fn(client);
   } finally {
     await client.logout().catch(() => undefined);
+    await client.close().catch(() => undefined);
   }
 }
 
@@ -141,6 +151,8 @@ interface SyncMeta {
   source: string;
   pulledAt: string;
   engineVersion: string | null;
+  /** Resource ids the tree held at pull time (see Known in src/push). Absent in older trees. */
+  resources?: Known;
 }
 
 async function writeMeta(root: string, source: string, config: CanonicalConfig): Promise<void> {
@@ -156,6 +168,7 @@ async function writeMeta(root: string, source: string, config: CanonicalConfig):
         : typeof config['@version'] === 'string'
           ? (config['@version'] as string)
           : null,
+    resources: resourceIds(config),
   };
   await writeFile(path.join(root, 'channelvault.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8');
 }
@@ -271,11 +284,185 @@ async function assertCompatibleOrigin(
     wants === 'live'
       ? `this working tree was exploded from an XML backup, but 'push' sends to a live server. ` +
         `The two transports use different config shapes and the normalization bridge is not implemented yet, ` +
-        `so pushing would upload a config the Mirth API cannot parse. Seed the tree with 'pull' instead, or pass --force to override.`
+        `so pushing would upload a config the Mirth API cannot parse. Seed the tree with 'pull' instead, or pass --ignore-origin to override.`
       : `this working tree was pulled from a live server, but 'implode' writes a backup XML. ` +
         `The two transports use different config shapes and the normalization bridge is not implemented yet, ` +
         `so imploding would produce malformed XML. Re-create the tree with 'explode' from a backup, or pass --force to override.`;
   fail(msg);
+}
+
+/** Commander collector for a repeatable option; undefined until first used. */
+function collect(value: string, previous: string[] | undefined): string[] {
+  return [...(previous ?? []), value];
+}
+
+// --- push ---------------------------------------------------------------------
+
+/** Resource ids recorded at the last pull, if this tree has them. */
+async function readKnown(root: string): Promise<Known | undefined> {
+  const metaPath = path.join(root, 'channelvault.json');
+  if (!existsSync(metaPath)) return undefined;
+  return (JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta).resources;
+}
+
+async function writeKnown(root: string, known: Known): Promise<void> {
+  const metaPath = path.join(root, 'channelvault.json');
+  if (!existsSync(metaPath)) return;
+  const meta = JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta;
+  if (!meta.resources) return; // an older tree: leave it to the next pull
+  meta.resources = known;
+  await writeFile(metaPath, JSON.stringify(meta, null, 2) + '\n', 'utf8');
+}
+
+/** The tree now knows what it created and has forgotten what it deleted. */
+function afterChanges(known: Known, applied: Change[]): Known {
+  const key = { channel: 'channels', library: 'libraries', codeTemplate: 'codeTemplates' } as const;
+  const next: Known = { channels: [...known.channels], libraries: [...known.libraries], codeTemplates: [...known.codeTemplates] };
+  for (const c of applied) {
+    if (c.kind === 'globalScripts') continue;
+    const ids = next[key[c.kind]];
+    if (c.op === 'create' && !ids.includes(c.id)) ids.push(c.id);
+    if (c.op === 'delete') next[key[c.kind]] = ids.filter((id) => id !== c.id);
+  }
+  return next;
+}
+
+function printChanges(plan: Plan): void {
+  const kindLabel: Record<Change['kind'], string> = { channel: 'channel', library: 'library', codeTemplate: 'code template', globalScripts: '' };
+  for (const c of plan.changes) process.stdout.write(`  ${c.op.padEnd(6)}  ${`${kindLabel[c.kind]} ${c.label}`.trim()}\n`);
+}
+
+/** Refuse conflicts and deletions unless the user opted in. */
+function checkPlan(plan: Plan, flags: { allowDeletes?: boolean; force?: boolean }): void {
+  if (plan.conflicts.length > 0 && !flags.force) {
+    fail(
+      `changed on the server since the last pull:\n  ${plan.conflicts.join('\n  ')}\n` +
+        `pull (and merge) first, or pass --force to overwrite the server's version`,
+    );
+  }
+  const deletes = plan.changes.filter((c) => c.op === 'delete').length;
+  if (deletes > 0 && !flags.allowDeletes) {
+    fail(`the plan deletes ${deletes} resource(s) from the server; pass --allow-deletes, or narrow with --channel/--library`);
+  }
+}
+
+interface PushFlags {
+  allowDeletes?: boolean;
+  deploy?: boolean;
+  force?: boolean;
+  yes?: boolean;
+  overwriteConfigMap?: boolean;
+}
+
+async function scopedPush(
+  client: MirthClientExt,
+  root: string,
+  local: CanonicalConfig,
+  scope: Scope,
+  target: string,
+  flags: PushFlags,
+): Promise<void> {
+  const remote = await client.getServerConfiguration();
+  const known = await readKnown(root);
+  const plan = planPush(local, remote, scope, known);
+  const names = new Map(
+    [...channelsOf(remote), ...channelsOf(local)].map((c) => [String(c['id']), String(c['name'])] as const),
+  );
+  const nameOf = (id: string): string => names.get(id) ?? id;
+
+  // --deploy refreshes what is running; it never starts a channel that is not
+  // deployed now (an operator may have taken it down on purpose).
+  const deployed = flags.deploy && plan.deployIds.length > 0 ? await client.getDeployedChannelIds() : new Set<string>();
+  const toDeploy = plan.deployIds.filter((id) => deployed.has(id));
+  const notDeployed = flags.deploy ? plan.deployIds.filter((id) => !deployed.has(id)) : [];
+
+  if (plan.changes.length === 0) {
+    process.stdout.write(`nothing to push: ${target} already matches the tree\n`);
+  } else {
+    process.stdout.write(`Push to ${target}:\n`);
+    printChanges(plan);
+    if (toDeploy.length > 0) process.stdout.write(`then redeploy: ${toDeploy.map(nameOf).join(', ')}\n`);
+    if (notDeployed.length > 0) {
+      process.stdout.write(`not redeployed (not deployed on the server now): ${notDeployed.map(nameOf).join(', ')}\n`);
+    }
+  }
+  if (plan.notPushed.length > 0) {
+    process.stdout.write(`not pushed (differs; use --whole-server): ${plan.notPushed.join(', ')}\n`);
+  }
+  if (plan.serverOnly.length > 0) {
+    process.stdout.write(`left alone (created on the server since the last pull; pull to get them): ${plan.serverOnly.join(', ')}\n`);
+  }
+  if (plan.changes.length === 0) return;
+
+  checkPlan(plan, flags);
+  if (!flags.yes && !(await confirm('Continue?'))) {
+    process.stdout.write('aborted.\n');
+    return;
+  }
+
+  const result = await applyPlan(client, plan, local, remote, scope);
+  // Record the server's new revisions even after a partial failure, so the
+  // resources that did go through don't read as conflicts next time.
+  if (result.touchedIds.size > 0) {
+    await refreshRevisions(root, await client.getServerConfiguration(), result.touchedIds);
+  }
+  if (known) await writeKnown(root, afterChanges(known, result.applied));
+  if (result.failed) {
+    const { change, error } = result.failed;
+    fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}`);
+  }
+  process.stdout.write(`pushed ${result.applied.length} change(s)\n`);
+
+  if (toDeploy.length > 0) {
+    const failures = await deployChannels(client, toDeploy, nameOf);
+    process.stdout.write(`deployed ${toDeploy.length - failures.length} of ${toDeploy.length} channel(s)\n`);
+    for (const f of failures) process.stderr.write(`deploy failed: ${f.name}: ${f.error}\n`);
+    if (failures.length > 0) process.exitCode = 1;
+  }
+}
+
+/** The full replace, gated like a scoped push: it lists and guards deletions and conflicts too. */
+async function wholeServerPush(
+  client: MirthClientExt,
+  root: string,
+  local: CanonicalConfig,
+  target: string,
+  flags: PushFlags,
+): Promise<void> {
+  const remote = await client.getServerConfiguration();
+  const known = await readKnown(root);
+  const plan = planPush(local, remote, {}, known);
+  const s = summarize(local);
+  process.stdout.write(
+    `Replace the ENTIRE server configuration at ${target} (${s.channels} channels, ${s.codeTemplates} code templates` +
+      `${flags.deploy ? ', then redeploy all channels' : ''}).\n`,
+  );
+  if (plan.changes.length > 0) {
+    process.stdout.write('Channel, library and template changes:\n');
+    printChanges(plan);
+  }
+  if (plan.notPushed.length > 0) process.stdout.write(`also replaced: ${plan.notPushed.join(', ')}\n`);
+  // A full replace deletes what the tree lacks, including work created on the
+  // server since the pull, which a scoped push would have left alone.
+  if (plan.serverOnly.length > 0 && !flags.force) {
+    fail(
+      `these were created on the server since the last pull and would be deleted:\n  ${plan.serverOnly.join('\n  ')}\n` +
+        `pull first, or pass --force to delete them`,
+    );
+  }
+  checkPlan(plan, flags);
+  if (!flags.yes && !(await confirm('Continue?'))) {
+    process.stdout.write('aborted.\n');
+    return;
+  }
+  await client.putServerConfiguration(local, {
+    deploy: flags.deploy === true,
+    overwriteConfigMap: flags.overwriteConfigMap === true,
+  });
+  const ids = resourceIds(local);
+  await refreshRevisions(root, await client.getServerConfiguration(), new Set([...ids.channels, ...ids.libraries, ...ids.codeTemplates]));
+  if (known) await writeKnown(root, ids);
+  process.stdout.write(`pushed ${root} -> ${target}\n`);
 }
 
 // --- commands -------------------------------------------------------------
@@ -334,50 +521,52 @@ addEnvFlag(addConnectionFlags(
 addEnvFlag(addConnectionFlags(
   program
     .command('push')
-    .description('Push a working tree to the live server (whole-server snapshot)')
+    .description('Push changed channels, code templates and global scripts to the live server')
     .argument('<dir>', 'working-tree directory')
-    .option('--deploy', 'redeploy all channels after applying', false)
-    .option('--overwrite-config-map', 'overwrite the global configuration map', false)
-    .option('--force', 'push even if the tree was exploded from an XML backup', false)
+    .option('--channel <name>', 'only this channel (name or id); repeatable', collect)
+    .option('--library <name>', 'only this code template library (name or id); repeatable', collect)
+    .option('--global-scripts', 'with --channel/--library: also push global scripts')
+    .option('--allow-deletes', 'delete server resources that are missing from the tree', false)
+    .option('--deploy', 'redeploy the changed channels and the channels using changed code templates', false)
+    .option('--force', "push even if the server changed since the last pull (overwrites the server's version)", false)
+    .option('--ignore-origin', 'push a tree that was exploded from an XML backup (normally refused)', false)
+    .option('--whole-server', 'replace the entire server configuration instead (settings, config map, groups too)', false)
+    .option('--overwrite-config-map', 'with --whole-server: also overwrite the configuration map', false)
     .option('-y, --yes', 'skip the confirmation prompt', false),
 )).action(
   async (
     dir: string,
     flags: ConnectionFlags & EnvFlags & {
+      channel?: string[];
+      library?: string[];
+      globalScripts?: boolean;
+      allowDeletes?: boolean;
       deploy?: boolean;
+      wholeServer?: boolean;
       overwriteConfigMap?: boolean;
       yes?: boolean;
       force?: boolean;
+      ignoreOrigin?: boolean;
     },
   ) => {
+    if (flags.wholeServer && (flags.channel || flags.library || flags.globalScripts)) {
+      fail('--whole-server replaces everything; it cannot be combined with --channel, --library or --global-scripts');
+    }
     const root = path.resolve(dir);
     assertTree(root);
     const config = await renderedTree(root, flags);
-    await assertCompatibleOrigin(root, config, 'live', flags.force === true);
+    await assertCompatibleOrigin(root, config, 'live', flags.ignoreOrigin === true);
     const cfg = resolveClientConfig(flags);
     const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
-    const s = summarize(config);
-
-    if (!flags.yes) {
-      process.stdout.write(
-        `About to overwrite the ENTIRE server configuration at ${target}\n` +
-          `  ${s.channels} channels, ${s.codeTemplates} code templates` +
-          (flags.deploy ? ', then redeploy all channels' : '') +
-          '\n',
-      );
-      if (!(await confirm('Continue?'))) {
-        process.stdout.write('aborted.\n');
-        return;
-      }
+    if (!flags.yes && !process.stdin.isTTY) {
+      fail('no terminal to confirm on; review with `diff` and pass --yes');
     }
-
-    await withClient(flags, (client) =>
-      client.putServerConfiguration(config, {
-        deploy: flags.deploy === true,
-        overwriteConfigMap: flags.overwriteConfigMap === true,
-      }),
-    );
-    process.stdout.write(`pushed ${root} -> ${target}\n`);
+    if (flags.wholeServer) {
+      await withClient(flags, (client) => wholeServerPush(client, root, config, target, flags));
+      return;
+    }
+    const scope: Scope = { channels: flags.channel, libraries: flags.library, globalScripts: flags.globalScripts };
+    await withClient(flags, (client) => scopedPush(client, root, config, scope, target, flags));
   },
 );
 
@@ -415,7 +604,13 @@ addEnvFlag(addConnectionFlags(
       const local = existsSync(path.join(root, d)) ? path.join(root, d) : empty;
       const server = existsSync(path.join(tmp, d)) ? path.join(tmp, d) : empty;
       if (local === empty && server === empty) continue;
-      const result = spawnSync('git', ['diff', '--no-index', '--no-color', local, server], { encoding: 'utf8' });
+      // Pin line-ending handling so the answer doesn't depend on the user's git
+      // config, and match push, which ignores CR-only differences.
+      const result = spawnSync(
+        'git',
+        ['-c', 'core.autocrlf=false', 'diff', '--no-index', '--no-color', '--ignore-cr-at-eol', local, server],
+        { encoding: 'utf8' },
+      );
       // spawnSync does NOT throw when the binary is missing or the spawn fails --
       // it returns { error, status: null }. Treating an empty stdout as "no diff"
       // would print a confident false-clean on the exact gate users run before a
@@ -469,5 +664,9 @@ program
   });
 
 program.parseAsync().catch((err: unknown) => {
-  fail(err instanceof Error ? err.message : String(err));
+  process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+  if (!(err instanceof CliError) && err instanceof Error && process.env.CHANNELVAULT_DEBUG) {
+    process.stderr.write(`${err.stack}\n`);
+  }
+  process.exitCode = 1;
 });
