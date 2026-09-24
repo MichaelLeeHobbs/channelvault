@@ -249,10 +249,10 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   await clearManaged(root);
   await engine.explode(config, { root });
   await writeMeta(root, source, config);
-  const backup = await backupEnvFile(envFile, envUpdates);
+  const backup = await backupEnvFile(envFile, envUpdates, path.join(root, '.secrets'));
   await updateEnvFile(envFile, envUpdates);
   const rel = path.relative(root, envFile);
-  if (existsSync(envFile) && !rel.startsWith('..') && !path.isAbsolute(rel)) await ensureEnvIgnored(root);
+  if (backup || (existsSync(envFile) && !rel.startsWith('..') && !path.isAbsolute(rel))) await ensureEnvIgnored(root);
   if (scan.findings.length > 0) process.stdout.write(`extracted ${scan.findings.length} secret(s) found in values\n`);
   const updated = Object.keys(envUpdates).length;
   if (updated > 0) process.stdout.write(`stored ${updated} secret value(s) in ${envFile}\n`);
@@ -620,44 +620,44 @@ addEnvFlag(addConnectionFlags(
   assertTree(root);
 
   const fetched = await withClient(flags, (client) => client.getServerConfiguration());
+  const tree = await engine.implode({ root });
   // Compare like with like: the server's credentials become the placeholders
   // the tree holds. Values that differ from the env file are named, never shown.
-  const { config: templatedRemote, envUpdates, notes } = templatize(
-    fetched,
-    await engine.implode({ root }),
-    await loadEnv(envFilePath(root, flags)),
-  );
+  const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, await loadEnv(envFilePath(root, flags)));
   for (const name of Object.keys(envUpdates)) {
     process.stderr.write(`note: ${name} differs between the server and the env file\n`);
   }
   for (const note of notes) process.stderr.write(`note: ${note}\n`);
-  // Never print a secret the server holds but the tree has not extracted yet.
-  const redacted = scanSecrets(templatedRemote, { mode: 'redact', allow: await readAllow(root) });
-  const remote = redacted.config;
-  if (redacted.findings.length > 0) {
-    process.stderr.write(
-      `note: ${redacted.findings.length} possible secret(s) on the server are redacted below; pull --extract-secrets to move them to the env file\n`,
-    );
+  // Redact both sides the same way, so neither can print a secret and a raw
+  // secret held on both sides doesn't read as a difference.
+  const allow = await readAllow(root);
+  const treeView = scanSecrets(tree, { mode: 'redact', allow });
+  const serverView = scanSecrets(templatedRemote, { mode: 'redact', allow });
+  if (treeView.findings.length > 0) {
+    process.stderr.write(`note: the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets\n`);
+  }
+  if (serverView.findings.length > 0) {
+    process.stderr.write(`note: ${serverView.findings.length} possible secret(s) on the server are redacted below\n`);
   }
   const tmp = await mkdtemp(path.join(tmpdir(), 'channelvault-diff-'));
   try {
-    await engine.explode(remote, { root: tmp });
-    // Compare only what explode owns, so the user's own files (.gitignore, .env,
-    // a README) and our channelvault.json bookkeeping never show as deletions.
-    // Per-directory, because git diff --no-index takes exactly two paths.
-    const empty = path.join(tmp, '.empty');
-    await mkdir(empty);
+    // Both sides are exploded fresh from their configs, into tmp/tree and
+    // tmp/server, and compared from tmp so paths print as tree/… and server/….
+    await engine.explode(treeView.config, { root: path.join(tmp, 'tree') });
+    await engine.explode(serverView.config, { root: path.join(tmp, 'server') });
+    await mkdir(path.join(tmp, '.empty'));
     const chunks: string[] = [];
+    // Only what explode owns; per directory, because git diff --no-index takes two paths.
     for (const d of MANAGED_DIRS) {
-      const local = existsSync(path.join(root, d)) ? path.join(root, d) : empty;
-      const server = existsSync(path.join(tmp, d)) ? path.join(tmp, d) : empty;
-      if (local === empty && server === empty) continue;
+      const local = existsSync(path.join(tmp, 'tree', d)) ? `tree/${d}` : '.empty';
+      const server = existsSync(path.join(tmp, 'server', d)) ? `server/${d}` : '.empty';
+      if (local === '.empty' && server === '.empty') continue;
       // Pin line-ending handling so the answer doesn't depend on the user's git
       // config, and match push, which ignores CR-only differences.
       const result = spawnSync(
         'git',
         ['-c', 'core.autocrlf=false', 'diff', '--no-index', '--no-color', '--ignore-cr-at-eol', local, server],
-        { encoding: 'utf8' },
+        { encoding: 'utf8', cwd: tmp },
       );
       // spawnSync does NOT throw when the binary is missing or the spawn fails --
       // it returns { error, status: null }. Treating an empty stdout as "no diff"

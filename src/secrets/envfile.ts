@@ -67,16 +67,15 @@ export const ENV_BACKUPS_KEPT = 5;
 
 /**
  * Before `updates` overwrite a value already in `file`, copy the file to
- * `.secrets/<name>-<UTC timestamp>` beside it, keeping the newest
+ * `<dir>/<name>-<UTC timestamp>` (the tree's git-ignored `.secrets/`), keeping the newest
  * {@link ENV_BACKUPS_KEPT}. Adding new variables loses nothing, so it makes
  * no copy. Returns the backup path, or null if none was needed.
  */
-export async function backupEnvFile(file: string, updates: Record<string, string>): Promise<string | null> {
+export async function backupEnvFile(file: string, updates: Record<string, string>, dir: string): Promise<string | null> {
   if (!existsSync(file)) return null;
   const current = parse(await readFile(file, 'utf8'));
   if (!Object.entries(updates).some(([k, v]) => current[k] !== undefined && current[k] !== v)) return null;
 
-  const dir = path.join(path.dirname(file), '.secrets');
   await mkdir(dir, { recursive: true });
   const prefix = `${path.basename(file)}-`;
   // 20260924T173321.123Z: sorts chronologically; a same-millisecond collision gets -02, -03…

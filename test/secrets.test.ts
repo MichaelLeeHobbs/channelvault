@@ -103,13 +103,23 @@ describe('templatize', () => {
     expect(channel(config)['deployScript']).toBe("var url = '{{env:API_URL}}/x';");
   });
 
-  it('drops an embedded placeholder the server no longer matches, and says so', () => {
+  it('updates an embedded placeholder whose surrounding text still matches', () => {
     const remote = liveConfig();
     channel(remote)['deployScript'] = "var url = 'https://other.example.org/x';";
     const previous = liveConfig();
     channel(previous)['deployScript'] = "var url = '{{env:API_URL}}/x';";
+    const { config, envUpdates } = templatize(remote, previous, { API_URL: 'https://api.example.org/v1' });
+    expect(channel(config)['deployScript']).toBe("var url = '{{env:API_URL}}/x';");
+    expect(envUpdates['API_URL']).toBe('https://other.example.org');
+  });
+
+  it('drops a placeholder when neither its text nor its value is on the server, and says so', () => {
+    const remote = liveConfig();
+    channel(remote)['deployScript'] = "var link = 'https://other.example.org/y';";
+    const previous = liveConfig();
+    channel(previous)['deployScript'] = "var url = '{{env:API_URL}}/x';";
     const { config, notes } = templatize(remote, previous, { API_URL: 'https://api.example.org/v1' });
-    expect(channel(config)['deployScript']).toBe("var url = 'https://other.example.org/x';");
+    expect(channel(config)['deployScript']).toBe("var link = 'https://other.example.org/y';");
     expect(notes.join('\n')).toMatch(/deployScript: placeholder no longer matches/);
   });
 
