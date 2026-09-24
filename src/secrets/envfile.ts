@@ -3,7 +3,7 @@
  * comments and hand-added variables survive a pull.
  */
 import { existsSync } from 'node:fs';
-import { appendFile, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, copyFile, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { parse } from 'dotenv';
@@ -62,7 +62,38 @@ export async function updateEnvFile(file: string, updates: Record<string, string
   await writeFile(file, `${out.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
 }
 
-const IGNORE_LINES = ['.env', '.env.*', '!.env.example'];
+/** How many superseded env files to keep; old secrets should not pile up on disk. */
+export const ENV_BACKUPS_KEPT = 5;
+
+/**
+ * Before `updates` overwrite a value already in `file`, copy the file to
+ * `<dir>/<name>-<UTC timestamp>` (the tree's git-ignored `.secrets/`), keeping the newest
+ * {@link ENV_BACKUPS_KEPT}. Adding new variables loses nothing, so it makes
+ * no copy. Returns the backup path, or null if none was needed.
+ */
+export async function backupEnvFile(file: string, updates: Record<string, string>, dir: string): Promise<string | null> {
+  if (!existsSync(file)) return null;
+  const current = parse(await readFile(file, 'utf8'));
+  if (!Object.entries(updates).some(([k, v]) => current[k] !== undefined && current[k] !== v)) return null;
+
+  await mkdir(dir, { recursive: true });
+  const prefix = `${path.basename(file)}-`;
+  // 20260924T173321.123Z: sorts chronologically; a same-millisecond collision gets -02, -03…
+  const stamp = new Date().toISOString().replace(/[-:]/g, '');
+  let target = path.join(dir, `${prefix}${stamp}`);
+  for (let n = 2; existsSync(target); n += 1) target = path.join(dir, `${prefix}${stamp}-${String(n).padStart(2, '0')}`);
+  await copyFile(file, target);
+  await chmod(target, 0o600);
+
+  // Prune the oldest, never the copy just made.
+  const others = (await readdir(dir)).filter((f) => f.startsWith(prefix) && f !== path.basename(target)).sort();
+  for (const old of others.slice(0, Math.max(0, others.length - (ENV_BACKUPS_KEPT - 1)))) {
+    await rm(path.join(dir, old));
+  }
+  return target;
+}
+
+const IGNORE_LINES = ['.env', '.env.*', '!.env.example', '.secrets/'];
 
 /** Make sure `dir/.gitignore` keeps env files out of git. Returns true if it changed. */
 export async function ensureEnvIgnored(dir: string): Promise<boolean> {

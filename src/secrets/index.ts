@@ -15,7 +15,6 @@ import type { CanonicalConfig, Json } from '../types.js';
 export type Env = Readonly<Record<string, string | undefined>>;
 
 const PLACEHOLDER = /\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g;
-const SINGLE_PLACEHOLDER = /^\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}$/;
 
 /** Credential-bearing keys: `password`, `smtpPassword`, `proxyPassword`, `secret`, `apiToken`… */
 const SECRET_KEY = /(password|passphrase|secret|token)$/i;
@@ -86,7 +85,7 @@ function elementSegment(el: Json, index: number): Segment {
   return `[${index}]`;
 }
 
-interface Leaf {
+export interface Leaf {
   location: string;
   key: string;
   /** `name`s of enclosing objects (channel, connector), outermost first. */
@@ -98,7 +97,7 @@ interface Leaf {
 }
 
 /** Visit every string leaf, allowing the visitor to replace it. */
-function mapLeaves(config: CanonicalConfig, visit: (value: string, leaf: Leaf) => string): CanonicalConfig {
+export function mapLeaves(config: CanonicalConfig, visit: (value: string, leaf: Leaf) => string): CanonicalConfig {
   const walk = (node: Json, key: string, path: Segment[], labels: string[], section: string, cmKey?: string): Json => {
     if (typeof node === 'string') {
       return visit(node, { location: path.join('/'), key, labels, section, configMapKey: cmKey });
@@ -135,7 +134,7 @@ function isSecret(leaf: Leaf): boolean {
   return SECRET_KEY.test(leaf.key);
 }
 
-function envName(parts: string[]): string {
+export function envName(parts: string[]): string {
   return parts
     .map((p) => p.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, ''))
     .filter(Boolean)
@@ -143,7 +142,7 @@ function envName(parts: string[]): string {
     .replace(/^(?=[0-9])/, '_');
 }
 
-function derivedName(leaf: Leaf): string {
+export function derivedName(leaf: Leaf): string {
   if (leaf.configMapKey !== undefined) return envName(['CONFIG_MAP', leaf.configMapKey]);
   const context = leaf.labels.length > 0 ? leaf.labels : [leaf.section];
   return envName([...context, leaf.key]);
@@ -155,7 +154,7 @@ export interface TemplatizeResult {
   config: CanonicalConfig;
   /** Values to write to the env file (new or changed on the server). Never print these. */
   envUpdates: Record<string, string>;
-  /** Human-readable notes: placeholders dropped, secrets updated, possible hard-coded secrets. */
+  /** Human-readable notes: placeholders dropped, secrets updated from the server. */
   notes: string[];
 }
 
@@ -171,7 +170,30 @@ function templatesOf(config: CanonicalConfig | null): Map<string, string> {
   return out;
 }
 
-const HARDCODED = /(password|passwd|pwd|secret|api[_-]?key|token)\s*[:=]\s*['"][^'"{}\s]{4,}['"]/i;
+/**
+ * Read `value` as `template` with its placeholders filled in: returns each
+ * placeholder's value, or null if the text around them differs. A name used
+ * twice must match the same text both times.
+ */
+function matchTemplate(template: string, value: string): Map<string, string> | null {
+  const names: string[] = [];
+  let pattern = '^';
+  let at = 0;
+  for (const m of template.matchAll(PLACEHOLDER)) {
+    pattern += template.slice(at, m.index).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const seen = names.indexOf(m[1]!);
+    if (seen >= 0) {
+      pattern += `\\${seen + 1}`;
+    } else {
+      names.push(m[1]!);
+      pattern += '([\\s\\S]*?)';
+    }
+    at = m.index + m[0].length;
+  }
+  pattern += `${template.slice(at).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`;
+  const match = new RegExp(pattern).exec(value);
+  return match ? new Map(names.map((n, i) => [n, match[i + 1]!])) : null;
+}
 
 /**
  * Replace credentials in a freshly fetched config with placeholders.
@@ -210,13 +232,30 @@ export function templatize(remote: CanonicalConfig, previous: CanonicalConfig | 
         for (const m of template.matchAll(PLACEHOLDER)) assigned.set(m[1]!, env[m[1]!]!);
         return template;
       }
-      const single = SINGLE_PLACEHOLDER.exec(template);
-      if (single) {
-        const name = single[1]!;
-        assigned.set(name, value);
-        envUpdates[name] = value;
-        notes.push(`${name}: server value differs from the env file; env file updated`);
+      // Same text around the placeholders, new values (a rotated secret):
+      // keep the template and take the new values.
+      const captured = matchTemplate(template, value);
+      if (captured) {
+        for (const [name, v] of captured) {
+          assigned.set(name, v);
+          if (env[name] !== v) {
+            envUpdates[name] = v;
+            notes.push(`${name}: server value differs from the env file; env file updated`);
+          }
+        }
         return template;
+      }
+      // Text edited elsewhere, secrets unchanged: put the placeholders back
+      // where their values still appear. Lossless, since rendering restores
+      // exactly this text.
+      let restored = value;
+      for (const m of template.matchAll(PLACEHOLDER)) {
+        const v = env[m[1]!];
+        if (v !== undefined && v.length >= 4) restored = restored.split(v).join(placeholder(m[1]!));
+      }
+      if (restored !== value) {
+        for (const m of restored.matchAll(PLACEHOLDER)) assigned.set(m[1]!, env[m[1]!]!);
+        return restored;
       }
       notes.push(`${leaf.location}: placeholder no longer matches the server; replaced with the server value`);
       return value;
@@ -224,7 +263,6 @@ export function templatize(remote: CanonicalConfig, previous: CanonicalConfig | 
     if (isSecret(leaf) && value !== '' && !hasPlaceholder(value)) {
       return placeholder(assign(derivedName(leaf), value));
     }
-    if (HARDCODED.test(value)) notes.push(`${leaf.location}: possible hard-coded secret`);
     return value;
   });
 

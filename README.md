@@ -68,7 +68,14 @@ channelvault status <dir>                   # summary of a tree
 
 - You can add placeholders yourself anywhere, in JSON or in a `.js` file (for example `"host": "{{env:DB_HOST}}"`). A re-pull keeps them as long as they still resolve to what the server holds.
 - `--env-file .env.prod` selects another environment. Variables already set in the process environment take precedence over the file, so CI can supply them directly.
-- A password rotated on the server updates `.env` on the next `pull`, and `diff` reports it by name only.
+- A password rotated on the server updates `.env` on the next `pull`, and `diff` reports it by name only. The previous env file is kept in the tree's `.secrets/` (git-ignored, newest 5 only) whenever a value in it changes. An extracted secret inside a script survives server-side edits to the rest of that script.
+
+Secrets inside values are caught too: credentials in URLs and connection strings, `Authorization` headers, `createDatabaseConnection(…, 'password')` calls, password/key assignments in scripts, private keys, and AWS, GitHub, Slack and JWT tokens. If `pull` or `explode` finds one, it writes nothing and lists each finding by location and kind (never the value). Then either:
+
+- rerun with `--extract-secrets`, which replaces just the secret part with a placeholder, or
+- list a false positive in `channelvault.allow.json` (committed): `{ "ignore": [{ "location": "<as printed>", "kind": "assignment", "context": "<as printed>", "note": "why" }] }`. `context` identifies the surrounding text, so the entry stops applying if that text changes.
+
+`diff` redacts any such secret the server holds that the tree hasn't extracted.
 
 ## Pushing
 

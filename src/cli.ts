@@ -25,7 +25,8 @@ import { createMirthClient, type MirthClientExt } from './client/index.js';
 import { channelsOf, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
 import { render, templatize } from './secrets/index.js';
-import { ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
+import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
+import { formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
 
 const engine = createExplodeEngine();
@@ -177,6 +178,7 @@ async function writeMeta(root: string, source: string, config: CanonicalConfig):
 
 interface EnvFlags {
   envFile?: string;
+  extractSecrets?: boolean;
 }
 
 function envFilePath(root: string, flags: EnvFlags): string {
@@ -190,6 +192,10 @@ async function loadEnv(file: string): Promise<Record<string, string | undefined>
 
 function addEnvFlag(cmd: Command): Command {
   return cmd.option('--env-file <path>', 'env file holding secrets and per-environment values (default <dir>/.env)');
+}
+
+function addExtractFlag(cmd: Command): Command {
+  return cmd.option('--extract-secrets', 'move secrets found inside values (URLs, scripts, headers) to the env file', false);
 }
 
 /** The tree as stored, placeholders unresolved; null if there is no tree yet. */
@@ -206,18 +212,52 @@ async function renderedTree(root: string, flags: EnvFlags): Promise<CanonicalCon
  * Write a fetched config into the tree with credentials swapped for
  * placeholders; their values go to the env file, never to the tree.
  */
+const ALLOW_FILE = 'channelvault.allow.json';
+
+/** Known false positives, committed with the tree: `{ "ignore": [{ "location", "kind", "note"? }] }`. */
+async function readAllow(root: string): Promise<AllowEntry[]> {
+  const file = path.join(root, ALLOW_FILE);
+  if (!existsSync(file)) return [];
+  const parsed = JSON.parse(await readFile(file, 'utf8')) as { ignore?: AllowEntry[] };
+  return parsed.ignore ?? [];
+}
+
+/**
+ * Write a fetched config into the tree with credentials swapped for
+ * placeholders; their values go to the env file, never to the tree. Anything
+ * that still looks like a secret stops the write unless --extract-secrets.
+ */
 async function writeTree(root: string, fetched: CanonicalConfig, source: string, flags: EnvFlags): Promise<void> {
   const envFile = envFilePath(root, flags);
-  const { config, envUpdates, notes } = templatize(fetched, await existingTree(root), await loadEnv(envFile));
+  const env = await loadEnv(envFile);
+  const templated = templatize(fetched, await existingTree(root), env);
+  const scan = scanSecrets(templated.config, {
+    mode: flags.extractSecrets ? 'extract' : 'find',
+    allow: await readAllow(root),
+    env: { ...env, ...templated.envUpdates },
+  });
+  if (scan.findings.length > 0 && !flags.extractSecrets) {
+    fail(
+      `found ${scan.findings.length} possible secret(s) that would be stored in plain text; nothing was written:\n` +
+        `${formatFindings(scan.findings)}\n` +
+        `Rerun with --extract-secrets to move them to ${envFile}, or list false positives in ${ALLOW_FILE}.`,
+    );
+  }
+  const config = scan.config;
+  const envUpdates = { ...templated.envUpdates, ...scan.envUpdates };
+
   await clearManaged(root);
   await engine.explode(config, { root });
   await writeMeta(root, source, config);
+  const backup = await backupEnvFile(envFile, envUpdates, path.join(root, '.secrets'));
   await updateEnvFile(envFile, envUpdates);
   const rel = path.relative(root, envFile);
-  if (existsSync(envFile) && !rel.startsWith('..') && !path.isAbsolute(rel)) await ensureEnvIgnored(root);
+  if (backup || (existsSync(envFile) && !rel.startsWith('..') && !path.isAbsolute(rel))) await ensureEnvIgnored(root);
+  if (scan.findings.length > 0) process.stdout.write(`extracted ${scan.findings.length} secret(s) found in values\n`);
   const updated = Object.keys(envUpdates).length;
   if (updated > 0) process.stdout.write(`stored ${updated} secret value(s) in ${envFile}\n`);
-  for (const note of notes) process.stderr.write(`note: ${note}\n`);
+  if (backup) process.stdout.write(`previous env file kept as ${backup}\n`);
+  for (const note of templated.notes) process.stderr.write(`note: ${note}\n`);
 }
 
 async function clearManaged(root: string): Promise<void> {
@@ -473,13 +513,13 @@ program
   .description('Git-style pull/push/diff for Mirth Connect')
   .version('0.1.0');
 
-addEnvFlag(
+addExtractFlag(addEnvFlag(
   program
     .command('explode')
     .description('Explode a Mirth backup XML into a working tree')
     .argument('<backup.xml>', 'path to a Mirth backup config XML file')
     .argument('<dir>', 'output working-tree directory'),
-).action(async (backupPath: string, dir: string, flags: EnvFlags) => {
+)).action(async (backupPath: string, dir: string, flags: EnvFlags) => {
   const config = xml.parse(await readFile(backupPath, 'utf8'));
   const root = path.resolve(dir);
   await writeTree(root, config, `file:${path.resolve(backupPath)}`, flags);
@@ -504,12 +544,12 @@ addEnvFlag(
     process.stdout.write(`imploded ${root} -> ${path.resolve(outPath)}\n`);
   });
 
-addEnvFlag(addConnectionFlags(
+addExtractFlag(addEnvFlag(addConnectionFlags(
   program
     .command('pull')
     .description('Pull the live server configuration into a working tree')
     .argument('<dir>', 'working-tree directory'),
-)).action(async (dir: string, flags: ConnectionFlags & EnvFlags) => {
+))).action(async (dir: string, flags: ConnectionFlags & EnvFlags) => {
   const root = path.resolve(dir);
   const config = await withClient(flags, (client) => client.getServerConfiguration());
   const cfg = resolveClientConfig(flags);
@@ -580,36 +620,44 @@ addEnvFlag(addConnectionFlags(
   assertTree(root);
 
   const fetched = await withClient(flags, (client) => client.getServerConfiguration());
+  const tree = await engine.implode({ root });
   // Compare like with like: the server's credentials become the placeholders
   // the tree holds. Values that differ from the env file are named, never shown.
-  const { config: remote, envUpdates, notes } = templatize(
-    fetched,
-    await engine.implode({ root }),
-    await loadEnv(envFilePath(root, flags)),
-  );
+  const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, await loadEnv(envFilePath(root, flags)));
   for (const name of Object.keys(envUpdates)) {
     process.stderr.write(`note: ${name} differs between the server and the env file\n`);
   }
   for (const note of notes) process.stderr.write(`note: ${note}\n`);
+  // Redact both sides the same way, so neither can print a secret and a raw
+  // secret held on both sides doesn't read as a difference.
+  const allow = await readAllow(root);
+  const treeView = scanSecrets(tree, { mode: 'redact', allow });
+  const serverView = scanSecrets(templatedRemote, { mode: 'redact', allow });
+  if (treeView.findings.length > 0) {
+    process.stderr.write(`note: the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets\n`);
+  }
+  if (serverView.findings.length > 0) {
+    process.stderr.write(`note: ${serverView.findings.length} possible secret(s) on the server are redacted below\n`);
+  }
   const tmp = await mkdtemp(path.join(tmpdir(), 'channelvault-diff-'));
   try {
-    await engine.explode(remote, { root: tmp });
-    // Compare only what explode owns, so the user's own files (.gitignore, .env,
-    // a README) and our channelvault.json bookkeeping never show as deletions.
-    // Per-directory, because git diff --no-index takes exactly two paths.
-    const empty = path.join(tmp, '.empty');
-    await mkdir(empty);
+    // Both sides are exploded fresh from their configs, into tmp/tree and
+    // tmp/server, and compared from tmp so paths print as tree/… and server/….
+    await engine.explode(treeView.config, { root: path.join(tmp, 'tree') });
+    await engine.explode(serverView.config, { root: path.join(tmp, 'server') });
+    await mkdir(path.join(tmp, '.empty'));
     const chunks: string[] = [];
+    // Only what explode owns; per directory, because git diff --no-index takes two paths.
     for (const d of MANAGED_DIRS) {
-      const local = existsSync(path.join(root, d)) ? path.join(root, d) : empty;
-      const server = existsSync(path.join(tmp, d)) ? path.join(tmp, d) : empty;
-      if (local === empty && server === empty) continue;
+      const local = existsSync(path.join(tmp, 'tree', d)) ? `tree/${d}` : '.empty';
+      const server = existsSync(path.join(tmp, 'server', d)) ? `server/${d}` : '.empty';
+      if (local === '.empty' && server === '.empty') continue;
       // Pin line-ending handling so the answer doesn't depend on the user's git
       // config, and match push, which ignores CR-only differences.
       const result = spawnSync(
         'git',
         ['-c', 'core.autocrlf=false', 'diff', '--no-index', '--no-color', '--ignore-cr-at-eol', local, server],
-        { encoding: 'utf8' },
+        { encoding: 'utf8', cwd: tmp },
       );
       // spawnSync does NOT throw when the binary is missing or the spawn fails --
       // it returns { error, status: null }. Treating an empty stdout as "no diff"
