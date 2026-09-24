@@ -148,6 +148,15 @@ export function derivedName(leaf: Leaf): string {
   return envName([...context, leaf.key]);
 }
 
+/**
+ * Replace every literal credential (by field name, as `templatize` finds them)
+ * with a marker, for display. `diff` uses it so a password typed into the
+ * tree by hand is never printed.
+ */
+export function redactKnownSecrets(config: CanonicalConfig): CanonicalConfig {
+  return mapLeaves(config, (value, leaf) => (isSecret(leaf) && value !== '' && !hasPlaceholder(value) ? '<redacted>' : value));
+}
+
 // --- templatize ------------------------------------------------------------
 
 export interface TemplatizeResult {
@@ -212,39 +221,52 @@ export function templatize(remote: CanonicalConfig, previous: CanonicalConfig | 
     for (const m of t.matchAll(PLACEHOLDER)) reserved.add(m[1]!);
   }
 
-  const assign = (base: string, value: string): string => {
+  /** A name no location uses yet, bound to `value`. Placeholders are never shared between locations. */
+  const fresh = (base: string, value: string): string => {
     let name = base;
-    for (let n = 2; ; n += 1) {
-      const taken = assigned.get(name);
-      if (taken === value || (taken === undefined && !reserved.has(name))) break;
-      name = `${base}_${n}`;
-    }
+    for (let n = 2; assigned.has(name) || reserved.has(name); n += 1) name = `${base}_${n}`;
     assigned.set(name, value);
     if (env[name] !== value) envUpdates[name] = value;
     return name;
   };
 
+  /**
+   * Bind this location's placeholder values. A name another location already
+   * holds with a different value (a shared placeholder whose credentials have
+   * diverged) is split off under a new name, so rotating one credential never
+   * changes another.
+   */
+  const bind = (template: string, values: Map<string, string>, rotated: boolean): string => {
+    let out = template;
+    for (const [name, value] of values) {
+      const bound = assigned.get(name);
+      if (bound !== undefined && bound !== value) {
+        reserved.delete(name);
+        const renamed = fresh(name, value);
+        out = out.split(placeholder(name)).join(placeholder(renamed));
+        notes.push(`${renamed}: split from ${name}, which another location holds with a different value`);
+        continue;
+      }
+      assigned.set(name, value);
+      if (env[name] !== value) {
+        envUpdates[name] = value;
+        if (rotated) notes.push(`${name}: server value differs from the env file; env file updated`);
+      }
+    }
+    return out;
+  };
+  const envValues = (template: string): Map<string, string> =>
+    new Map([...template.matchAll(PLACEHOLDER)].map((m) => [m[1]!, env[m[1]!]!] as const));
+
   const config = mapLeaves(remote, (value, leaf) => {
     const template = templates.get(leaf.location);
     if (template !== undefined) {
       const missing = new Set<string>();
-      if (fill(template, env, missing) === value && missing.size === 0) {
-        for (const m of template.matchAll(PLACEHOLDER)) assigned.set(m[1]!, env[m[1]!]!);
-        return template;
-      }
+      if (fill(template, env, missing) === value && missing.size === 0) return bind(template, envValues(template), false);
       // Same text around the placeholders, new values (a rotated secret):
       // keep the template and take the new values.
       const captured = matchTemplate(template, value);
-      if (captured) {
-        for (const [name, v] of captured) {
-          assigned.set(name, v);
-          if (env[name] !== v) {
-            envUpdates[name] = v;
-            notes.push(`${name}: server value differs from the env file; env file updated`);
-          }
-        }
-        return template;
-      }
+      if (captured) return bind(template, captured, true);
       // Text edited elsewhere, secrets unchanged: put the placeholders back
       // where their values still appear. Lossless, since rendering restores
       // exactly this text.
@@ -253,15 +275,12 @@ export function templatize(remote: CanonicalConfig, previous: CanonicalConfig | 
         const v = env[m[1]!];
         if (v !== undefined && v.length >= 4) restored = restored.split(v).join(placeholder(m[1]!));
       }
-      if (restored !== value) {
-        for (const m of restored.matchAll(PLACEHOLDER)) assigned.set(m[1]!, env[m[1]!]!);
-        return restored;
-      }
+      if (restored !== value) return bind(restored, envValues(restored), false);
       notes.push(`${leaf.location}: placeholder no longer matches the server; replaced with the server value`);
       return value;
     }
     if (isSecret(leaf) && value !== '' && !hasPlaceholder(value)) {
-      return placeholder(assign(derivedName(leaf), value));
+      return placeholder(fresh(derivedName(leaf), value));
     }
     return value;
   });

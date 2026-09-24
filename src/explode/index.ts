@@ -15,7 +15,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
@@ -83,22 +83,20 @@ function slug(name: unknown): string {
   s = s.replace(/\s+/g, '-');
   // Trim leading/trailing dashes/dots.
   s = s.replace(/^[-.]+|[-.]+$/g, '');
-  return s.length > 0 ? s : 'unnamed';
+  if (s.length === 0) return 'unnamed';
+  // Windows reserves these device names in every directory.
+  return /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(s) ? `${s}-` : s;
 }
 
-/** Deterministically resolve slug collisions within a namespace. */
+/**
+ * Deterministically resolve slug collisions within a namespace. Compared
+ * case-insensitively: on Windows and macOS `Alpha` and `alpha` are the same
+ * directory, and one would silently overwrite the other.
+ */
 function uniqueSlug(base: string, used: Set<string>): string {
-  if (!used.has(base)) {
-    used.add(base);
-    return base;
-  }
-  let n = 2;
-  let candidate = `${base}-${n}`;
-  while (used.has(candidate)) {
-    n += 1;
-    candidate = `${base}-${n}`;
-  }
-  used.add(candidate);
+  let candidate = base;
+  for (let n = 2; used.has(candidate.toLowerCase()); n += 1) candidate = `${base}-${n}`;
+  used.add(candidate.toLowerCase());
   return candidate;
 }
 
@@ -207,17 +205,10 @@ function resolveUnique(baseDir: string, relName: string, used: Set<string>): str
   const dirSlug = dir === '.' ? '' : dir;
   // Build slugged segments for the directory portion (preserve structure).
   const segs = dirSlug.split('/').filter(Boolean);
+  // Case-insensitive, like uniqueSlug.
   let rel = [...segs, `${stem}${ext}`].join('/');
-  if (used.has(rel)) {
-    let n = 2;
-    let candidate = [...segs, `${stem}-${n}${ext}`].join('/');
-    while (used.has(candidate)) {
-      n += 1;
-      candidate = [...segs, `${stem}-${n}${ext}`].join('/');
-    }
-    rel = candidate;
-  }
-  used.add(rel);
+  for (let n = 2; used.has(rel.toLowerCase()); n += 1) rel = [...segs, `${stem}-${n}${ext}`].join('/');
+  used.add(rel.toLowerCase());
   return path.join(baseDir, ...rel.split('/'));
 }
 
@@ -849,6 +840,19 @@ function resolveWithinRoot(root: string, jsonDir: string, rel: string): string {
 }
 
 /**
+ * Read a marker target, re-checking containment on the real path: the text
+ * check above can't see a symlink or junction inside the tree that points
+ * outside it.
+ */
+async function readWithinRoot(root: string, target: string, rel: string): Promise<string> {
+  const [realRoot, realTarget] = await Promise.all([realpath(root), realpath(target)]);
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+    throw new Error(`marker path escapes the working tree through a link: ${rel}`);
+  }
+  return readFile(realTarget, 'utf8');
+}
+
+/**
  * Recursively resolve markers in a parsed JSON value. `jsonDir` is the directory
  * of the JSON file this value came from (markers are relative to it); `root` is
  * the working-tree root that every marker target must stay within.
@@ -868,12 +872,12 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
   if (isFileRef(value)) {
     const target = resolveWithinRoot(root, jsonDir, value['@file']);
     // Raw read, NO trimming — byte-identical round-trip.
-    return readFile(target, 'utf8');
+    return readWithinRoot(root, target, value['@file']);
   }
 
   if (isRefMarker(value)) {
     const target = resolveWithinRoot(root, jsonDir, value['@ref']);
-    const text = await readFile(target, 'utf8');
+    const text = await readWithinRoot(root, target, value['@ref']);
     const parsed = JSON.parse(text) as Json;
     return resolveMarkers(parsed, path.dirname(target), root);
   }

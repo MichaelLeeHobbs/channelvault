@@ -276,10 +276,19 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
         }
         touched = true;
       }
-      if (touched) for (const id of channelsUsing(lib, allChannelIds)) deploy.add(id);
+      // Channels using it before or after the push both need a redeploy: one
+      // losing access to the library must stop running its old code too.
+      if (touched) {
+        for (const id of channelsUsing(lib, allChannelIds)) deploy.add(id);
+        if (r) for (const id of channelsUsing(r, allChannelIds)) deploy.add(id);
+      }
     }
     for (const r of rl.filter(inScope)) {
-      if (!ll.some((l) => idOf(l) === idOf(r))) missingLocally('library', r, nameOf(r), known?.libraries);
+      if (!ll.some((l) => idOf(l) === idOf(r))) {
+        const before = changes.length;
+        missingLocally('library', r, nameOf(r), known?.libraries);
+        if (changes.length > before) for (const id of channelsUsing(r, allChannelIds)) deploy.add(id);
+      }
       for (const t of templatesOf(r)) {
         if (!localTemplateIds.has(idOf(t))) missingLocally('codeTemplate', t, `${nameOf(r)}/${nameOf(t)}`, known?.codeTemplates);
       }
@@ -321,13 +330,46 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
  * replaces the whole list): the tree's version of each library in scope and the
  * server's version of the rest, so a scoped push never touches other libraries.
  */
-export function librariesToSend(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope = {}): Obj[] {
+export function librariesToSend(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope, plan: Plan): Obj[] {
   const ll = librariesOf(local);
   const rl = librariesOf(remote);
-  if (scope.libraries === undefined) return ll;
-  const inScope = (o: Obj) => scope.libraries!.includes(nameOf(o)) || scope.libraries!.includes(idOf(o));
-  const out = rl.map((r) => (inScope(r) ? ll.find((l) => idOf(l) === idOf(r)) : r)).filter((x): x is Obj => x !== undefined);
+  const inScope =
+    scope.libraries === undefined ? () => true : (o: Obj) => scope.libraries!.includes(nameOf(o)) || scope.libraries!.includes(idOf(o));
+  // Start from the server's list: a library leaves it only through a planned
+  // (and approved) delete, so one created on the server since the pull survives.
+  const deleted = new Set(plan.changes.filter((c) => c.kind === 'library' && c.op === 'delete').map((c) => c.id));
+  const localById = new Map(ll.map((l) => [idOf(l), l]));
+  const out: Obj[] = [];
+  for (const r of rl) {
+    if (deleted.has(idOf(r))) continue;
+    const l = localById.get(idOf(r));
+    out.push(l && inScope(l) ? l : r);
+  }
   for (const l of ll) if (inScope(l) && !rl.some((r) => idOf(r) === idOf(l))) out.push(l);
+  return out;
+}
+
+/**
+ * Planned resources whose server copy changed between `before` (what the plan
+ * was made from) and `after`. Run after the confirmation prompt: an edit made
+ * in the Administrator while it was open must not be overwritten.
+ */
+export function changedSince(plan: Plan, before: CanonicalConfig, after: CanonicalConfig): string[] {
+  const out: string[] = [];
+  const libs = (c: CanonicalConfig) => new Map(librariesOf(c).map((l) => [idOf(l), l]));
+  const [lb, la] = [libs(before), libs(after)];
+  for (const c of plan.changes) {
+    let a: Obj | undefined;
+    let b: Obj | undefined;
+    if (c.kind === 'channel') [b, a] = [findChannel(before, c.id), findChannel(after, c.id)];
+    else if (c.kind === 'codeTemplate') [b, a] = [findTemplate(before, c.id), findTemplate(after, c.id)];
+    else if (c.kind === 'library') [b, a] = [lb.get(c.id), la.get(c.id)];
+    else if (!same(before['globalScripts'], after['globalScripts'])) out.push('global scripts');
+    if (c.kind === 'globalScripts') continue;
+    const existed = b !== undefined;
+    const exists = a !== undefined;
+    if (existed !== exists || (a && b && revisionOf(a) !== revisionOf(b))) out.push(`${c.kind} "${c.label}"`);
+  }
   return out;
 }
 

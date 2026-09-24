@@ -204,12 +204,19 @@ export function scanSecrets(config: CanonicalConfig, opts: { mode: ScanMode; all
   const envUpdates: Record<string, string> = {};
   const assigned = new Map<string, string>(); // name -> value, this run
 
+  // Names placeholders already use belong to their locations; each new
+  // placeholder gets its own name, so rotating one secret never changes another.
+  const inUse = new Set<string>();
+  mapLeaves(config, (value) => {
+    for (const m of value.matchAll(/\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g)) inUse.add(m[1]!);
+    return value;
+  });
   const nameFor = (leaf: Leaf, rule: Rule, value: string): string => {
     const base = `${derivedName(leaf)}__${rule.suffix}`;
     for (let n = 1; ; n += 1) {
       const name = n === 1 ? base : `${base}_${n}`;
-      const current = assigned.get(name) ?? env[name];
-      if (current === undefined || current === value) {
+      if (assigned.has(name) || inUse.has(name)) continue;
+      if (env[name] === undefined || env[name] === value) {
         assigned.set(name, value);
         // A value the environment already holds (the file, or CI's process
         // environment) is not written to the file again.

@@ -113,11 +113,20 @@ export async function backupEnvFile(file: string, updates: Record<string, string
 const IGNORE_LINES = ['.env', '.env.*', '!.env.example', '.secrets/'];
 
 /** Make sure `dir/.gitignore` keeps env files out of git. Returns true if it changed. */
-export async function ensureEnvIgnored(dir: string): Promise<boolean> {
+export async function ensureEnvIgnored(dir: string, envFile?: string): Promise<boolean> {
   const file = path.join(dir, '.gitignore');
   const text = existsSync(file) ? await readFile(file, 'utf8') : '';
   const present = new Set(text.split(/\r?\n/).map((l) => l.trim()));
-  const missing = IGNORE_LINES.filter((l) => !present.has(l));
+  const wanted = [...IGNORE_LINES];
+  // The chosen env file itself, when the standard patterns miss its name
+  // (e.g. `--dotenv secrets.prod`).
+  if (envFile) {
+    const rel = path.relative(dir, envFile).split(path.sep).join('/');
+    const base = path.basename(envFile);
+    const covered = !rel.includes('/') && (base === '.env' || (base.startsWith('.env.') && base !== '.env.example'));
+    if (!covered && !rel.startsWith('..') && !path.isAbsolute(rel)) wanted.push(`/${rel}`);
+  }
+  const missing = wanted.filter((l) => !present.has(l));
   if (missing.length === 0) return false;
   const prefix = text === '' || text.endsWith('\n') ? '' : '\n';
   await appendFile(file, `${prefix}# channelvault: secrets and per-environment values\n${missing.join('\n')}\n`);

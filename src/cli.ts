@@ -22,9 +22,9 @@ import { Command } from 'commander';
 import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
 import { createMirthClient, type MirthClientExt } from './client/index.js';
-import { channelsOf, normalizeEolDeep, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
+import { changedSince, channelsOf, normalizeEolDeep, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
-import { render, templatize } from './secrets/index.js';
+import { redactKnownSecrets, render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
 import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
@@ -266,7 +266,7 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   const rel = path.relative(root, envFile);
   const envInTree = !rel.startsWith('..') && !path.isAbsolute(rel);
   const backup = await backupEnvFile(envFile, envUpdates, path.join(root, '.secrets'));
-  if (backup || (envInTree && Object.keys(envUpdates).length > 0)) await ensureEnvIgnored(root);
+  if (backup || (envInTree && Object.keys(envUpdates).length > 0)) await ensureEnvIgnored(root, envInTree ? envFile : undefined);
   await updateEnvFile(envFile, envUpdates);
 
   await clearManaged(root);
@@ -462,7 +462,15 @@ async function scopedPush(
     return;
   }
 
-  const result = await applyPlan(client, plan, local, remote, scope);
+  // The prompt may have been open for a while: re-check that nothing in the
+  // plan changed on the server meanwhile. Each channel save re-checks its own
+  // revision once more; the gap after that last check can't be closed from
+  // here, because Mirth accepts a stale revision.
+  const moved = changedSince(plan, remote, await client.getServerConfiguration());
+  if (moved.length > 0 && !flags.force) {
+    fail(`changed on the server while this push was being confirmed:\n  ${moved.join('\n  ')}\npull and try again, or pass --force`);
+  }
+  const result = await applyPlan(client, plan, local, remote, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
   // resources that did go through don't read as conflicts next time.
   if (result.touchedIds.size > 0) {
@@ -658,8 +666,8 @@ addEnvFlag(addConnectionFlags(
   // secret held on both sides doesn't read as a difference.
   const allow = await readAllow(root);
   // Line endings are normalised too: push ignores them because Mirth rewrites them on save.
-  const treeView = scanSecrets(normalizeEolDeep(tree), { mode: 'redact', allow });
-  const serverView = scanSecrets(normalizeEolDeep(templatedRemote), { mode: 'redact', allow });
+  const treeView = scanSecrets(redactKnownSecrets(normalizeEolDeep(tree)), { mode: 'redact', allow });
+  const serverView = scanSecrets(redactKnownSecrets(normalizeEolDeep(templatedRemote)), { mode: 'redact', allow });
   if (treeView.findings.length > 0) {
     process.stderr.write(`note: the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets\n`);
   }
@@ -703,10 +711,16 @@ addEnvFlag(addConnectionFlags(
       if (chunk !== '') chunks.push(chunk);
     }
     const out = chunks.join('\n');
-    if (out === '') {
+    // A secret changed on the server is drift too, even though both sides show
+    // the same placeholder; name it, never its value.
+    const secretDrift = Object.keys(envUpdates);
+    if (out === '' && secretDrift.length === 0) {
       process.stdout.write('no differences — working tree matches the server.\n');
     } else {
-      process.stdout.write(out + '\n');
+      if (out !== '') process.stdout.write(out + '\n');
+      if (secretDrift.length > 0) {
+        process.stdout.write(`secret values differ between the server and the env file: ${secretDrift.join(', ')}\n`);
+      }
       process.exitCode = 1;
     }
   } finally {

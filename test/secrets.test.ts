@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { parse } from 'dotenv';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { render, templatize } from '../src/secrets/index.js';
+import { redactKnownSecrets, render, templatize } from '../src/secrets/index.js';
 import { ensureEnvIgnored, formatValue, readEnvFile, updateEnvFile } from '../src/secrets/envfile.js';
 import { XmlConfigAdapter } from '../src/xml/index.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
@@ -256,4 +256,48 @@ describe('CLI: explode/implode keep secrets in .env', () => {
     expect(imploded.status).toBe(1);
     expect(imploded.stderr).toMatch(/missing values for .*SERVERSETTINGS__SMTPPASSWORD/);
   });
+});
+
+describe('second review regressions', () => {
+  const two = (a: string, b: string): CanonicalConfig => ({
+    channels: {
+      channel: [
+        { id: 'c1', name: 'A-B', properties: { password: a } },
+        { id: 'c2', name: 'A B', properties: { password: b } },
+      ],
+    },
+  });
+  const pw = (c: CanonicalConfig, i: number) => ((((c['channels'] as Obj)['channel'] as Obj[])[i]!['properties'] as Obj)['password']);
+
+  it('gives two locations their own placeholders even when name and value collide', () => {
+    const { config } = templatize(two('same', 'same'), null, {});
+    expect(pw(config, 0)).not.toBe(pw(config, 1));
+  });
+
+  it('rotating one of two shared placeholders never changes the other', () => {
+    // A tree from before the fix, where both locations share one name.
+    const shared = two('{{env:A_B__PASSWORD}}', '{{env:A_B__PASSWORD}}');
+    const env = { A_B__PASSWORD: 'old' };
+    const { config, envUpdates } = templatize(two('new', 'old'), shared, env);
+    const rendered = render(config, { ...env, ...envUpdates });
+    expect(pw(rendered, 0)).toBe('new');
+    expect(pw(rendered, 1)).toBe('old');
+  });
+
+  it('redacts literal credentials by field name for display', () => {
+    const cfg: CanonicalConfig = { serverSettings: { smtpPassword: 'typed-by-hand', smtpHost: 'smtp.example.org' } };
+    expect(redactKnownSecrets(cfg)).toEqual({ serverSettings: { smtpPassword: '<redacted>', smtpHost: 'smtp.example.org' } });
+  });
+});
+
+it('ignores a custom env file name inside the tree', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-ignore-'));
+  try {
+    await ensureEnvIgnored(dir, path.join(dir, 'secrets.prod'));
+    expect(await readFile(path.join(dir, '.gitignore'), 'utf8')).toContain('\n/secrets.prod\n');
+    await ensureEnvIgnored(dir, path.join(dir, '.env.prod')); // already covered by .env.*
+    expect((await readFile(path.join(dir, '.gitignore'), 'utf8')).match(/\.env\.prod/g)).toBeNull();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
