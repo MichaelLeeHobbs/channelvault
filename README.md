@@ -103,6 +103,8 @@ MIRTH_HOST=localhost MIRTH_PORT=8443 MIRTH_USER=admin MIRTH_PASS=admin \
   channelvault pull ./work --insecure
 ```
 
+To try channelvault on a **real** configuration, use `docker compose -f docker-compose.isolated.yml up -d` instead: the same server with no outbound network (a deployed channel cannot reach anything), startup deploy off, and port 8443 on localhost only. `down` deletes it and everything in it.
+
 `test/integration/live.test.ts` runs against it when `MIRTH_HOST` is set and the server answers, and skips otherwise.
 
 ## License
