@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.idea/
+# local scratch / real configs pulled from servers
+/scratch/
+/tmp-out/
+*.local.json
+/out/
+/roundtrip.xml
+*.stackdump
+.vscode/
+# secrets and per-environment values
+.env
+.env.*
+!.env.example

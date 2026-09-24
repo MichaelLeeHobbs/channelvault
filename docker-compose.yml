@@ -1,0 +1,20 @@
+# Local Mirth Connect for integration-testing `channelvault`.
+#
+#   docker compose up -d
+#   # admin UI / API at https://localhost:8443  (self-signed cert)
+#   # default credentials: admin / admin
+#
+# Then point the CLI at it:
+#   MIRTH_HOST=localhost MIRTH_PORT=8443 MIRTH_USER=admin MIRTH_PASS=admin \
+#     channelvault pull ./work --insecure
+#
+services:
+  mirth:
+    image: nextgenhealthcare/connect:4.5.2
+    container_name: channelvault-test
+    ports:
+      - '8443:8443'
+    environment:
+      - DATABASE=derby
+      - KEYSTORE_STOREPASS=changeit
+      - KEYSTORE_KEYPASS=changeit

@@ -1,0 +1,95 @@
+# channelvault roadmap
+
+*Last revised 2026-09-24.*
+
+## Goal
+
+A team running Mirth can keep every channel, code template and script in git, review changes as pull requests, and apply them with `push`, instead of editing in the Administrator and copying code between servers by hand. channelvault is a single Node CLI, so a CI job can run it with nothing but Node installed.
+
+**Ready for a first release** means M1 and M2 are done and their exit checks pass.
+
+## Where it stands
+
+- **Offline round trip.** XML ⟷ canonical ⟷ tree is lossless:
+  - tested on a Mirth-exported synthetic fixture, and privately on a 2.7 MB production export (`test/private-fixture.test.ts`);
+  - survives unknown XML: plugin steps, unknown sections, comments, interleaved step order, CDATA, CRLF line endings and attribute whitespace.
+- **Live commands.** `pull`, `push`, `diff` and `status` work against Mirth 4.5.2 in Docker. `push` replaces the whole server configuration.
+- **Secrets.** Credentials and configuration-map values are kept in `.env` as `{{env:NAME}}` placeholders. `push` and `implode` fill them in and refuse to run if any are missing.
+- **Guards.**
+  - `diff` fails loudly when git fails, and compares only the directories channelvault manages.
+  - `@file`/`@ref` markers can't point outside the tree.
+  - Operations mixing the two transports are refused.
+  - A tripwire test keeps real exports out of `test/fixtures`.
+- **Not yet:** CI and tests for the CLI commands.
+
+## M1: Safe to point at production
+
+1. **Scoped push with a preview.**
+   - Push one channel or one code-template library through the per-resource endpoints instead of `PUT /server/configuration`.
+   - Before confirming, show the diff and list everything that will be deleted.
+   - Deletions require `--allow-deletes`.
+   - Whole-server push stays available only behind an explicit flag.
+2. **Per-environment values.**
+   - The same tree deploys to dev and prod, with values from `--env-file .env.dev` or `.env.prod`.
+   - The mechanism already exists; what's missing is a documented promotion workflow and a test that promotes between two servers.
+3. **Global scripts as files.** Today they stay inline in `server/configuration.json`.
+4. **Safe to script.**
+   - `push` without a terminal fails straight away unless `--yes` is passed. Today it waits on stdin.
+   - Document `diff`'s exit codes (0 = clean, 1 = differences, other = error) for scheduled drift checks.
+5. **Secret coverage.**
+   - Credential detection matches key names (`*password`, `*secret`, `*token`, `*passphrase`) and all configuration-map values.
+   - Check it against every connector type in a real server, especially Database Reader/Writer URLs with embedded credentials and HTTP headers.
+
+*Exit check:* against the Docker server, a round trip of `pull`, an edit to one step, and a scoped `push` changes only that channel. A promotion between two Docker servers with different env files leaves the right values on each.
+
+## M2: A workflow developers can use
+
+- **CI.** GitHub Actions running typecheck, lint, test and build on Node 20 and 22, on Linux and Windows. Add a job that starts the Docker Mirth server and runs `test/integration/live.test.ts`.
+- **Tests for Rhino code.** A loader so code templates can be called from vitest/Jest, and a harness that provides `msg`, `channelMap`, `$c` and the other Mirth globals to channel scripts.
+- **Rhino lint.** An ESLint preset for Mirth's Rhino runtime: no template literals, `async`, `?.` or `class`; `let` rather than `const` inside loops.
+- **Step order you can edit.**
+  - Steps are grouped by Java class, and `#order` records the order when classes interleave, so reordering a JavaScript step against a Mapper step means editing `#order` by hand.
+  - Either present each transformer as one ordered list, or make the file-name prefix `<n>` authoritative.
+  - Which to choose depends on whether Mirth runs steps in list order or by `sequenceNumber` (see open questions).
+- **Version coverage.** Fixtures exported from Docker for each supported Mirth / OIE version, run through every round-trip test.
+- **Test gaps.** CLI tests for `pull`, `push` and `diff`, a coverage threshold, and a test that exploding the same config twice produces identical files.
+
+*Exit check:* green CI on every push, including the live job.
+
+## M3: First release
+
+- Publish to npm with provenance.
+- Take the version from `package.json` instead of the literals in `src/cli.ts`.
+- A README walkthrough from `docker compose up` to a reviewed `push`.
+
+## Backlog
+
+- **Other secret stores.** AWS Secrets Manager, and possibly others, behind the same `{{env:NAME}}` placeholders so trees don't change.
+- **Converting between the XML and live shapes.** Only needed to push a tree built from a backup file.
+- **Login and TLS.** A `--token` login option, a no-echo password prompt, `--cafile`, and a warning when `--insecure` turns verification off.
+- **Login errors** shouldn't include the response body (`src/client/index.ts`).
+- **Cleanup list.** `clearManaged` should get its directory list from the explode engine.
+- **More resources.** Alerts, server resources and the configuration map as separately syncable resources.
+
+## Open questions
+
+- Does Mirth run transformer steps in list order or by `sequenceNumber`? This decides the step-order design in M2.
+- Which Mirth / OIE / BridgeLink versions will be supported?
+
+## Decisions
+
+Dated and not edited afterwards. A later decision replaces an earlier one with a new entry.
+
+**2026-06-16: Hand-written live client, not one generated from Mirth's OpenAPI spec.** The spec Mirth ships doesn't match what the server actually returns: response wrapping, Jackson `@class`/`@version` metadata, polymorphic connector types, `{time,timezone}` dates. So only the transport (session login, TLS, re-authentication on 401) and the few endpoints we use are hand-written, and payloads are treated as opaque JSON.
+
+**2026-09-24: Build channelvault rather than use [mirthsync](https://github.com/SagaHealthcareIT/mirthsync).**
+- mirthsync (3.6.0 when compared on 2026-06-26) is mature and already has per-resource sync, orphan detection, `--restrict-to-path` and token auth.
+- It runs on the JVM, including through its npm wrapper. channelvault needs only Node, which suits Node-based CI images and TypeScript projects.
+- channelvault also stores config as a canonical JSON tree with friendly file names, where mirthsync mirrors Mirth's XML on disk.
+- The cost: M1 item 1 rebuilds features mirthsync already has.
+
+**2026-09-24: Secrets as `{{env:NAME}}` placeholders backed by `.env`.**
+- `pull` and `explode` move the values into the env file, which is added to `.gitignore`. `push` and `implode` refuse to run while any placeholder is unresolved.
+- The syntax isn't `${NAME}` because Mirth connector fields already use `${...}` for Velocity variables.
+- `process.env` wins over the file, so CI can supply values without writing one.
+- Rejected for now: a secret-store integration. Placeholders keep that change separate from the tree.
