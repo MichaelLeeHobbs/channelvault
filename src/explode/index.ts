@@ -881,6 +881,8 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
   if (isPlainObject(value)) {
     const out: Record<string, Json> = {};
     for (const [k, v] of Object.entries(value)) {
+      // Same for a one-member collection, which explode stores as a bare marker.
+      if (isRefMarker(v) && !existsSync(resolveWithinRoot(root, jsonDir, v['@ref']))) continue;
       out[k] = await resolveMarkers(v, jsonDir, root);
     }
     return out;

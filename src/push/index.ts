@@ -57,12 +57,18 @@ function stripVolatile(o: Obj): Obj {
   const out: Obj = { ...o };
   delete out['revision'];
   delete out['lastModified'];
+  // Of exportData, compare only the channel's own metadata. Its tags and
+  // dependency links are carried over from the server on push, and Mirth
+  // flips them between absent and null in GET /server/configuration after
+  // unrelated saves (seen on 4.5.2).
   const exportData = out['exportData'];
-  if (isObj(exportData) && isObj(exportData['metadata'])) {
-    const metadata = { ...exportData['metadata'] };
-    delete metadata['lastModified'];
-    delete metadata['userId'];
-    out['exportData'] = { ...exportData, metadata };
+  if (isObj(exportData)) {
+    const metadata = isObj(exportData['metadata']) ? { ...exportData['metadata'] } : undefined;
+    if (metadata) {
+      delete metadata['lastModified'];
+      delete metadata['userId'];
+    }
+    out['exportData'] = metadata ? { metadata } : {};
   }
   return out;
 }
@@ -90,6 +96,8 @@ export interface Plan {
   changes: Change[];
   /** Resources the server changed since the tree was pulled. */
   conflicts: string[];
+  /** Server resources the tree never had (created since the last pull): left alone, not deleted. */
+  serverOnly: string[];
   /** Top-level sections that differ but that scoped push does not send. */
   notPushed: string[];
   /** Channels to redeploy with --deploy: changed ones and users of changed libraries. */
@@ -104,6 +112,27 @@ export interface Scope {
   globalScripts?: boolean;
 }
 
+/**
+ * Resource ids the tree held when it was last pulled. A server resource the
+ * tree lacks is a local deletion only if the tree once had it; otherwise it
+ * was created on the server since the pull, and deleting it would destroy
+ * someone else's work.
+ */
+export interface Known {
+  channels: string[];
+  libraries: string[];
+  codeTemplates: string[];
+}
+
+export function resourceIds(c: CanonicalConfig): Known {
+  const libs = librariesOf(c);
+  return {
+    channels: channelsOf(c).map(idOf),
+    libraries: libs.map(idOf),
+    codeTemplates: libs.flatMap((l) => templatesOf(l).map(idOf)),
+  };
+}
+
 /** The server-configuration sections scoped push handles. */
 const HANDLED = new Set(['channels', 'codeTemplateLibraries', 'globalScripts', 'date']);
 
@@ -114,6 +143,39 @@ function selectedBy(names: string[] | undefined, what: string, local: Obj[], rem
     if (!known.some((o) => nameOf(o) === n || idOf(o) === n)) throw new Error(`no ${what} named "${n}" in the tree or on the server`);
   }
   return (o) => names.includes(nameOf(o)) || names.includes(idOf(o));
+}
+
+/**
+ * With --library, the library list sent mixes the tree's in-scope libraries
+ * with the server's others, so a template moved across that boundary would end
+ * up in two libraries or in none. Refuse instead.
+ */
+function assertNoMovesAcrossScope(ll: Obj[], rl: Obj[], inScope: (o: Obj) => boolean): void {
+  const owner = (libs: Obj[]) => new Map(libs.flatMap((l) => templatesOf(l).map((t) => [idOf(t), l] as const)));
+  const localOwner = owner(ll);
+  for (const [id, r] of owner(rl)) {
+    const l = localOwner.get(id);
+    if (l && idOf(l) !== idOf(r) && inScope(l) !== inScope(r)) {
+      throw new Error(
+        `code template "${nameOf(templatesOf(l).find((t) => idOf(t) === id)!)}" moved from "${nameOf(r)}" to "${nameOf(l)}"; include both with --library`,
+      );
+    }
+  }
+}
+
+/**
+ * Libraries whose tree copy matched the server before a push. The library-list
+ * PUT bumps every library's revision; copying the new revision into these is
+ * safe, but copying it into a stale library would hide a real conflict.
+ */
+export function librariesInSync(local: CanonicalConfig, remote: CanonicalConfig): string[] {
+  const rl = new Map(librariesOf(remote).map((l) => [idOf(l), l]));
+  return librariesOf(local)
+    .filter((l) => {
+      const r = rl.get(idOf(l));
+      return r !== undefined && revisionOf(r) === revisionOf(l) && same(libraryShape(l), libraryShape(r));
+    })
+    .map(idOf);
 }
 
 /** Channels a library's code is available to, per its include/enable/disable settings. */
@@ -128,13 +190,22 @@ function channelsUsing(lib: Obj, allChannelIds: string[]): string[] {
   return allChannelIds.filter((id) => enabled.has(id));
 }
 
-export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope = {}): Plan {
+export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope = {}, known?: Known): Plan {
   const everything = scope.channels === undefined && scope.libraries === undefined && scope.globalScripts === undefined;
   const channelScope = everything || scope.channels !== undefined;
   const libraryScope = everything || scope.libraries !== undefined;
   const changes: Change[] = [];
   const conflicts: string[] = [];
   const deploy = new Set<string>();
+  const serverOnly: string[] = [];
+  /** A server resource missing from the tree: a planned delete, unless the tree never had it. */
+  const missingLocally = (kind: 'channel' | 'library' | 'codeTemplate', r: Obj, label: string, knownIds?: string[]): void => {
+    if (knownIds && !knownIds.includes(idOf(r))) {
+      serverOnly.push(`${kind === 'codeTemplate' ? 'code template' : kind} "${label}"`);
+    } else {
+      changes.push({ kind, op: 'delete', id: idOf(r), label });
+    }
+  };
 
   // Channels
   if (channelScope) {
@@ -156,7 +227,7 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
       deploy.add(idOf(c));
     }
     for (const r of rc.filter(inScope)) {
-      if (!localIds.has(idOf(r))) changes.push({ kind: 'channel', op: 'delete', id: idOf(r), label: nameOf(r) });
+      if (!localIds.has(idOf(r))) missingLocally('channel', r, nameOf(r), known?.channels);
     }
   }
 
@@ -165,6 +236,7 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
     const ll = librariesOf(local);
     const rl = librariesOf(remote);
     const inScope = selectedBy(scope.libraries, 'library', ll, rl);
+    if (scope.libraries !== undefined) assertNoMovesAcrossScope(ll, rl, inScope);
     const remoteLibById = new Map(rl.map((l) => [idOf(l), l]));
     const remoteTemplates = new Map(rl.flatMap((l) => templatesOf(l).map((t) => [idOf(t), t] as const)));
     const localTemplateIds = new Set(ll.flatMap((l) => templatesOf(l).map(idOf)));
@@ -194,11 +266,9 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
       if (touched) for (const id of channelsUsing(lib, allChannelIds)) deploy.add(id);
     }
     for (const r of rl.filter(inScope)) {
-      if (!ll.some((l) => idOf(l) === idOf(r))) changes.push({ kind: 'library', op: 'delete', id: idOf(r), label: nameOf(r) });
+      if (!ll.some((l) => idOf(l) === idOf(r))) missingLocally('library', r, nameOf(r), known?.libraries);
       for (const t of templatesOf(r)) {
-        if (!localTemplateIds.has(idOf(t))) {
-          changes.push({ kind: 'codeTemplate', op: 'delete', id: idOf(t), label: `${nameOf(r)}/${nameOf(t)}` });
-        }
+        if (!localTemplateIds.has(idOf(t))) missingLocally('codeTemplate', t, `${nameOf(r)}/${nameOf(t)}`, known?.codeTemplates);
       }
     }
   }
@@ -227,6 +297,7 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
   return {
     changes,
     conflicts,
+    serverOnly,
     notPushed,
     deployIds: [...deploy].filter((id) => enabled.has(id)),
   };

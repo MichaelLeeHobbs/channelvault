@@ -22,7 +22,7 @@ import { Command } from 'commander';
 import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
 import { createMirthClient, type MirthClientExt } from './client/index.js';
-import { channelsOf, planPush, type Scope } from './push/index.js';
+import { channelsOf, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
 import { render, templatize } from './secrets/index.js';
 import { ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
@@ -151,6 +151,8 @@ interface SyncMeta {
   source: string;
   pulledAt: string;
   engineVersion: string | null;
+  /** Resource ids the tree held at pull time (see Known in src/push). Absent in older trees. */
+  resources?: Known;
 }
 
 async function writeMeta(root: string, source: string, config: CanonicalConfig): Promise<void> {
@@ -166,6 +168,7 @@ async function writeMeta(root: string, source: string, config: CanonicalConfig):
         : typeof config['@version'] === 'string'
           ? (config['@version'] as string)
           : null,
+    resources: resourceIds(config),
   };
   await writeFile(path.join(root, 'channelvault.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8');
 }
@@ -281,7 +284,7 @@ async function assertCompatibleOrigin(
     wants === 'live'
       ? `this working tree was exploded from an XML backup, but 'push' sends to a live server. ` +
         `The two transports use different config shapes and the normalization bridge is not implemented yet, ` +
-        `so pushing would upload a config the Mirth API cannot parse. Seed the tree with 'pull' instead, or pass --force to override.`
+        `so pushing would upload a config the Mirth API cannot parse. Seed the tree with 'pull' instead, or pass --ignore-origin to override.`
       : `this working tree was pulled from a live server, but 'implode' writes a backup XML. ` +
         `The two transports use different config shapes and the normalization bridge is not implemented yet, ` +
         `so imploding would produce malformed XML. Re-create the tree with 'explode' from a backup, or pass --force to override.`;
@@ -293,7 +296,63 @@ function collect(value: string, previous: string[] | undefined): string[] {
   return [...(previous ?? []), value];
 }
 
-// --- scoped push ----------------------------------------------------------
+// --- push ---------------------------------------------------------------------
+
+/** Resource ids recorded at the last pull, if this tree has them. */
+async function readKnown(root: string): Promise<Known | undefined> {
+  const metaPath = path.join(root, 'channelvault.json');
+  if (!existsSync(metaPath)) return undefined;
+  return (JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta).resources;
+}
+
+async function writeKnown(root: string, known: Known): Promise<void> {
+  const metaPath = path.join(root, 'channelvault.json');
+  if (!existsSync(metaPath)) return;
+  const meta = JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta;
+  if (!meta.resources) return; // an older tree: leave it to the next pull
+  meta.resources = known;
+  await writeFile(metaPath, JSON.stringify(meta, null, 2) + '\n', 'utf8');
+}
+
+/** The tree now knows what it created and has forgotten what it deleted. */
+function afterChanges(known: Known, applied: Change[]): Known {
+  const key = { channel: 'channels', library: 'libraries', codeTemplate: 'codeTemplates' } as const;
+  const next: Known = { channels: [...known.channels], libraries: [...known.libraries], codeTemplates: [...known.codeTemplates] };
+  for (const c of applied) {
+    if (c.kind === 'globalScripts') continue;
+    const ids = next[key[c.kind]];
+    if (c.op === 'create' && !ids.includes(c.id)) ids.push(c.id);
+    if (c.op === 'delete') next[key[c.kind]] = ids.filter((id) => id !== c.id);
+  }
+  return next;
+}
+
+function printChanges(plan: Plan): void {
+  const kindLabel: Record<Change['kind'], string> = { channel: 'channel', library: 'library', codeTemplate: 'code template', globalScripts: '' };
+  for (const c of plan.changes) process.stdout.write(`  ${c.op.padEnd(6)}  ${`${kindLabel[c.kind]} ${c.label}`.trim()}\n`);
+}
+
+/** Refuse conflicts and deletions unless the user opted in. */
+function checkPlan(plan: Plan, flags: { allowDeletes?: boolean; force?: boolean }): void {
+  if (plan.conflicts.length > 0 && !flags.force) {
+    fail(
+      `changed on the server since the last pull:\n  ${plan.conflicts.join('\n  ')}\n` +
+        `pull (and merge) first, or pass --force to overwrite the server's version`,
+    );
+  }
+  const deletes = plan.changes.filter((c) => c.op === 'delete').length;
+  if (deletes > 0 && !flags.allowDeletes) {
+    fail(`the plan deletes ${deletes} resource(s) from the server; pass --allow-deletes, or narrow with --channel/--library`);
+  }
+}
+
+interface PushFlags {
+  allowDeletes?: boolean;
+  deploy?: boolean;
+  force?: boolean;
+  yes?: boolean;
+  overwriteConfigMap?: boolean;
+}
 
 async function scopedPush(
   client: MirthClientExt,
@@ -301,46 +360,41 @@ async function scopedPush(
   local: CanonicalConfig,
   scope: Scope,
   target: string,
-  flags: { allowDeletes?: boolean; deploy?: boolean; force?: boolean; yes?: boolean },
+  flags: PushFlags,
 ): Promise<void> {
   const remote = await client.getServerConfiguration();
-  const plan = planPush(local, remote, scope);
-  const deletes = plan.changes.filter((c) => c.op === 'delete');
+  const known = await readKnown(root);
+  const plan = planPush(local, remote, scope, known);
   const names = new Map(
     [...channelsOf(remote), ...channelsOf(local)].map((c) => [String(c['id']), String(c['name'])] as const),
   );
+  const nameOf = (id: string): string => names.get(id) ?? id;
+
+  // --deploy refreshes what is running; it never starts a channel that is not
+  // deployed now (an operator may have taken it down on purpose).
+  const deployed = flags.deploy && plan.deployIds.length > 0 ? await client.getDeployedChannelIds() : new Set<string>();
+  const toDeploy = plan.deployIds.filter((id) => deployed.has(id));
+  const notDeployed = flags.deploy ? plan.deployIds.filter((id) => !deployed.has(id)) : [];
 
   if (plan.changes.length === 0) {
     process.stdout.write(`nothing to push: ${target} already matches the tree\n`);
   } else {
     process.stdout.write(`Push to ${target}:\n`);
-    const kindLabel: Record<string, string> = {
-      channel: 'channel',
-      library: 'library',
-      codeTemplate: 'code template',
-      globalScripts: '',
-    };
-    for (const c of plan.changes) {
-      process.stdout.write(`  ${c.op.padEnd(6)}  ${`${kindLabel[c.kind]} ${c.label}`.trim()}\n`);
-    }
-    if (flags.deploy && plan.deployIds.length > 0) {
-      process.stdout.write(`then redeploy: ${plan.deployIds.map((id) => names.get(id) ?? id).join(', ')}\n`);
+    printChanges(plan);
+    if (toDeploy.length > 0) process.stdout.write(`then redeploy: ${toDeploy.map(nameOf).join(', ')}\n`);
+    if (notDeployed.length > 0) {
+      process.stdout.write(`not redeployed (not deployed on the server now): ${notDeployed.map(nameOf).join(', ')}\n`);
     }
   }
   if (plan.notPushed.length > 0) {
     process.stdout.write(`not pushed (differs; use --whole-server): ${plan.notPushed.join(', ')}\n`);
   }
+  if (plan.serverOnly.length > 0) {
+    process.stdout.write(`left alone (created on the server since the last pull; pull to get them): ${plan.serverOnly.join(', ')}\n`);
+  }
   if (plan.changes.length === 0) return;
 
-  if (plan.conflicts.length > 0 && !flags.force) {
-    fail(
-      `changed on the server since the last pull:\n  ${plan.conflicts.join('\n  ')}\n` +
-        `pull (and merge) first, or pass --force to overwrite the server's version`,
-    );
-  }
-  if (deletes.length > 0 && !flags.allowDeletes) {
-    fail(`the plan deletes ${deletes.length} resource(s) from the server; pass --allow-deletes, or narrow with --channel/--library`);
-  }
+  checkPlan(plan, flags);
   if (!flags.yes && !(await confirm('Continue?'))) {
     process.stdout.write('aborted.\n');
     return;
@@ -352,19 +406,63 @@ async function scopedPush(
   if (result.touchedIds.size > 0) {
     await refreshRevisions(root, await client.getServerConfiguration(), result.touchedIds);
   }
+  if (known) await writeKnown(root, afterChanges(known, result.applied));
   if (result.failed) {
     const { change, error } = result.failed;
     fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}`);
   }
   process.stdout.write(`pushed ${result.applied.length} change(s)\n`);
 
-  if (flags.deploy && plan.deployIds.length > 0) {
-    const failures = await deployChannels(client, plan.deployIds, (id) => names.get(id) ?? id);
-    const ok = plan.deployIds.length - failures.length;
-    process.stdout.write(`deployed ${ok} of ${plan.deployIds.length} channel(s)\n`);
+  if (toDeploy.length > 0) {
+    const failures = await deployChannels(client, toDeploy, nameOf);
+    process.stdout.write(`deployed ${toDeploy.length - failures.length} of ${toDeploy.length} channel(s)\n`);
     for (const f of failures) process.stderr.write(`deploy failed: ${f.name}: ${f.error}\n`);
     if (failures.length > 0) process.exitCode = 1;
   }
+}
+
+/** The full replace, gated like a scoped push: it lists and guards deletions and conflicts too. */
+async function wholeServerPush(
+  client: MirthClientExt,
+  root: string,
+  local: CanonicalConfig,
+  target: string,
+  flags: PushFlags,
+): Promise<void> {
+  const remote = await client.getServerConfiguration();
+  const known = await readKnown(root);
+  const plan = planPush(local, remote, {}, known);
+  const s = summarize(local);
+  process.stdout.write(
+    `Replace the ENTIRE server configuration at ${target} (${s.channels} channels, ${s.codeTemplates} code templates` +
+      `${flags.deploy ? ', then redeploy all channels' : ''}).\n`,
+  );
+  if (plan.changes.length > 0) {
+    process.stdout.write('Channel, library and template changes:\n');
+    printChanges(plan);
+  }
+  if (plan.notPushed.length > 0) process.stdout.write(`also replaced: ${plan.notPushed.join(', ')}\n`);
+  // A full replace deletes what the tree lacks, including work created on the
+  // server since the pull, which a scoped push would have left alone.
+  if (plan.serverOnly.length > 0 && !flags.force) {
+    fail(
+      `these were created on the server since the last pull and would be deleted:\n  ${plan.serverOnly.join('\n  ')}\n` +
+        `pull first, or pass --force to delete them`,
+    );
+  }
+  checkPlan(plan, flags);
+  if (!flags.yes && !(await confirm('Continue?'))) {
+    process.stdout.write('aborted.\n');
+    return;
+  }
+  await client.putServerConfiguration(local, {
+    deploy: flags.deploy === true,
+    overwriteConfigMap: flags.overwriteConfigMap === true,
+  });
+  const ids = resourceIds(local);
+  await refreshRevisions(root, await client.getServerConfiguration(), new Set([...ids.channels, ...ids.libraries, ...ids.codeTemplates]));
+  if (known) await writeKnown(root, ids);
+  process.stdout.write(`pushed ${root} -> ${target}\n`);
 }
 
 // --- commands -------------------------------------------------------------
@@ -430,7 +528,8 @@ addEnvFlag(addConnectionFlags(
     .option('--global-scripts', 'with --channel/--library: also push global scripts')
     .option('--allow-deletes', 'delete server resources that are missing from the tree', false)
     .option('--deploy', 'redeploy the changed channels and the channels using changed code templates', false)
-    .option('--force', 'push even if the server changed since the last pull, or the tree came from an XML backup', false)
+    .option('--force', "push even if the server changed since the last pull (overwrites the server's version)", false)
+    .option('--ignore-origin', 'push a tree that was exploded from an XML backup (normally refused)', false)
     .option('--whole-server', 'replace the entire server configuration instead (settings, config map, groups too)', false)
     .option('--overwrite-config-map', 'with --whole-server: also overwrite the configuration map', false)
     .option('-y, --yes', 'skip the confirmation prompt', false),
@@ -447,44 +546,27 @@ addEnvFlag(addConnectionFlags(
       overwriteConfigMap?: boolean;
       yes?: boolean;
       force?: boolean;
+      ignoreOrigin?: boolean;
     },
   ) => {
+    if (flags.wholeServer && (flags.channel || flags.library || flags.globalScripts)) {
+      fail('--whole-server replaces everything; it cannot be combined with --channel, --library or --global-scripts');
+    }
     const root = path.resolve(dir);
     assertTree(root);
     const config = await renderedTree(root, flags);
-    await assertCompatibleOrigin(root, config, 'live', flags.force === true);
+    await assertCompatibleOrigin(root, config, 'live', flags.ignoreOrigin === true);
     const cfg = resolveClientConfig(flags);
     const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
     if (!flags.yes && !process.stdin.isTTY) {
       fail('no terminal to confirm on; review with `diff` and pass --yes');
     }
-    if (!flags.wholeServer) {
-      const scope: Scope = { channels: flags.channel, libraries: flags.library, globalScripts: flags.globalScripts };
-      await withClient(flags, (client) => scopedPush(client, root, config, scope, target, flags));
+    if (flags.wholeServer) {
+      await withClient(flags, (client) => wholeServerPush(client, root, config, target, flags));
       return;
     }
-    const s = summarize(config);
-
-    if (!flags.yes) {
-      process.stdout.write(
-        `About to overwrite the ENTIRE server configuration at ${target}\n` +
-          `  ${s.channels} channels, ${s.codeTemplates} code templates` +
-          (flags.deploy ? ', then redeploy all channels' : '') +
-          '\n',
-      );
-      if (!(await confirm('Continue?'))) {
-        process.stdout.write('aborted.\n');
-        return;
-      }
-    }
-
-    await withClient(flags, (client) =>
-      client.putServerConfiguration(config, {
-        deploy: flags.deploy === true,
-        overwriteConfigMap: flags.overwriteConfigMap === true,
-      }),
-    );
-    process.stdout.write(`pushed ${root} -> ${target}\n`);
+    const scope: Scope = { channels: flags.channel, libraries: flags.library, globalScripts: flags.globalScripts };
+    await withClient(flags, (client) => scopedPush(client, root, config, scope, target, flags));
   },
 );
 

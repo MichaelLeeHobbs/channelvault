@@ -11,6 +11,7 @@ import type { CanonicalConfig, Json } from '../types.js';
 import {
   findChannel,
   findTemplate,
+  librariesInSync,
   librariesOf,
   librariesToSend,
   list,
@@ -56,9 +57,17 @@ export async function applyPlan(
         if (kind === 'library') {
           // One PUT replaces the whole list and bumps every library's revision.
           if (!librariesSent) {
+            const inSync = librariesInSync(local, remote);
             await client.putCodeTemplateLibraries(librariesToSend(local, remote, scope));
             librariesSent = true;
-            for (const l of [...librariesOf(local), ...librariesOf(remote)]) touchedIds.add(String(l['id']));
+            // Take the server's new revision only where the tree now holds what
+            // was sent; a stale out-of-scope library must keep its old revision
+            // so the next push still sees its conflict.
+            const sentFromTree = librariesOf(local).filter(
+              (l) => scope.libraries === undefined || scope.libraries.includes(String(l['name'])) || scope.libraries.includes(String(l['id'])),
+            );
+            for (const l of sentFromTree) touchedIds.add(String(l['id']));
+            for (const id of inSync) touchedIds.add(id);
           }
         } else if (kind === 'codeTemplate' && change.op === 'delete') {
           await client.deleteCodeTemplate(change.id);

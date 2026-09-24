@@ -80,11 +80,12 @@ channelvault push ./mirth --channel "ADT Router"         # just this channel (re
 channelvault push ./mirth --library Formatting --deploy  # one library, then redeploy the channels using it
 ```
 
-- **Deletions** (a channel directory or template you removed) need `--allow-deletes`.
+- **Deletions** (a channel directory or template you removed) need `--allow-deletes`. Something created on the server since your last pull is never treated as a deletion; `push` leaves it alone and says so.
 - **Conflicts**: if the server's copy has a newer revision than your tree (someone saved it in the Administrator since your last pull), `push` refuses. Pull, merge in git, and push again, or pass `--force`.
-- **`--deploy`** redeploys the channels that changed and the channels a changed code-template library is enabled for, and reports any that fail to deploy.
+- **`--deploy`** redeploys the channels that changed and the channels a changed code-template library is enabled for, but only those deployed on the server right now; it never starts a channel someone took down. Failures are reported per channel.
 - After a push the tree's revision numbers are updated from the server, so `diff` and the next `push` stay clean.
-- Server settings, the configuration map, channel groups and tags are **not** pushed; `push` names them if they differ. `--whole-server` replaces the entire server configuration instead (the old behaviour; it deletes anything missing from the tree).
+- Server settings, the configuration map, channel groups and tags are **not** pushed; `push` names them if they differ. `--whole-server` replaces the entire server configuration instead. It shows the same change list and needs the same `--allow-deletes` / `--force`, and it can't be combined with `--channel` or `--library`.
+- A tree exploded from an XML backup is refused (its shape differs from the live API's); `--ignore-origin` overrides that.
 - Without a terminal, `push` needs `--yes`.
 
 ## Local test server

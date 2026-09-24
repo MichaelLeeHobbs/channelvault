@@ -97,4 +97,6 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - Mirth 4.5.2 does not reject a stale revision on `PUT /channels/{id}`, even with `override=false`, so push compares the server's revision with the tree's before sending anything.
 - Saving a channel drops its tags and dependencies unless the payload carries them, and the server configuration omits them, so push copies them from `GET /channels/{id}`.
 - Mirth drops CRs when it saves a channel, so push treats CRLF and LF as equal and `diff` ignores CR at end of line.
-- Replacing the library list bumps every library's revision, so push only sends it when membership or library settings changed.
+- Replacing the library list bumps every library's revision, so push only sends it when membership or library settings changed, and afterwards takes the new revision only for libraries the tree now matches.
+- `channelvault.json` records the resource ids present at pull time, so a server resource the tree lacks is a deletion only if the tree once had it.
+- `--deploy` only redeploys channels that are deployed now.

@@ -55,8 +55,10 @@ export interface MirthClientExt extends MirthClient {
   putCodeTemplateLibraries(libraries: Record<string, unknown>[]): Promise<void>;
   /** PUT /server/globalScripts, from the `globalScripts` value of a server configuration. */
   putGlobalScripts(globalScripts: unknown): Promise<void>;
-  /** POST /channels/{id}/_deploy; throws with the server's reason if deployment fails. */
+  /** POST /channels/{id}/_deploy; throws if deployment fails. */
   deployChannel(id: string): Promise<void>;
+  /** Ids of the channels currently deployed (GET /channels/statuses). */
+  getDeployedChannelIds(): Promise<Set<string>>;
 }
 
 /** Internal HTTP verbs we use. */
@@ -287,6 +289,15 @@ class MirthClientImpl implements MirthClientExt {
     await this.sendJson('PUT', '/server/globalScripts', { map: globalScripts });
   }
 
+  async getDeployedChannelIds(): Promise<Set<string>> {
+    const response = await this.request('GET', '/channels/statuses', { headers: { Accept: 'application/json' } });
+    const text = await response.text();
+    const ids = new Set<string>();
+    // Undeployed channels have no status entry; collect every channelId present.
+    for (const m of text.matchAll(/"channelId"\s*:\s*"([^"]+)"/g)) ids.add(m[1]!);
+    return ids;
+  }
+
   async deployChannel(id: string): Promise<void> {
     await this.request('POST', `/channels/${encodeURIComponent(id)}/_deploy`, { query: { returnErrors: true } });
   }
@@ -388,10 +399,15 @@ class MirthClientImpl implements MirthClientExt {
       // ignore body read errors
     }
 
-    const error = new Error(`HTTP ${response.status}: ${response.statusText}`) as Error & ApiError;
+    // Keep a short plain-text or JSON reason (Mirth's HTML error pages say only
+    // "Request failed.", so they add nothing).
+    const text = typeof body === 'string' ? body.replace(/\s+/g, ' ').trim() : '';
+    const reason = text !== '' && !/^<(!doctype|html)/i.test(text) ? `: ${text.slice(0, 300)}` : '';
+    const message = `HTTP ${response.status}: ${response.statusText}${reason}`;
+    const error = new Error(message) as Error & ApiError;
     error.status = response.status;
     error.statusText = response.statusText;
-    error.message = `HTTP ${response.status}: ${response.statusText}`;
+    error.message = message;
     error.body = body;
     return error;
   }

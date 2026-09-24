@@ -95,10 +95,18 @@ maybe('live Mirth server', () => {
     'scoped push changes one channel script, keeps its tags, and then has nothing left to push',
     async () => {
       const remote = await client.getServerConfiguration();
-      const target = channelsOf(remote)[0];
-      if (!target) throw new Error('the live server has no channels; load test/fixtures/serverConfiguration.sample.xml');
-      const id = String(target['id']);
-      const tagsBefore = ((await client.getChannel(id))?.['exportData'] as Record<string, unknown>)['channelTags'];
+      // Use a tagged channel, or the tag assertion below would compare nothing.
+      let id: string | undefined;
+      let tagsBefore: unknown;
+      for (const c of channelsOf(remote)) {
+        const tags = ((await client.getChannel(String(c['id'])))?.['exportData'] as Record<string, unknown>)['channelTags'];
+        if (tags) {
+          id = String(c['id']);
+          tagsBefore = tags;
+          break;
+        }
+      }
+      if (!id) throw new Error('no tagged channel on the live server; load test/fixtures/serverConfiguration.sample.xml');
 
       const local = structuredClone(remote);
       const original = findChannel(local, id)!['deployScript'];
@@ -114,7 +122,8 @@ maybe('live Mirth server', () => {
         expect(planPush(local, after).changes).toEqual([]);
         expect(((await client.getChannel(id))?.['exportData'] as Record<string, unknown>)['channelTags']).toEqual(tagsBefore);
       } finally {
-        const restore = findChannel(await client.getServerConfiguration(), id)!;
+        // The full GET copy carries the tags; the server-configuration copy would drop them.
+        const restore = (await client.getChannel(id))!;
         restore['deployScript'] = original!;
         await client.putChannel(restore);
       }

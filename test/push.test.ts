@@ -1,12 +1,14 @@
+import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { MirthClientExt } from '../src/client/index.js';
 import { createExplodeEngine } from '../src/explode/index.js';
-import { librariesToSend, planPush, type Plan } from '../src/push/index.js';
+import { librariesInSync, librariesToSend, planPush, resourceIds, type Plan } from '../src/push/index.js';
 import { applyPlan, refreshRevisions } from '../src/push/apply.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
 
@@ -293,4 +295,80 @@ describe('tree maintenance', () => {
       JSON.stringify({ id: 'c1', revision: 9 }, null, 2),
     );
   });
+});
+
+describe('code review regressions', () => {
+  it('refuses a --library push that moves a template across the scope boundary', () => {
+    const local = server();
+    const moved = ((lib(local, 0)['codeTemplates'] as Obj)['codeTemplate'] as Obj[]).splice(1, 1)[0]!;
+    ((lib(local, 1)['codeTemplates'] as Obj)['codeTemplate'] as Obj[]).push(moved);
+    expect(() => planPush(local, server(), { libraries: ['Routing'] })).toThrow(
+      'code template "trim" moved from "Formatting" to "Routing"; include both with --library',
+    );
+    // Both libraries in scope: a normal move.
+    expect(summary(planPush(local, server(), { libraries: ['Routing', 'Formatting'] }))).toEqual([
+      'update library Formatting',
+      'update library Routing',
+    ]);
+  });
+
+  it('leaves server resources the tree never had alone instead of deleting them', () => {
+    const remote = server();
+    ((remote['channels'] as Obj)['channel'] as Obj[]).push(channel('c9', 'Created Later'));
+    const known = resourceIds(server());
+    const plan = planPush(server(), remote, {}, known);
+    expect(plan.changes).toEqual([]);
+    expect(plan.serverOnly).toEqual(['channel "Created Later"']);
+    // A resource the tree had and lost is still a delete.
+    const local = server();
+    ((local['channels'] as Obj)['channel'] as Obj[]).pop();
+    expect(summary(planPush(local, remote, {}, known))).toEqual(['delete channel Beta']);
+  });
+
+  it('refreshes only in-scope and already-in-sync libraries after a library-list PUT', async () => {
+    const local = server();
+    (tpl(local, 0, 0)['properties'] as Obj)['code'] = 'changed';
+    lib(local, 0)['description'] = 'membership-level edit';
+    const remote = server();
+    lib(remote, 1)['description'] = 'a colleague edited Routing';
+    lib(remote, 1)['revision'] = 5;
+    const scope = { libraries: ['Formatting'] };
+    const { client } = fakeClient();
+    const result = await applyPlan(client, planPush(local, remote, scope), local, remote, scope);
+    expect(result.touchedIds.has('L1')).toBe(true);
+    expect(result.touchedIds.has('L2')).toBe(false); // stale: keeps its conflict for next time
+    expect(librariesInSync(server(), server())).toEqual(['L1', 'L2']);
+  });
+
+  it('implode drops a deleted directory even when it was the only member', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'channelvault-single-'));
+    try {
+      const single = server();
+      (single['channels'] as Obj)['channel'] = ch(single, 0); // Jackson single-element shape
+      const engine = createExplodeEngine();
+      await engine.explode(single, { root });
+      await rm(path.join(root, 'channels', 'Alpha'), { recursive: true });
+      const imploded = await engine.implode({ root });
+      expect(planPush(imploded, single).changes.map((c) => `${c.op} ${c.label}`)).toEqual(['delete Alpha']);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('rejects --whole-server combined with --channel before touching a server', () => {
+    const repo = fileURLToPath(new URL('..', import.meta.url));
+    const r = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', path.join(repo, 'src', 'cli.ts'), 'push', repo, '--whole-server', '--channel', 'X'],
+      { cwd: repo, encoding: 'utf8' },
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('--whole-server replaces everything');
+  });
+});
+
+it('ignores tag and dependency fields that Mirth flips between absent and null', () => {
+  const remote = server();
+  Object.assign(ch(remote, 0)['exportData'] as Obj, { channelTags: null, dependentIds: null, dependencyIds: null });
+  expect(planPush(server(), remote).changes).toEqual([]);
 });
