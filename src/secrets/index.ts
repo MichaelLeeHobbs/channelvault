@@ -86,7 +86,7 @@ function elementSegment(el: Json, index: number): Segment {
   return `[${index}]`;
 }
 
-interface Leaf {
+export interface Leaf {
   location: string;
   key: string;
   /** `name`s of enclosing objects (channel, connector), outermost first. */
@@ -98,7 +98,7 @@ interface Leaf {
 }
 
 /** Visit every string leaf, allowing the visitor to replace it. */
-function mapLeaves(config: CanonicalConfig, visit: (value: string, leaf: Leaf) => string): CanonicalConfig {
+export function mapLeaves(config: CanonicalConfig, visit: (value: string, leaf: Leaf) => string): CanonicalConfig {
   const walk = (node: Json, key: string, path: Segment[], labels: string[], section: string, cmKey?: string): Json => {
     if (typeof node === 'string') {
       return visit(node, { location: path.join('/'), key, labels, section, configMapKey: cmKey });
@@ -135,7 +135,7 @@ function isSecret(leaf: Leaf): boolean {
   return SECRET_KEY.test(leaf.key);
 }
 
-function envName(parts: string[]): string {
+export function envName(parts: string[]): string {
   return parts
     .map((p) => p.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, ''))
     .filter(Boolean)
@@ -143,7 +143,7 @@ function envName(parts: string[]): string {
     .replace(/^(?=[0-9])/, '_');
 }
 
-function derivedName(leaf: Leaf): string {
+export function derivedName(leaf: Leaf): string {
   if (leaf.configMapKey !== undefined) return envName(['CONFIG_MAP', leaf.configMapKey]);
   const context = leaf.labels.length > 0 ? leaf.labels : [leaf.section];
   return envName([...context, leaf.key]);
@@ -155,7 +155,7 @@ export interface TemplatizeResult {
   config: CanonicalConfig;
   /** Values to write to the env file (new or changed on the server). Never print these. */
   envUpdates: Record<string, string>;
-  /** Human-readable notes: placeholders dropped, secrets updated, possible hard-coded secrets. */
+  /** Human-readable notes: placeholders dropped, secrets updated from the server. */
   notes: string[];
 }
 
@@ -170,8 +170,6 @@ function templatesOf(config: CanonicalConfig | null): Map<string, string> {
   }
   return out;
 }
-
-const HARDCODED = /(password|passwd|pwd|secret|api[_-]?key|token)\s*[:=]\s*['"][^'"{}\s]{4,}['"]/i;
 
 /**
  * Replace credentials in a freshly fetched config with placeholders.
@@ -224,7 +222,6 @@ export function templatize(remote: CanonicalConfig, previous: CanonicalConfig | 
     if (isSecret(leaf) && value !== '' && !hasPlaceholder(value)) {
       return placeholder(assign(derivedName(leaf), value));
     }
-    if (HARDCODED.test(value)) notes.push(`${leaf.location}: possible hard-coded secret`);
     return value;
   });
 

@@ -130,12 +130,12 @@ describe('templatize', () => {
     expect(templatize(cfg, null, {}).envUpdates).toEqual({ CONFIG_MAP__DB_URL: 'jdbc:x' });
   });
 
-  it('flags a likely hard-coded secret in code without changing it', () => {
+  it('leaves secrets inside values to the detector', () => {
     const remote = liveConfig();
     channel(remote)['deployScript'] = "var password = 'hunter22';";
     const { config, notes } = templatize(remote, null, {});
     expect(channel(config)['deployScript']).toBe("var password = 'hunter22';");
-    expect(notes.join('\n')).toMatch(/deployScript: possible hard-coded secret/);
+    expect(notes).toEqual([]);
   });
 });
 
@@ -188,7 +188,7 @@ describe('env file', () => {
     expect(await ensureEnvIgnored(dir)).toBe(true);
     expect(await ensureEnvIgnored(dir)).toBe(false);
     expect(await readFile(path.join(dir, '.gitignore'), 'utf8')).toBe(
-      'node_modules\n# channelvault: secrets and per-environment values\n.env\n.env.*\n!.env.example\n',
+      'node_modules\n# channelvault: secrets and per-environment values\n.env\n.env.*\n!.env.example\n.secrets/\n',
     );
   });
 });

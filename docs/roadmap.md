@@ -34,8 +34,8 @@ A team running Mirth can keep every channel, code template and script in git, re
    - Done: `push` without a terminal fails straight away unless `--yes` is passed.
    - Document `diff`'s exit codes (0 = clean, 1 = differences, other = error) for scheduled drift checks.
 5. **Secret coverage.**
-   - Credential detection matches key names (`*password`, `*secret`, `*token`, `*passphrase`) and all configuration-map values.
-   - Check it against every connector type in a real server, especially Database Reader/Writer URLs with embedded credentials and HTTP headers.
+   - Done (2026-09-24): key names (`*password`, `*secret`, `*token`, `*passphrase`), every configuration-map value, and secrets inside values (URL and connection-string credentials, auth headers, `createDatabaseConnection` calls, script assignments, private keys, known token formats). `pull`/`explode` refuse until each finding is extracted or allowed. On the private 2.7 MB export: 29 by key name, 6 in values, no false positives.
+   - Remaining: check against a full real server, including connector types the private export lacks (Database Reader/Writer, Web Service Sender).
 
 *Exit check:* against the Docker server, a round trip of `pull`, an edit to one step, and a scoped `push` changes only that channel. This passes today (`test/integration/live.test.ts`). A promotion between two Docker servers with different env files leaves the right values on each.
 
@@ -100,3 +100,8 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - Replacing the library list bumps every library's revision, so push only sends it when membership or library settings changed, and afterwards takes the new revision only for libraries the tree now matches.
 - `channelvault.json` records the resource ids present at pull time, so a server resource the tree lacks is a deletion only if the tree once had it.
 - `--deploy` only redeploys channels that are deployed now.
+
+**2026-09-24: Secrets found inside values block the write; old env files are kept briefly.**
+- Key-name matching missed credentials in URLs, connection strings, headers and scripts. The detector scans every value, and `pull`/`explode` write nothing until each finding is extracted (`--extract-secrets`) or allowed in the committed `channelvault.allow.json`. Refusing beats warning: a warning scrolls past and the secret lands in git.
+- Findings are reported by location and kind only. Extraction replaces just the secret substring, so scripts stay readable and `render` restores them exactly.
+- When a pull changes a value already in `.env`, the old file is copied to `.secrets/` (git-ignored) and only the newest 5 are kept. Rejected: unlimited history, which leaves every past password in plain text on disk.
