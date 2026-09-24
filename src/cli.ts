@@ -22,6 +22,8 @@ import { Command } from 'commander';
 import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
 import { createMirthClient, type MirthClientExt } from './client/index.js';
+import { channelsOf, planPush, type Scope } from './push/index.js';
+import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
 import { render, templatize } from './secrets/index.js';
 import { ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
@@ -31,9 +33,16 @@ const xml = new XmlConfigAdapter();
 
 // --- helpers --------------------------------------------------------------
 
+/** A user-facing error: printed without a stack trace. */
+class CliError extends Error {}
+
+/**
+ * Abort the command. Throws rather than calling process.exit so open
+ * connections close first; exiting while undici sockets are closing crashes
+ * Node on Windows with a libuv assertion.
+ */
 function fail(message: string): never {
-  process.stderr.write(`error: ${message}\n`);
-  process.exit(1);
+  throw new CliError(message);
 }
 
 /** Directories under a working tree that `explode` owns (cleared before a pull). */
@@ -97,6 +106,7 @@ async function withClient<T>(flags: ConnectionFlags, fn: (client: MirthClientExt
     return await fn(client);
   } finally {
     await client.logout().catch(() => undefined);
+    await client.close().catch(() => undefined);
   }
 }
 
@@ -278,6 +288,85 @@ async function assertCompatibleOrigin(
   fail(msg);
 }
 
+/** Commander collector for a repeatable option; undefined until first used. */
+function collect(value: string, previous: string[] | undefined): string[] {
+  return [...(previous ?? []), value];
+}
+
+// --- scoped push ----------------------------------------------------------
+
+async function scopedPush(
+  client: MirthClientExt,
+  root: string,
+  local: CanonicalConfig,
+  scope: Scope,
+  target: string,
+  flags: { allowDeletes?: boolean; deploy?: boolean; force?: boolean; yes?: boolean },
+): Promise<void> {
+  const remote = await client.getServerConfiguration();
+  const plan = planPush(local, remote, scope);
+  const deletes = plan.changes.filter((c) => c.op === 'delete');
+  const names = new Map(
+    [...channelsOf(remote), ...channelsOf(local)].map((c) => [String(c['id']), String(c['name'])] as const),
+  );
+
+  if (plan.changes.length === 0) {
+    process.stdout.write(`nothing to push: ${target} already matches the tree\n`);
+  } else {
+    process.stdout.write(`Push to ${target}:\n`);
+    const kindLabel: Record<string, string> = {
+      channel: 'channel',
+      library: 'library',
+      codeTemplate: 'code template',
+      globalScripts: '',
+    };
+    for (const c of plan.changes) {
+      process.stdout.write(`  ${c.op.padEnd(6)}  ${`${kindLabel[c.kind]} ${c.label}`.trim()}\n`);
+    }
+    if (flags.deploy && plan.deployIds.length > 0) {
+      process.stdout.write(`then redeploy: ${plan.deployIds.map((id) => names.get(id) ?? id).join(', ')}\n`);
+    }
+  }
+  if (plan.notPushed.length > 0) {
+    process.stdout.write(`not pushed (differs; use --whole-server): ${plan.notPushed.join(', ')}\n`);
+  }
+  if (plan.changes.length === 0) return;
+
+  if (plan.conflicts.length > 0 && !flags.force) {
+    fail(
+      `changed on the server since the last pull:\n  ${plan.conflicts.join('\n  ')}\n` +
+        `pull (and merge) first, or pass --force to overwrite the server's version`,
+    );
+  }
+  if (deletes.length > 0 && !flags.allowDeletes) {
+    fail(`the plan deletes ${deletes.length} resource(s) from the server; pass --allow-deletes, or narrow with --channel/--library`);
+  }
+  if (!flags.yes && !(await confirm('Continue?'))) {
+    process.stdout.write('aborted.\n');
+    return;
+  }
+
+  const result = await applyPlan(client, plan, local, remote, scope);
+  // Record the server's new revisions even after a partial failure, so the
+  // resources that did go through don't read as conflicts next time.
+  if (result.touchedIds.size > 0) {
+    await refreshRevisions(root, await client.getServerConfiguration(), result.touchedIds);
+  }
+  if (result.failed) {
+    const { change, error } = result.failed;
+    fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}`);
+  }
+  process.stdout.write(`pushed ${result.applied.length} change(s)\n`);
+
+  if (flags.deploy && plan.deployIds.length > 0) {
+    const failures = await deployChannels(client, plan.deployIds, (id) => names.get(id) ?? id);
+    const ok = plan.deployIds.length - failures.length;
+    process.stdout.write(`deployed ${ok} of ${plan.deployIds.length} channel(s)\n`);
+    for (const f of failures) process.stderr.write(`deploy failed: ${f.name}: ${f.error}\n`);
+    if (failures.length > 0) process.exitCode = 1;
+  }
+}
+
 // --- commands -------------------------------------------------------------
 
 const program = new Command();
@@ -334,17 +423,27 @@ addEnvFlag(addConnectionFlags(
 addEnvFlag(addConnectionFlags(
   program
     .command('push')
-    .description('Push a working tree to the live server (whole-server snapshot)')
+    .description('Push changed channels, code templates and global scripts to the live server')
     .argument('<dir>', 'working-tree directory')
-    .option('--deploy', 'redeploy all channels after applying', false)
-    .option('--overwrite-config-map', 'overwrite the global configuration map', false)
-    .option('--force', 'push even if the tree was exploded from an XML backup', false)
+    .option('--channel <name>', 'only this channel (name or id); repeatable', collect)
+    .option('--library <name>', 'only this code template library (name or id); repeatable', collect)
+    .option('--global-scripts', 'with --channel/--library: also push global scripts')
+    .option('--allow-deletes', 'delete server resources that are missing from the tree', false)
+    .option('--deploy', 'redeploy the changed channels and the channels using changed code templates', false)
+    .option('--force', 'push even if the server changed since the last pull, or the tree came from an XML backup', false)
+    .option('--whole-server', 'replace the entire server configuration instead (settings, config map, groups too)', false)
+    .option('--overwrite-config-map', 'with --whole-server: also overwrite the configuration map', false)
     .option('-y, --yes', 'skip the confirmation prompt', false),
 )).action(
   async (
     dir: string,
     flags: ConnectionFlags & EnvFlags & {
+      channel?: string[];
+      library?: string[];
+      globalScripts?: boolean;
+      allowDeletes?: boolean;
       deploy?: boolean;
+      wholeServer?: boolean;
       overwriteConfigMap?: boolean;
       yes?: boolean;
       force?: boolean;
@@ -356,6 +455,14 @@ addEnvFlag(addConnectionFlags(
     await assertCompatibleOrigin(root, config, 'live', flags.force === true);
     const cfg = resolveClientConfig(flags);
     const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
+    if (!flags.yes && !process.stdin.isTTY) {
+      fail('no terminal to confirm on; review with `diff` and pass --yes');
+    }
+    if (!flags.wholeServer) {
+      const scope: Scope = { channels: flags.channel, libraries: flags.library, globalScripts: flags.globalScripts };
+      await withClient(flags, (client) => scopedPush(client, root, config, scope, target, flags));
+      return;
+    }
     const s = summarize(config);
 
     if (!flags.yes) {
@@ -415,7 +522,13 @@ addEnvFlag(addConnectionFlags(
       const local = existsSync(path.join(root, d)) ? path.join(root, d) : empty;
       const server = existsSync(path.join(tmp, d)) ? path.join(tmp, d) : empty;
       if (local === empty && server === empty) continue;
-      const result = spawnSync('git', ['diff', '--no-index', '--no-color', local, server], { encoding: 'utf8' });
+      // Pin line-ending handling so the answer doesn't depend on the user's git
+      // config, and match push, which ignores CR-only differences.
+      const result = spawnSync(
+        'git',
+        ['-c', 'core.autocrlf=false', 'diff', '--no-index', '--no-color', '--ignore-cr-at-eol', local, server],
+        { encoding: 'utf8' },
+      );
       // spawnSync does NOT throw when the binary is missing or the spawn fails --
       // it returns { error, status: null }. Treating an empty stdout as "no diff"
       // would print a confident false-clean on the exact gate users run before a
@@ -469,5 +582,9 @@ program
   });
 
 program.parseAsync().catch((err: unknown) => {
-  fail(err instanceof Error ? err.message : String(err));
+  process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+  if (!(err instanceof CliError) && err instanceof Error && process.env.CHANNELVAULT_DEBUG) {
+    process.stderr.write(`${err.stack}\n`);
+  }
+  process.exitCode = 1;
 });

@@ -13,7 +13,8 @@ A team running Mirth can keep every channel, code template and script in git, re
 - **Offline round trip.** XML ⟷ canonical ⟷ tree is lossless:
   - tested on a Mirth-exported synthetic fixture, and privately on a 2.7 MB production export (`test/private-fixture.test.ts`);
   - survives unknown XML: plugin steps, unknown sections, comments, interleaved step order, CDATA, CRLF line endings and attribute whitespace.
-- **Live commands.** `pull`, `push`, `diff` and `status` work against Mirth 4.5.2 in Docker. `push` replaces the whole server configuration.
+- **Live commands.** `pull`, `push`, `diff` and `status` work against Mirth 4.5.2 in Docker.
+- **Scoped push.** `push` sends only changed channels, code templates, libraries and global scripts, one resource at a time, after previewing them. It refuses conflicts and deletions unless told otherwise, and `--deploy` redeploys only the channels affected. `--whole-server` keeps the old full replace.
 - **Secrets.** Credentials and configuration-map values are kept in `.env` as `{{env:NAME}}` placeholders. `push` and `implode` fill them in and refuse to run if any are missing.
 - **Guards.**
   - `diff` fails loudly when git fails, and compares only the directories channelvault manages.
@@ -24,23 +25,19 @@ A team running Mirth can keep every channel, code template and script in git, re
 
 ## M1: Safe to point at production
 
-1. **Scoped push with a preview.**
-   - Push one channel or one code-template library through the per-resource endpoints instead of `PUT /server/configuration`.
-   - Before confirming, show the diff and list everything that will be deleted.
-   - Deletions require `--allow-deletes`.
-   - Whole-server push stays available only behind an explicit flag.
+1. ~~**Scoped push with a preview.**~~ Done (2026-09-24).
 2. **Per-environment values.**
    - The same tree deploys to dev and prod, with values from `--env-file .env.dev` or `.env.prod`.
    - The mechanism already exists; what's missing is a documented promotion workflow and a test that promotes between two servers.
 3. **Global scripts as files.** Today they stay inline in `server/configuration.json`.
 4. **Safe to script.**
-   - `push` without a terminal fails straight away unless `--yes` is passed. Today it waits on stdin.
+   - Done: `push` without a terminal fails straight away unless `--yes` is passed.
    - Document `diff`'s exit codes (0 = clean, 1 = differences, other = error) for scheduled drift checks.
 5. **Secret coverage.**
    - Credential detection matches key names (`*password`, `*secret`, `*token`, `*passphrase`) and all configuration-map values.
    - Check it against every connector type in a real server, especially Database Reader/Writer URLs with embedded credentials and HTTP headers.
 
-*Exit check:* against the Docker server, a round trip of `pull`, an edit to one step, and a scoped `push` changes only that channel. A promotion between two Docker servers with different env files leaves the right values on each.
+*Exit check:* against the Docker server, a round trip of `pull`, an edit to one step, and a scoped `push` changes only that channel. This passes today (`test/integration/live.test.ts`). A promotion between two Docker servers with different env files leaves the right values on each.
 
 ## M2: A workflow developers can use
 
@@ -87,9 +84,17 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - It runs on the JVM, including through its npm wrapper. channelvault needs only Node, which suits Node-based CI images and TypeScript projects.
 - channelvault also stores config as a canonical JSON tree with friendly file names, where mirthsync mirrors Mirth's XML on disk.
 - The cost: M1 item 1 rebuilds features mirthsync already has.
+- Scope: channelvault syncs code and channel configuration between git and Mirth. Features outside that (embedded git, alerts, resources, orphan cleanup modes) stay out unless that sync needs them.
 
 **2026-09-24: Secrets as `{{env:NAME}}` placeholders backed by `.env`.**
 - `pull` and `explode` move the values into the env file, which is added to `.gitignore`. `push` and `implode` refuse to run while any placeholder is unresolved.
 - The syntax isn't `${NAME}` because Mirth connector fields already use `${...}` for Velocity variables.
 - `process.env` wins over the file, so CI can supply values without writing one.
 - Rejected for now: a secret-store integration. Placeholders keep that change separate from the tree.
+
+**2026-09-24: Scoped push goes resource by resource and does its own conflict detection.**
+- `PUT /server/configuration` replaces everything and deletes whatever the tree lacks, so it moved behind `--whole-server`.
+- Mirth 4.5.2 does not reject a stale revision on `PUT /channels/{id}`, even with `override=false`, so push compares the server's revision with the tree's before sending anything.
+- Saving a channel drops its tags and dependencies unless the payload carries them, and the server configuration omits them, so push copies them from `GET /channels/{id}`.
+- Mirth drops CRs when it saves a channel, so push treats CRLF and LF as equal and `diff` ignores CR at end of line.
+- Replacing the library list bumps every library's revision, so push only sends it when membership or library settings changed.

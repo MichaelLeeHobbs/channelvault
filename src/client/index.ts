@@ -41,6 +41,22 @@ export interface PutServerConfigurationOptions {
  */
 export interface MirthClientExt extends MirthClient {
   putServerConfiguration(config: CanonicalConfig, options?: PutServerConfigurationOptions): Promise<void>;
+  /** GET /channels/{id}, unwrapped; includes the tag and dependency data the server configuration omits. */
+  getChannel(id: string): Promise<Record<string, unknown> | null>;
+  /** PUT /channels/{id}; creates the channel if the id is new. */
+  putChannel(channel: Record<string, unknown>): Promise<void>;
+  /** Release pooled connections so the process can exit promptly. */
+  close(): Promise<void>;
+  deleteChannel(id: string): Promise<void>;
+  /** PUT /codeTemplates/{id}; creates the template if the id is new. */
+  putCodeTemplate(template: Record<string, unknown>): Promise<void>;
+  deleteCodeTemplate(id: string): Promise<void>;
+  /** PUT /codeTemplateLibraries: replaces the whole list (membership and library settings). */
+  putCodeTemplateLibraries(libraries: Record<string, unknown>[]): Promise<void>;
+  /** PUT /server/globalScripts, from the `globalScripts` value of a server configuration. */
+  putGlobalScripts(globalScripts: unknown): Promise<void>;
+  /** POST /channels/{id}/_deploy; throws with the server's reason if deployment fails. */
+  deployChannel(id: string): Promise<void>;
 }
 
 /** Internal HTTP verbs we use. */
@@ -86,7 +102,8 @@ class MirthClientImpl implements MirthClientExt {
   private readonly config: ClientConfig;
   private readonly baseUrl: string;
   private readonly cookieJar: CookieJar;
-  private readonly dispatcher?: Agent;
+  /** Our own pool (not the global one) so `close()` can release it. */
+  private readonly dispatcher: Agent;
 
   private authenticated = false;
   /** Single in-flight login promise (concurrency guard). */
@@ -98,13 +115,7 @@ class MirthClientImpl implements MirthClientExt {
     this.baseUrl = `${protocol}://${config.host}:${config.port}/api`;
     this.cookieJar = new CookieJar();
 
-    if (config.disableTlsCheck) {
-      this.dispatcher = new Agent({
-        connect: {
-          rejectUnauthorized: false,
-        },
-      });
-    }
+    this.dispatcher = new Agent(config.disableTlsCheck ? { connect: { rejectUnauthorized: false } } : {});
   }
 
   isAuthenticated(): boolean {
@@ -233,6 +244,64 @@ class MirthClientImpl implements MirthClientExt {
       },
       body: JSON.stringify(wrapped),
     });
+  }
+
+  // --- per-resource ---------------------------------------------------------
+  // Override is on: Mirth does not reject a stale revision anyway (verified on
+  // 4.5.2), so conflict detection happens in the push planner instead.
+
+  async getChannel(id: string): Promise<Record<string, unknown> | null> {
+    const response = await this.request('GET', `/channels/${encodeURIComponent(id)}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const text = await response.text();
+    if (text.trim() === '') return null;
+    return unwrapSingleKey(JSON.parse(text) as Record<string, unknown>) as Record<string, unknown>;
+  }
+
+  async close(): Promise<void> {
+    await this.dispatcher.close();
+  }
+
+  async putChannel(channel: Record<string, unknown>): Promise<void> {
+    await this.sendJson('PUT', `/channels/${encodeURIComponent(String(channel.id))}`, { channel }, { override: true });
+  }
+
+  async deleteChannel(id: string): Promise<void> {
+    await this.request('DELETE', `/channels/${encodeURIComponent(id)}`);
+  }
+
+  async putCodeTemplate(template: Record<string, unknown>): Promise<void> {
+    await this.sendJson('PUT', `/codeTemplates/${encodeURIComponent(String(template.id))}`, { codeTemplate: template }, { override: true });
+  }
+
+  async deleteCodeTemplate(id: string): Promise<void> {
+    await this.request('DELETE', `/codeTemplates/${encodeURIComponent(id)}`);
+  }
+
+  async putCodeTemplateLibraries(libraries: Record<string, unknown>[]): Promise<void> {
+    await this.sendJson('PUT', '/codeTemplateLibraries', { list: { codeTemplateLibrary: libraries } }, { override: true });
+  }
+
+  async putGlobalScripts(globalScripts: unknown): Promise<void> {
+    await this.sendJson('PUT', '/server/globalScripts', { map: globalScripts });
+  }
+
+  async deployChannel(id: string): Promise<void> {
+    await this.request('POST', `/channels/${encodeURIComponent(id)}/_deploy`, { query: { returnErrors: true } });
+  }
+
+  /** Send a JSON body; Mirth answers some updates with `{"boolean": false}` instead of an error status. */
+  private async sendJson(method: HttpMethod, path: string, body: unknown, query?: Record<string, unknown>): Promise<void> {
+    const response = await this.request(method, path, {
+      query,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    if (/^\s*\{\s*"boolean"\s*:\s*false\s*\}\s*$/.test(text)) {
+      throw new Error(`${method} ${path}: the server refused the update`);
+    }
   }
 
   // --- internal transport ---------------------------------------------------
