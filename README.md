@@ -26,6 +26,7 @@ The exploded tree is a projection, not a re-derivation: config is stored verbati
 - `test/xml.test.ts`, `test/xml.robustness.test.ts`: XML parse/build fixed point, entity and whitespace handling, document order, unexpected XML
 - `test/explode.test.ts`, `test/explode.paths.test.ts`: `implode(explode(c))` deep-equals `c`, byte-identical sidecars, file naming
 - `test/e2e.test.ts`: the whole pipeline on a Mirth-exported fixture (`test/fixtures`, synthetic; `test/fixtures.guard.test.ts` rejects real exports)
+- `test/third-party-fixtures.test.ts`: the same pipeline on mirthsync's Mirth 3.8, 4.0.1 and OIE 4.5.2 exports (`test/fixtures/third-party/mirthsync`, EPL-1.0, pinned by hash in its `SOURCE.md`)
 
 ## Layout produced by `explode` / `pull`
 

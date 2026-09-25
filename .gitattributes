@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Upstream fixtures, verified byte-for-byte by checksum.
+test/fixtures/third-party/** -text

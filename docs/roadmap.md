@@ -50,7 +50,7 @@ A team running Mirth can keep every channel, code template and script in git, re
   - Steps are grouped by Java class, and `#order` records the order when classes interleave, so reordering a JavaScript step against a Mapper step means editing `#order` by hand.
   - Either present each transformer as one ordered list, or make the file-name prefix `<n>` authoritative.
   - Which to choose depends on whether Mirth runs steps in list order or by `sequenceNumber` (see open questions).
-- **Version coverage.** Fixtures exported from Docker for each supported Mirth / OIE version, run through every round-trip test.
+- **Version coverage.** Fixtures exported from Docker for each supported Mirth / OIE version, run through every round-trip test. Started: mirthsync's 3.8, 4.0.1 and OIE 4.5.2 exports run through the offline pipeline (`test/third-party-fixtures.test.ts`); they cover only HTTP, JavaScript and Database Writer connectors.
 - **Test gaps.** A coverage threshold, deterministic repeated-explode coverage, native terminal interaction beyond the pipe-driven confirmation tests, and more server versions. CLI failure/retry/confirmation tests and real pull/push/diff promotion coverage are implemented.
 
 *Exit check:* green CI on every push, including the live job.
