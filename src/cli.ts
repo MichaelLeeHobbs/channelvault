@@ -266,9 +266,19 @@ function rememberSecrets(tree: CanonicalConfig, env: Record<string, string | und
   });
 }
 
-/** `text` with every known secret value replaced, longest first. */
+/**
+ * `text` with every known secret value replaced, longest first. Error bodies
+ * reach here decoded (see `readableBody`); the encoded forms cover text that
+ * quotes a secret some other way.
+ */
 function scrub(text: string): string {
-  return [...knownSecrets].sort((a, b) => b.length - a.length).reduce((t, s) => t.split(s).join('<redacted>'), text);
+  const forms = [...knownSecrets].flatMap((s) => [
+    s,
+    JSON.stringify(s).slice(1, -1),
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'),
+    encodeURIComponent(s),
+  ]);
+  return [...new Set(forms)].sort((a, b) => b.length - a.length).reduce((t, s) => t.split(s).join('<redacted>'), text);
 }
 
 /**
@@ -362,7 +372,8 @@ async function resolvedPath(p: string): Promise<string> {
 function isWithin(child: string, parent: string): boolean {
   const norm = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
   const rel = path.relative(norm(parent), norm(child));
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  // `..runtime.env` is a file name, not a step up.
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
 }
 
 /**
@@ -371,9 +382,13 @@ function isWithin(child: string, parent: string): boolean {
  * then rewrite `channelvault.json`. Returns the existing metadata, if any.
  */
 async function preflightTree(root: string, envFile: string): Promise<SyncMeta | null> {
-  // The swap deletes these, so the env file must not live in one.
+  // The swap deletes these, so the env file must not live in one: neither by
+  // the path given (a link inside one is removed with it) nor by where links
+  // lead.
   const [realRoot, realEnv] = await Promise.all([resolvedPath(root), resolvedPath(envFile)]);
-  const doomed = [...MANAGED_DIRS, STAGING_DIR].find((d) => isWithin(realEnv, path.join(realRoot, d)));
+  const doomed = [...MANAGED_DIRS, STAGING_DIR].find(
+    (d) => isWithin(path.resolve(envFile), path.resolve(root, d)) || isWithin(realEnv, path.join(realRoot, d)),
+  );
   if (doomed) fail(`the env file ${envFile} is inside ${doomed}/, which this command replaces; keep it elsewhere`);
 
   const metaPath = path.join(root, 'channelvault.json');

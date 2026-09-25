@@ -1,11 +1,11 @@
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { channelsOf } from '../src/push/index.js';
 import type { CanonicalConfig } from '../src/types.js';
-import { startFakeMirth, type FakeMirth } from './helpers/fakeMirth.js';
+import { startFakeMirth, type FakeMirth, type FakeResponse } from './helpers/fakeMirth.js';
 import { runCli, startCli } from './helpers/cli.js';
 
 function fixture(): CanonicalConfig {
@@ -36,21 +36,31 @@ const writes = () => mirth.writes.map(w => `${w.method} ${w.path}`);
 const meta = async () => JSON.parse(await readFile(path.join(tree, 'channelvault.json'), 'utf8')) as { resources: { channels: Record<string, number> } };
 
 describe('CLI failure output', () => {
-  it('never prints an extracted credential that a failed save echoes back', async () => {
-    const passcode = 'fixture-passcode-924';
+  // Characters JSON and XML escape, so an echo differs from the value sent.
+  const passcode = 'fixture"pass\\code&<924>';
+  const xmlEscaped = passcode.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  it.each<[string, FakeResponse]>([
+    ['plain text', { status: 400, raw: `rejected value ${passcode} for DICOM` }],
+    ['a JSON sentence', { status: 400, body: { error: `rejected value ${passcode} for DICOM` } }],
+    ['an XML sentence', { status: 400, raw: `<error><message>rejected value ${xmlEscaped} for DICOM</message></error>` }],
+  ])('never prints an extracted credential that a failed save echoes back in %s', async (_format, response) => {
     const channels = channelsOf(mirth.config);
     channels[0]!['destinationConnectors'] = { connector: [{ metaDataId: 1, name: 'DICOM', properties: { passcode } }] };
     mirth.config['channels'] = { channel: channels };
     const pulled = await runCli(['pull', tree, '--no-https'], env);
     expect(pulled.status, pulled.stderr).toBe(0);
-    expect(await readFile(path.join(tree, 'channels', 'Alpha', 'channel.json'), 'utf8')).not.toContain(passcode);
+    const channelJson = await readFile(path.join(tree, 'channels', 'Alpha', 'channel.json'), 'utf8');
+    expect(channelJson).toContain('{{env:');
+    expect(channelJson).not.toContain('924');
     await edit('Alpha');
-    // Unstructured, so only the CLI's knowledge of the env values can catch it.
-    mirth.onRequest = req => req.method === 'PUT' && req.path === '/api/channels/c1' ? { status: 400, body: `rejected value ${passcode} for DICOM` } : undefined;
+    // A sentence, not a credential field: only the CLI's knowledge of the env values can catch it.
+    mirth.onRequest = req => req.method === 'PUT' && req.path === '/api/channels/c1' ? response : undefined;
     const pushed = await runCli(pushArgs('--yes'), env);
     expect(pushed.status).toBe(1);
     expect(pushed.stderr).toContain('rejected value <redacted> for DICOM');
-    expect(pushed.stdout + pushed.stderr).not.toContain(passcode);
+    const printed = pushed.stdout + pushed.stderr;
+    for (const form of [passcode, JSON.stringify(passcode).slice(1, -1), xmlEscaped]) expect(printed).not.toContain(form);
+    expect(printed).not.toContain('924');
   });
 });
 
@@ -62,6 +72,27 @@ describe('CLI pull preflight', () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toContain('is inside channels/');
     expect(existsSync(fresh)).toBe(false);
+  });
+
+  it('refuses an env file whose name merely starts with two dots', async () => {
+    const fresh = path.join(dir, 'fresh');
+    const r = await runCli(['pull', fresh, '--no-https', '--dotenv', path.join(fresh, 'channels', '..runtime.env')], env);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('is inside channels/');
+  });
+
+  it('refuses an env file reached through a directory link inside a replaced directory', async () => {
+    const fresh = path.join(dir, 'fresh');
+    const outside = path.join(dir, 'envstore');
+    await mkdir(outside);
+    await mkdir(path.join(fresh, 'channels'), { recursive: true });
+    await writeFile(path.join(fresh, 'channelvault.json'), JSON.stringify({ source: 'http://example' }));
+    // A junction needs no privileges on Windows; elsewhere it is a symlink.
+    await symlink(outside, path.join(fresh, 'channels', 'envstore'), 'junction');
+    const r = await runCli(['pull', fresh, '--no-https', '--dotenv', path.join(fresh, 'channels', 'envstore', 'runtime.env')], env);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('is inside channels/');
+    expect(existsSync(path.join(fresh, 'channels', 'envstore'))).toBe(true);
   });
 
   it('refuses unreadable metadata before touching the tree', async () => {

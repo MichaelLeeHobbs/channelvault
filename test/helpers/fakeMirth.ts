@@ -8,7 +8,8 @@ import type { AddressInfo } from 'node:net';
 import type { CanonicalConfig, Json } from '../../src/types.js';
 
 export interface FakeRequest { method: string; path: string; body: string }
-export interface FakeResponse { status: number; body?: unknown }
+/** `body` is sent as JSON; `raw` is sent as-is (plain text, XML). */
+export interface FakeResponse { status: number; body?: unknown; raw?: string }
 type Obj = Record<string, Json>;
 
 export interface FakeMirth {
@@ -43,6 +44,10 @@ export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth
       if (url.pathname === '/api/users/_logout') return json(200, {});
       if (req.method !== 'GET') state.writes.push(request);
       const intercepted = await state.onRequest?.(request);
+      if (intercepted?.raw !== undefined) {
+        res.writeHead(intercepted.status, { 'Content-Type': 'text/plain' });
+        return res.end(intercepted.raw);
+      }
       if (intercepted) return json(intercepted.status, intercepted.body ?? {});
       if (req.method === 'GET' && url.pathname === '/api/server/configuration') {
         return json(200, { serverConfiguration: state.config });

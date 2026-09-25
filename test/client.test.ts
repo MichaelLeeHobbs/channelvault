@@ -213,8 +213,8 @@ describe('createMirthClient', () => {
     });
 
     it.each([
-      ['JSON', '{"error":"invalid","passcode":"fixture-924","host":"pacs"}', '"passcode":"<redacted>"'],
-      ['XML', '<error><keyStorePW>fixture-924</keyStorePW><host>pacs</host></error>', '<keyStorePW><redacted></keyStorePW>'],
+      ['JSON', '{"error":"invalid","passcode":"fixture-924","host":"pacs"}', 'error: invalid, passcode: <redacted>, host: pacs'],
+      ['XML', '<error><keyStorePW>fixture-924</keyStorePW><host>pacs</host></error>', 'keyStorePW: <redacted> pacs'],
     ])('redacts a credential field echoed in a %s error body', async (_format, body, expected) => {
       fetchMock
         .mockResolvedValueOnce(loginResponse())

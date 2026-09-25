@@ -39,12 +39,12 @@ interface Rule {
 }
 
 /** Spans of capture group `group` (0 = whole match) of every match of `re`. */
-function regexSpans(re: RegExp, group: number, keep: (secret: string) => boolean = () => true): (value: string) => Span[] {
+function regexSpans(re: RegExp, group: number): (value: string) => Span[] {
   return (value) => {
     const out: Span[] = [];
     for (const m of value.matchAll(re)) {
       const secret = m[group];
-      if (secret === undefined || !keep(secret)) continue;
+      if (secret === undefined) continue;
       // The secret is the last occurrence of its text within the match.
       const start = m.index + m[0].lastIndexOf(secret);
       out.push({ start, end: start + secret.length });
@@ -101,15 +101,6 @@ function dbConnectionSpans(value: string): Span[] {
  */
 const ASSIGNED = String.raw`["']?\s*[:=]\s*(?:[\w$.[\]'"]+\s*(?:\|\||\?\?)\s*)?(["'])((?=\S)(?:[^"'{}\s]{4,}|(?=[^"'{}\n]*[0-9@#$%^&*+=~|\\/<>_])[^"'{}\n]{4,}))\1`;
 
-/**
- * A script's `pwd = $('x')` or `password = getPass()` reads as `pwd=` followed by a call:
- * the captured text ends at the call's quote (`$(`) or holds an empty
- * argument list. Parentheses elsewhere are ordinary password characters.
- */
-function notACall(secret: string): boolean {
-  return !secret.endsWith('(') && !secret.includes('()');
-}
-
 // Earlier rules win where spans overlap: a private key block may contain text
 // other rules match, and `token = 'ghp_…'` is one secret, not two.
 const RULES: Rule[] = [
@@ -125,10 +116,12 @@ const RULES: Rule[] = [
   // user:password@host. The user part stops at ';', '?' and '&' so a JDBC
   // parameter like `user=svc@srv` is not mistaken for credentials.
   { kind: 'url-credentials', suffix: 'PASSWORD', spans: regexSpans(/\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'";?&]+:([^\s@'"/;?&]+)@/gi, 1) },
-  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/[;?&]\s*(?:password|pwd)\s*=\s*([^;&'"\s]+)/gi, 1, notACall) },
-  // Leading the whole value (`Password=…;Server=…`): only when another key=value
-  // follows, so a script starting `password = getPass();` is not one.
-  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/^\s*(?:password|pwd)\s*=\s*([^;&'"\s]+)(?=\s*;\s*[\w ]+=)/gi, 1, notACall) },
+  // A connection string writes `password=value` with no spaces around the `=`; a
+  // script writes `pwd = $('x')`. Telling them apart by that syntax, not by the
+  // password's characters, keeps every password shape detectable.
+  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/[;?&]\s*(?:password|pwd)=([^;&'"\s]+)/gi, 1) },
+  // Leading the whole value (`Password=…;Server=…`), when another key=value follows.
+  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/^\s*(?:password|pwd)=([^;&'"\s]+)(?=;\s*[\w ]+=)/gi, 1) },
   // Case-sensitive, and the credential must contain a digit or a base64/token
   // symbol, so prose like "Basic authentication" does not match.
   {

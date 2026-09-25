@@ -23,6 +23,7 @@
 import { CookieJar } from 'tough-cookie';
 import { Agent } from 'undici';
 import { redactSecretsInText } from '../secrets/detect.js';
+import { isSecretKey } from '../secrets/index.js';
 import type { ApiError, CanonicalConfig, ClientConfig, MirthClient } from '../types.js';
 
 /** TLS verification failures, typically a self-signed or privately issued server certificate. */
@@ -433,11 +434,9 @@ class MirthClientImpl implements MirthClientExt {
       // ignore body read errors
     }
 
-    // Keep a short plain-text or JSON reason (Mirth's HTML error pages say only
-    // "Request failed.", so they add nothing), with secrets redacted: an error
-    // body can echo the payload that was sent.
-    const text = typeof body === 'string' ? redactSecretsInText(body).replace(/\s+/g, ' ').trim() : '';
-    const reason = text !== '' && !/^<(!doctype|html)/i.test(text) ? `: ${text.slice(0, 300)}` : '';
+    // Keep a short reason, redacted: an error body can echo the payload sent.
+    const text = typeof body === 'string' ? redactSecretsInText(readableBody(body)).replace(/\s+/g, ' ').trim() : '';
+    const reason = text !== '' ? `: ${text.slice(0, 300)}` : '';
     const message = `HTTP ${response.status}: ${response.statusText}${reason}`;
     const error = new Error(message) as Error & ApiError;
     error.status = response.status;
@@ -446,6 +445,49 @@ class MirthClientImpl implements MirthClientExt {
     error.body = text;
     return error;
   }
+}
+
+const XML_ENTITIES: Readonly<Record<string, string>> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+
+/**
+ * An error body as the text a person reads: JSON as its decoded values, XML as
+ * its decoded text. Anything that redacts by value (the CLI knows the secrets
+ * sent) then sees a secret as it was sent, not escaped as `\"` or `&amp;`.
+ * Credential fields are replaced while their names are still known.
+ */
+export function readableBody(body: string): string {
+  const trimmed = body.trim();
+  if (/^[[{]/.test(trimmed)) {
+    try {
+      return flattenJson(JSON.parse(trimmed) as unknown);
+    } catch {
+      // not JSON after all
+    }
+  }
+  if (!trimmed.startsWith('<')) return trimmed;
+  // Mirth's HTML error pages say only "Request failed.", so they add nothing.
+  if (/^<(!doctype|html)/i.test(trimmed)) return '';
+  // A marker that survives removing the tags.
+  const REDACTED = '\u0000redacted\u0000';
+  return trimmed
+    .replace(/<([\w.:-]+)>[^<]*<\/\1>/g, (whole, key: string) => (isSecretKey(key) ? ` ${key}: ${REDACTED} ` : whole))
+    .replace(/<[^>]*>/g, ' ')
+    .split(REDACTED)
+    .join('<redacted>')
+    .replace(/&(#x[0-9a-f]+|#[0-9]+|amp|lt|gt|quot|apos);/gi, (whole, e: string) =>
+      e[0] === '#'
+        ? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10))
+        : (XML_ENTITIES[e.toLowerCase()] ?? whole),
+    );
+}
+
+function flattenJson(value: unknown, key = ''): string {
+  if (typeof value === 'string') return key !== '' && isSecretKey(key) && value !== '' ? '<redacted>' : value;
+  if (Array.isArray(value)) return value.map((v) => flattenJson(v, key)).join('; ');
+  if (value !== null && typeof value === 'object') {
+    return Object.entries(value).map(([k, v]) => `${k}: ${flattenJson(v, k)}`).join(', ');
+  }
+  return String(value);
 }
 
 /**
