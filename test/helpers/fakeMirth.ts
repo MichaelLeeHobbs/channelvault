@@ -2,6 +2,7 @@
  * A minimal fake Mirth REST server (plain HTTP) for CLI tests: login, the
  * server configuration, and a record of every write it receives.
  */
+import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
@@ -30,12 +31,14 @@ export interface FakeMirth {
   writes: FakeRequest[];
   requests: FakeRequest[];
   deployed: Set<string>;
+  /** What GET /server/id returns: fixed per installation, untouched by a configuration restore. */
+  serverId: string;
   onRequest?: (request: FakeRequest) => FakeResponse | void | Promise<FakeResponse | void>;
   close(): Promise<void>;
 }
 
 export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth> {
-  const state: FakeMirth = { port: 0, config: structuredClone(config), writes: [], requests: [], deployed: new Set(), close: async () => undefined };
+  const state: FakeMirth = { port: 0, config: structuredClone(config), writes: [], requests: [], deployed: new Set(), serverId: randomUUID(), close: async () => undefined };
   const server: Server = createServer((req, res) => {
     let body = '';
     req.on('data', (c: Buffer) => (body += c.toString('utf8')));
@@ -62,6 +65,10 @@ export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth
       // XML when asked for it, as Mirth does (the backup/restore form).
       const wantsXml = (req.headers.accept ?? '').includes('application/xml');
       const sendsXml = (req.headers['content-type'] ?? '').includes('application/xml');
+      if (req.method === 'GET' && url.pathname === '/api/server/id') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        return res.end(state.serverId);
+      }
       if (req.method === 'GET' && url.pathname === '/api/server/configuration') {
         if (wantsXml) {
           res.writeHead(200, { 'Content-Type': 'application/xml' });

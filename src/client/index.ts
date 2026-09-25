@@ -71,6 +71,8 @@ export interface PutServerConfigurationOptions {
  */
 export interface MirthClientExt extends MirthClient {
   putServerConfiguration(config: CanonicalConfig, options?: PutServerConfigurationOptions): Promise<void>;
+  /** GET /server/id: the installation's ID, which a configuration restore does not change (verified on 4.5.2). */
+  getServerId(): Promise<string>;
   /** GET /server/configuration as the server's own XML (the Administrator's Backup Config document). */
   getServerConfigurationXml(): Promise<string>;
   /** PUT /server/configuration from backup XML, as the Administrator's Restore Config does. */
@@ -277,6 +279,12 @@ class MirthClientImpl implements MirthClientExt {
       },
       body: JSON.stringify(wrapped),
     });
+  }
+
+  async getServerId(): Promise<string> {
+    // JSON is refused (406); the ID comes as plain text.
+    const response = await this.request('GET', '/server/id', { headers: { Accept: 'text/plain' } });
+    return (await response.text()).trim();
   }
 
   async getServerConfigurationXml(): Promise<string> {

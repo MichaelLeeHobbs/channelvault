@@ -164,5 +164,12 @@ describe.skipIf(!enabled)('two disposable Mirth 4.5.2 servers', () => {
     const undone = new XmlConfigAdapter().parse(await readFile(undo!, 'utf8'));
     expect(channelsOf(undone).map(c => String(c['id']))).not.toContain(selectedId);
     expect(channelsOf(undone)).toHaveLength(before.length - 1);
+
+    // Both servers were seeded from one fixture, so their backups carry the
+    // same name; the server ID still tells them apart.
+    const sourceBackup = /backed up .+? to (.+)\n/.exec(backedUp.stdout)?.[1];
+    const crossed = await runCli(['restore', sourceBackup!, '--insecure', '--yes', '--backup-dir', backupDir], env(targetPort));
+    expect(crossed.status).toBe(1);
+    expect(crossed.stderr).toContain(`was taken from 127.0.0.1:${sourcePort}`);
   }, 120_000);
 });

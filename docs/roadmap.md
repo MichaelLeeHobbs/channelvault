@@ -137,5 +137,6 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - A backup is the server's own XML (`GET /server/configuration` as XML), not rebuilt by channelvault, so the Administrator can restore it too.
 - Named `<server>-<UTC stamp>.xml`, from the server name, then the environment name, then the host and port; UTC so the order holds across a DST change. The newest 10 per server are kept: backups hold credentials in plain text, the reason `.secrets/` is capped too.
 - `restore` defaults to the newest backup of the connected server, never the newest in the folder, which may be another server's. It saves an undo backup first and uses the same preview and confirmation as `push --whole-server`.
+- A backup's server is recorded by Mirth's server ID (`GET /server/id`), in a manifest beside the backups, not taken from the name in the file name. The name lives in Server Settings, which a restore or whole-server push copies to another server (verified on 4.5.2: the ID survives a configuration restore). Rotation only deletes files the manifest attributes to the server.
 - `push` backs up first unless `--no-backup`, so every push can be undone.
 - The sequential-save name rule for scoped pushes no longer applies to a whole replace (`--whole-server`, `restore`), which lands in one request; only its result must be free of name clashes.

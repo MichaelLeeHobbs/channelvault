@@ -50,6 +50,24 @@ describe('CLI push backup', () => {
     expect(saved).not.toContain('Alpha edited');
   });
 
+  it('backs up before a --whole-server replace too', async () => {
+    await edit('Alpha');
+    const pushed = await runCli(pushArgs('--yes', '--whole-server'), env);
+    expect(pushed.status, pushed.stderr).toBe(0);
+    expect(await backupFiles()).toHaveLength(1);
+  });
+
+  it('takes no backup when the push is declined at the prompt', async () => {
+    await edit('Alpha');
+    const running = startCli(pushArgs(), env, true);
+    try {
+      await running.waitFor('Continue?');
+      running.child.stdin.end('n\n');
+      expect((await running.finished).stdout).toContain('aborted.');
+      expect(await backupFiles()).toEqual([]);
+    } finally { running.child.kill(); }
+  });
+
   it('takes no backup with --no-backup, or when nothing is pushed', async () => {
     expect((await runCli(pushArgs('--yes'), env)).stdout).toContain('nothing to push');
     await edit('Alpha');

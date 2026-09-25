@@ -118,13 +118,16 @@ channelvault restore .backup/vns-gov-20260925T143012Z.xml --deploy
 ```
 
 - **Names.** The file is named after the server name in Server Settings, else the environment name, else the host and port, followed by the time in UTC. `.backup` is relative to the current directory; `--backup-dir` picks another.
-- **Plain-text credentials.** A backup holds every connector password and configuration-map value; channelvault's `{{env:…}}` placeholders don't apply. Files are readable by their owner only, and a backup directory channelvault creates contains a `.gitignore` that ignores everything in it. If git would still commit a backup, you get a warning. Keep backups off shared drives and out of CI artifacts.
-- **Rotation.** The newest 10 backups of each server are kept (`--keep` changes that); older ones are deleted.
+- **Which server.** That name is part of the configuration, so a restore or `push --whole-server` carries it to another server. Which server a backup came from is therefore recorded by Mirth's server ID, which belongs to the installation, in the directory's `channelvault-backups.json`. Choosing, checking and rotating backups go by that ID.
+- **Plain-text credentials.** A backup holds every connector password and configuration-map value; channelvault's `{{env:…}}` placeholders don't apply. Files are readable by their owner only (on Windows they get the folder's permissions instead), and a backup directory channelvault creates contains a `.gitignore` that ignores everything in it. If git would still commit a backup, you get a warning. Keep backups off shared drives and out of CI artifacts.
+- **Rotation.** The newest 10 backups of each server are kept (`--keep` changes that); older ones are deleted. Files the manifest doesn't attribute to the server, such as ones copied in by hand, are never deleted.
 - **Restore replaces the entire server**, like `push --whole-server`:
-  - Without a file it takes the newest backup of the server it is connected to, never another server's. A backup named for another server is refused unless you pass `--force`.
+  - Without a file it takes the newest backup of the server it is connected to, never another server's. A backup taken from another server is refused unless you pass `--force`. For a file from outside the backup directory only the server names can be compared, and it says so.
+  - The preview says when the restore changes the server's name. `push --whole-server` does too.
   - A backup from a newer Mirth version is refused; an older one is converted by the server.
   - It previews the channels and templates it creates, changes and deletes, and asks before continuing (`--yes` without a terminal).
-  - It saves the server's current configuration first, as a new backup, and prints the command that undoes the restore.
+  - It saves the server's current configuration first, as a new backup, and prints the command that undoes the restore. That backup is the newest, so a second plain `restore` reverts the first.
+  - If the server changes while you confirm, nothing is restored; run it again to review the new state.
   - `--deploy` redeploys every channel afterwards; `--overwrite-config-map` also replaces the configuration map.
 
 ## Local test server
