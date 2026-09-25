@@ -8,6 +8,8 @@
  * Both configs are in the live (Jackson JSON) shape, and the local one has its
  * `{{env:…}}` placeholders already rendered.
  */
+import { createHash } from 'node:crypto';
+
 import type { CanonicalConfig, Json } from '../types.js';
 
 type Obj = Record<string, Json>;
@@ -37,13 +39,26 @@ const nameOf = (o: Obj): string => String(o['name'] ?? o['id']);
 const revisionOf = (o: Obj): number => Number(o['revision'] ?? 0);
 
 /**
- * Key-order-insensitive structural equality. CRLF and LF compare equal: Mirth
- * drops the CR when it saves a channel (seen on 4.5.2), so a CR-only
- * difference can never be pushed and would otherwise re-appear on every run.
+ * Mirth rewrites every line ending (CRLF, and a lone CR too) as LF when it
+ * saves a channel (seen on 4.5.2), so a line-ending-only difference can never
+ * be pushed and would otherwise re-appear on every run.
  */
+export function normalizeEol(s: string): string {
+  return s.replace(/\r\n?/g, '\n');
+}
+
+/** `normalizeEol` applied to every string in a config (for display, e.g. `diff`). */
+export function normalizeEolDeep<T extends Json>(value: T): T {
+  if (typeof value === 'string') return normalizeEol(value) as T;
+  if (Array.isArray(value)) return value.map((v) => normalizeEolDeep(v)) as T;
+  if (isObj(value)) return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, normalizeEolDeep(v)])) as T;
+  return value;
+}
+
+/** Key-order-insensitive structural equality, ignoring line-ending style. */
 function same(a: Json | undefined, b: Json | undefined): boolean {
   if (a === b) return true;
-  if (typeof a === 'string' && typeof b === 'string') return a.replace(/\r\n/g, '\n') === b.replace(/\r\n/g, '\n');
+  if (typeof a === 'string' && typeof b === 'string') return normalizeEol(a) === normalizeEol(b);
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => same(x, b[i]));
   if (isObj(a) && isObj(b)) {
     const ka = Object.keys(a);
@@ -119,18 +134,69 @@ export interface Scope {
  * someone else's work.
  */
 export interface Known {
-  channels: string[];
-  libraries: string[];
-  codeTemplates: string[];
+  /** id -> revision when last synced (null: unknown, from an older tree). */
+  channels: Record<string, number | null>;
+  libraries: Record<string, number | null>;
+  codeTemplates: Record<string, number | null>;
+  /** Hash of the global scripts when last synced; they carry no revision. */
+  globalScripts?: string;
 }
 
+export function hashGlobalScripts(c: CanonicalConfig): string {
+  return createHash('sha256').update(JSON.stringify(normalizeEolDeep((c['globalScripts'] ?? null) as Json))).digest('hex');
+}
+
+/** The sync baseline for a config: every resource's revision, plus the global scripts' hash. */
 export function resourceIds(c: CanonicalConfig): Known {
   const libs = librariesOf(c);
+  const revs = (items: Obj[]) => Object.fromEntries(items.map((o) => [idOf(o), revisionOf(o)]));
   return {
-    channels: channelsOf(c).map(idOf),
-    libraries: libs.map(idOf),
-    codeTemplates: libs.flatMap((l) => templatesOf(l).map(idOf)),
+    channels: revs(channelsOf(c)),
+    libraries: revs(libs),
+    codeTemplates: revs(libs.flatMap(templatesOf)),
+    globalScripts: hashGlobalScripts(c),
   };
+}
+
+/** Accept the older id-list form of the baseline (no revisions). */
+export function knownFrom(raw: unknown): Known | undefined {
+  if (!isObj(raw as Json)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const map = (v: unknown): Record<string, number | null> =>
+    Array.isArray(v) ? Object.fromEntries(v.map((id) => [String(id), null])) : ((v ?? {}) as Record<string, number | null>);
+  return {
+    channels: map(r['channels']),
+    libraries: map(r['libraries']),
+    codeTemplates: map(r['codeTemplates']),
+    globalScripts: typeof r['globalScripts'] === 'string' ? r['globalScripts'] : undefined,
+  };
+}
+
+/**
+ * The baseline after a push: resources the push wrote take the server's new
+ * revision, created ones join, deleted ones leave; everything else keeps its
+ * old baseline, so a colleague's unpulled change still reads as a conflict.
+ */
+export function knownAfterPush(known: Known, applied: Change[], touched: Set<string>, fresh: CanonicalConfig): Known {
+  const now = resourceIds(fresh);
+  const next: Known = {
+    channels: { ...known.channels },
+    libraries: { ...known.libraries },
+    codeTemplates: { ...known.codeTemplates },
+    globalScripts: known.globalScripts,
+  };
+  const key = { channel: 'channels', library: 'libraries', codeTemplate: 'codeTemplates' } as const;
+  for (const c of applied) {
+    if (c.kind === 'globalScripts') {
+      next.globalScripts = now.globalScripts;
+    } else if (c.op === 'delete') {
+      delete next[key[c.kind]][c.id];
+    }
+  }
+  for (const k of ['channels', 'libraries', 'codeTemplates'] as const) {
+    for (const id of touched) if (id in now[k]) next[k][id] = now[k][id]!;
+  }
+  return next;
 }
 
 /** The server-configuration sections scoped push handles. */
@@ -190,7 +256,31 @@ function channelsUsing(lib: Obj, allChannelIds: string[]): string[] {
   return allChannelIds.filter((id) => enabled.has(id));
 }
 
+/** Groups of `items` sharing a key, for the keys held more than once. */
+function duplicates(items: Obj[], key: (o: Obj) => string): Array<[string, Obj[]]> {
+  const groups = new Map<string, Obj[]>();
+  for (const o of items) groups.set(key(o), [...(groups.get(key(o)) ?? []), o]);
+  return [...groups].filter(([, group]) => group.length > 1);
+}
+
+/**
+ * A copied channel or library directory keeps its source's id, and every save
+ * addresses resources by id, so pushing it would overwrite the original.
+ */
+function assertUniqueIds(local: CanonicalConfig): void {
+  const libs = librariesOf(local);
+  const problems = [
+    ...duplicates(channelsOf(local), idOf).map(([id, g]) => `channels ${g.map((o) => `"${nameOf(o)}"`).join(', ')} share id ${id}`),
+    ...duplicates(libs, idOf).map(([id, g]) => `libraries ${g.map((o) => `"${nameOf(o)}"`).join(', ')} share id ${id}`),
+    ...duplicates(libs.flatMap(templatesOf), idOf).map(([id, g]) => `code templates ${g.map((o) => `"${nameOf(o)}"`).join(', ')} share id ${id}`),
+  ];
+  if (problems.length > 0) {
+    throw new Error(`the tree holds duplicate ids (a copied directory keeps its source's id):\n  ${problems.join('\n  ')}\ngive each copy a new id (a UUID) before pushing`);
+  }
+}
+
 export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope = {}, known?: Known): Plan {
+  assertUniqueIds(local);
   const everything = scope.channels === undefined && scope.libraries === undefined && scope.globalScripts === undefined;
   const channelScope = everything || scope.channels !== undefined;
   const libraryScope = everything || scope.libraries !== undefined;
@@ -199,12 +289,24 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
   const deploy = new Set<string>();
   const serverOnly: string[] = [];
   /** A server resource missing from the tree: a planned delete, unless the tree never had it. */
-  const missingLocally = (kind: 'channel' | 'library' | 'codeTemplate', r: Obj, label: string, knownIds?: string[]): void => {
-    if (knownIds && !knownIds.includes(idOf(r))) {
-      serverOnly.push(`${kind === 'codeTemplate' ? 'code template' : kind} "${label}"`);
-    } else {
-      changes.push({ kind, op: 'delete', id: idOf(r), label });
+  const missingLocally = (
+    kind: 'channel' | 'library' | 'codeTemplate',
+    r: Obj,
+    label: string,
+    baseline?: Record<string, number | null>,
+  ): void => {
+    const what = `${kind === 'codeTemplate' ? 'code template' : kind} "${label}"`;
+    if (baseline && !(idOf(r) in baseline)) {
+      serverOnly.push(what);
+      return;
     }
+    // Deleted locally, but edited on the server since the last pull: the
+    // delete would discard someone else's work, so it is a conflict too.
+    const pulled = baseline?.[idOf(r)];
+    if (pulled != null && revisionOf(r) > pulled) {
+      conflicts.push(`${what} changed on the server since the last pull (revision ${revisionOf(r)}, pulled ${pulled}); deleting it would discard that`);
+    }
+    changes.push({ kind, op: 'delete', id: idOf(r), label });
   };
 
   // Channels
@@ -231,6 +333,31 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
     }
   }
 
+  // The channels as they will be after this push: the server's, minus planned
+  // deletes, with the tree's copy where the push writes one. Redeploys are
+  // computed from these, so a channel created on the server since the pull,
+  // or outside --channel, still gets a changed library's new code.
+  const deletedChannels = new Set(changes.filter((c) => c.kind === 'channel' && c.op === 'delete').map((c) => c.id));
+  const writtenChannels = new Set(changes.filter((c) => c.kind === 'channel' && c.op !== 'delete').map((c) => c.id));
+  const effective = new Map<string, Obj>();
+  for (const r of channelsOf(remote)) if (!deletedChannels.has(idOf(r))) effective.set(idOf(r), r);
+  for (const l of channelsOf(local)) if (writtenChannels.has(idOf(l))) effective.set(idOf(l), l);
+  // A saved channel may not take a name another channel holds, on the server
+  // now or after the push (a tree channel beside a same-named server channel
+  // with another id, as when servers were set up separately). Saves run before
+  // deletes and one at a time, so a name freed by a delete or rename in the
+  // same push is still taken when the save runs. Case-insensitive, to be safe.
+  const nameKey = (c: Obj) => nameOf(c).toLowerCase();
+  const holders = [...new Map([...channelsOf(remote), ...effective.values()].map((c) => [`${idOf(c)}\n${nameKey(c)}`, c])).values()];
+  const clashes = duplicates(holders, nameKey).filter(([, g]) => g.some((c) => writtenChannels.has(idOf(c))));
+  if (clashes.length > 0) {
+    throw new Error(
+      `the push would save a channel under a name another channel holds:\n  ` +
+        clashes.map(([, g]) => `"${nameOf(g[0]!)}": ids ${[...new Set(g.map(idOf))].join(', ')}`).join('\n  ') +
+        `\nrename one of them, or delete or rename the other in a push of its own first`,
+    );
+  }
+
   // Code templates and libraries
   if (libraryScope) {
     const ll = librariesOf(local);
@@ -240,7 +367,7 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
     const remoteLibById = new Map(rl.map((l) => [idOf(l), l]));
     const remoteTemplates = new Map(rl.flatMap((l) => templatesOf(l).map((t) => [idOf(t), t] as const)));
     const localTemplateIds = new Set(ll.flatMap((l) => templatesOf(l).map(idOf)));
-    const allChannelIds = channelsOf(local).map(idOf);
+    const allChannelIds = [...effective.keys()];
 
     for (const lib of ll.filter(inScope)) {
       const r = remoteLibById.get(idOf(lib));
@@ -263,10 +390,19 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
         }
         touched = true;
       }
-      if (touched) for (const id of channelsUsing(lib, allChannelIds)) deploy.add(id);
+      // Channels using it before or after the push both need a redeploy: one
+      // losing access to the library must stop running its old code too.
+      if (touched) {
+        for (const id of channelsUsing(lib, allChannelIds)) deploy.add(id);
+        if (r) for (const id of channelsUsing(r, allChannelIds)) deploy.add(id);
+      }
     }
     for (const r of rl.filter(inScope)) {
-      if (!ll.some((l) => idOf(l) === idOf(r))) missingLocally('library', r, nameOf(r), known?.libraries);
+      if (!ll.some((l) => idOf(l) === idOf(r))) {
+        const before = changes.length;
+        missingLocally('library', r, nameOf(r), known?.libraries);
+        if (changes.length > before) for (const id of channelsUsing(r, allChannelIds)) deploy.add(id);
+      }
       for (const t of templatesOf(r)) {
         if (!localTemplateIds.has(idOf(t))) missingLocally('codeTemplate', t, `${nameOf(r)}/${nameOf(t)}`, known?.codeTemplates);
       }
@@ -276,6 +412,10 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
   // Global scripts
   if ((everything || scope.globalScripts === true) && !same(local['globalScripts'], remote['globalScripts'])) {
     changes.push({ kind: 'globalScripts', op: 'update', id: 'globalScripts', label: 'global scripts' });
+    // No revision to compare, so compare against the hash taken at the last sync.
+    if (known?.globalScripts && hashGlobalScripts(remote) !== known.globalScripts) {
+      conflicts.push('global scripts changed on the server since the last pull');
+    }
   }
 
   const notPushed = everything
@@ -286,7 +426,7 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
 
   // Only enabled channels that will exist after the push can be deployed.
   const enabled = new Set(
-    channelsOf(local)
+    [...effective.values()]
       .filter((c) => {
         const md = isObj(c['exportData']) ? c['exportData']['metadata'] : undefined;
         return !(isObj(md) && md['enabled'] === false);
@@ -308,14 +448,76 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
  * replaces the whole list): the tree's version of each library in scope and the
  * server's version of the rest, so a scoped push never touches other libraries.
  */
-export function librariesToSend(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope = {}): Obj[] {
+export function librariesToSend(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope, plan: Plan): Obj[] {
   const ll = librariesOf(local);
   const rl = librariesOf(remote);
-  if (scope.libraries === undefined) return ll;
-  const inScope = (o: Obj) => scope.libraries!.includes(nameOf(o)) || scope.libraries!.includes(idOf(o));
-  const out = rl.map((r) => (inScope(r) ? ll.find((l) => idOf(l) === idOf(r)) : r)).filter((x): x is Obj => x !== undefined);
+  const inScope =
+    scope.libraries === undefined ? () => true : (o: Obj) => scope.libraries!.includes(nameOf(o)) || scope.libraries!.includes(idOf(o));
+  // Start from the server's list: a library leaves it only through a planned
+  // (and approved) delete, so one created on the server since the pull survives.
+  const deleted = new Set(plan.changes.filter((c) => c.kind === 'library' && c.op === 'delete').map((c) => c.id));
+  const localById = new Map(ll.map((l) => [idOf(l), l]));
+  const out: Obj[] = [];
+  for (const r of rl) {
+    if (deleted.has(idOf(r))) continue;
+    const l = localById.get(idOf(r));
+    out.push(l && inScope(l) ? l : r);
+  }
   for (const l of ll) if (inScope(l) && !rl.some((r) => idOf(r) === idOf(l))) out.push(l);
   return out;
+}
+
+/**
+ * Planned resources whose server copy changed between `before` (what the plan
+ * was made from) and `after`. Run after the confirmation prompt: an edit made
+ * in the Administrator while it was open must not be overwritten.
+ */
+export function changedSince(plan: Plan, before: CanonicalConfig, after: CanonicalConfig): string[] {
+  const out: string[] = [];
+  const libs = (c: CanonicalConfig) => new Map(librariesOf(c).map((l) => [idOf(l), l]));
+  const [lb, la] = [libs(before), libs(after)];
+  for (const c of plan.changes) {
+    let a: Obj | undefined;
+    let b: Obj | undefined;
+    if (c.kind === 'channel') [b, a] = [findChannel(before, c.id), findChannel(after, c.id)];
+    else if (c.kind === 'codeTemplate') [b, a] = [findTemplate(before, c.id), findTemplate(after, c.id)];
+    else if (c.kind === 'library') [b, a] = [lb.get(c.id), la.get(c.id)];
+    else if (!same(before['globalScripts'], after['globalScripts'])) out.push('global scripts');
+    if (c.kind === 'globalScripts') continue;
+    const existed = b !== undefined;
+    const exists = a !== undefined;
+    if (existed !== exists || (a && b && revisionOf(a) !== revisionOf(b))) out.push(`${c.kind} "${c.label}"`);
+  }
+  // The library-list save replaces every library, not just the planned ones:
+  // any library added, removed or changed meanwhile would be reverted.
+  if (plan.changes.some((c) => c.kind === 'library')) {
+    const shape = (m: Map<string, Obj>) => [...m].map(([id, l]) => `${id}@${revisionOf(l)}`).sort().join(',');
+    if (shape(lb) !== shape(la)) out.push('code template libraries (the library list is saved as a whole)');
+  }
+  return [...new Set(out)];
+}
+
+/** Two server configurations hold the same data (ignoring the export `date`, which every GET changes). */
+export function sameServerConfig(a: CanonicalConfig, b: CanonicalConfig): boolean {
+  const { date: _a, ...ra } = a;
+  const { date: _b, ...rb } = b;
+  return same(ra as Json, rb as Json);
+}
+
+/** Only adopt a save's revision while the server still holds the content sent. */
+export function savedChangeMatches(change: Change, local: CanonicalConfig, remote: CanonicalConfig): boolean {
+  if (change.kind === 'globalScripts') return same(local['globalScripts'], remote['globalScripts']);
+  const find = (config: CanonicalConfig): Obj | undefined => change.kind === 'channel'
+    ? findChannel(config, change.id)
+    : change.kind === 'codeTemplate'
+      ? findTemplate(config, change.id)
+      : librariesOf(config).find(l => idOf(l) === change.id);
+  const after = find(remote);
+  if (change.op === 'delete') return after === undefined;
+  const sent = find(local);
+  if (!sent || !after) return false;
+  const shape = change.kind === 'library' ? libraryShape : stripVolatile;
+  return same(shape(sent), shape(after));
 }
 
 /** Find a code template by id in a config. */

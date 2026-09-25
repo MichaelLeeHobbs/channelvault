@@ -1,7 +1,8 @@
 /**
  * Live integration test against a running Mirth server.
  *
- * Skipped unless `MIRTH_HOST` is set AND the server answers. Bring one up with:
+ * Skipped unless `MIRTH_HOST` is set. A configured but unavailable server fails.
+ * Use a disposable server only; these tests write its configuration:
  *   docker compose up -d
  *   MIRTH_HOST=localhost MIRTH_PORT=8443 MIRTH_USER=admin MIRTH_PASS=admin pnpm test
  *
@@ -30,23 +31,7 @@ const cfg: ClientConfig = {
   disableTlsCheck: process.env.MIRTH_INSECURE !== 'false',
 };
 
-async function reachable(): Promise<boolean> {
-  if (!HOST) return false;
-  // Allow self-signed certs for the reachability probe.
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-  try {
-    const proto = cfg.https === false ? 'http' : 'https';
-    const r = await fetch(`${proto}://${cfg.host}:${cfg.port}/api/server/version`, {
-      headers: { 'X-Requested-With': 'XMLHttpRequest' },
-    });
-    return r.status > 0 && r.status < 500;
-  } catch {
-    return false;
-  }
-}
-
-const live = await reachable();
-const maybe = live ? describe : describe.skip;
+const maybe = HOST ? describe : describe.skip;
 
 maybe('live Mirth server', () => {
   let client: MirthClientExt;
@@ -57,13 +42,13 @@ maybe('live Mirth server', () => {
   const SERVER_TIMEOUT = 60_000;
 
   beforeAll(async () => {
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
     client = createMirthClient(cfg);
     await client.login();
     work = await mkdtemp(path.join(tmpdir(), 'channelvault-live-'));
   }, SERVER_TIMEOUT);
   afterAll(async () => {
     await client?.logout().catch(() => undefined);
+    await client?.close();
     if (work) await rm(work, { recursive: true, force: true });
   });
 

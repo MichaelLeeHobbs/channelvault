@@ -11,26 +11,46 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 
-import { Command } from 'commander';
+import { Command, CommanderError } from 'commander';
 
 import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
-import { createMirthClient, type MirthClientExt } from './client/index.js';
-import { channelsOf, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
+import { createMirthClient, UNTRUSTED_CERT_CODES, type MirthClientExt } from './client/index.js';
+import {
+  changedSince,
+  channelsOf,
+  knownAfterPush,
+  librariesOf,
+  savedChangeMatches,
+  knownFrom,
+  normalizeEolDeep,
+  planPush,
+  resourceIds,
+  sameServerConfig,
+  type Change,
+  type Known,
+  type Plan,
+  type Scope,
+} from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
-import { render, templatize } from './secrets/index.js';
+import { mapLeaves, redactKnownSecrets, render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
-import { formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
+import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
+import { readJson } from './json.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
 
 const engine = createExplodeEngine();
 const xml = new XmlConfigAdapter();
+
+/** From package.json, one level up from both src/cli.ts and dist/cli.js. */
+const VERSION = (createRequire(import.meta.url)('../package.json') as { version: string }).version;
 
 // --- helpers --------------------------------------------------------------
 
@@ -46,8 +66,14 @@ function fail(message: string): never {
   throw new CliError(message);
 }
 
+/** Exit status for an error. `diff` uses 2, because its 1 means "differences found". */
+let errorExitCode = 1;
+
 /** Directories under a working tree that `explode` owns (cleared before a pull). */
 const MANAGED_DIRS = ['server', 'channels', 'codeTemplates', 'channelGroups'];
+
+/** Where `replaceTree` explodes before swapping in; removed before and after. */
+const STAGING_DIR = '.channelvault-staging';
 
 /**
  * Recursive-remove options. `maxRetries` is essential on Windows, where a
@@ -87,6 +113,8 @@ function resolveClientConfig(flags: ConnectionFlags): ClientConfig {
     password,
     https: flags.https !== false,
     disableTlsCheck: flags.insecure === true,
+    // Opt-in: error bodies can echo credentials (see `scrub`, applied to all output).
+    includeResponseBodies: Boolean(process.env.CHANNELVAULT_DEBUG),
   };
 }
 
@@ -113,9 +141,15 @@ async function withClient<T>(flags: ConnectionFlags, fn: (client: MirthClientExt
 
 async function confirm(question: string): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const controller = new AbortController();
+  rl.once('close', () => controller.abort());
+  rl.once('SIGINT', () => controller.abort());
   try {
-    const answer = (await rl.question(`${question} [y/N] `)).trim().toLowerCase();
+    const answer = (await rl.question(`${question} [y/N] `, { signal: controller.signal })).trim().toLowerCase();
     return answer === 'y' || answer === 'yes';
+  } catch (err) {
+    if (controller.signal.aborted) fail('confirmation interrupted; nothing was pushed');
+    throw err;
   } finally {
     rl.close();
   }
@@ -156,10 +190,10 @@ interface SyncMeta {
   resources?: Known;
 }
 
-async function writeMeta(root: string, source: string, config: CanonicalConfig): Promise<void> {
+async function writeMeta(root: string, source: string, config: CanonicalConfig, previous: SyncMeta | null): Promise<void> {
   const meta: SyncMeta = {
     tool: 'channelvault',
-    version: '0.1.0',
+    version: VERSION,
     source,
     pulledAt: new Date().toISOString(),
     // XML adapter yields `@_version`; the live JSON API yields `@version` (Jackson).
@@ -171,18 +205,22 @@ async function writeMeta(root: string, source: string, config: CanonicalConfig):
           : null,
     resources: resourceIds(config),
   };
-  await writeFile(path.join(root, 'channelvault.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8');
+  // A pull that changed nothing else must not leave a timestamp-only change
+  // for git to show.
+  const file = path.join(root, 'channelvault.json');
+  if (previous && JSON.stringify({ ...previous, pulledAt: '' }) === JSON.stringify({ ...meta, pulledAt: '' })) return;
+  await writeFile(file, JSON.stringify(meta, null, 2) + '\n', 'utf8');
 }
 
 // --- secrets / env ----------------------------------------------------------
 
 interface EnvFlags {
-  envFile?: string;
+  dotenv?: string;
   extractSecrets?: boolean;
 }
 
 function envFilePath(root: string, flags: EnvFlags): string {
-  return flags.envFile ? path.resolve(flags.envFile) : path.join(root, '.env');
+  return flags.dotenv ? path.resolve(flags.dotenv) : path.join(root, '.env');
 }
 
 /** The env file overlaid with the process environment (which wins, as in CI). */
@@ -191,7 +229,9 @@ async function loadEnv(file: string): Promise<Record<string, string | undefined>
 }
 
 function addEnvFlag(cmd: Command): Command {
-  return cmd.option('--env-file <path>', 'env file holding secrets and per-environment values (default <dir>/.env)');
+  // Not --env-file: Node scans the whole command line for that name and parses
+  // the file itself (it fails on a directory and honours NODE_OPTIONS in it).
+  return cmd.option('--dotenv <path>', 'env file holding secrets and per-environment values (default <dir>/.env)');
 }
 
 function addExtractFlag(cmd: Command): Command {
@@ -205,7 +245,42 @@ async function existingTree(root: string): Promise<CanonicalConfig | null> {
 
 /** The tree with placeholders filled from the env file; fails listing any missing names. */
 async function renderedTree(root: string, flags: EnvFlags): Promise<CanonicalConfig> {
-  return render(await engine.implode({ root }), await loadEnv(envFilePath(root, flags)));
+  const tree = await engine.implode({ root });
+  const env = await loadEnv(envFilePath(root, flags));
+  rememberSecrets(tree, env);
+  return render(tree, env);
+}
+
+/**
+ * The values behind the tree's placeholders. A server's error can echo what
+ * was sent, so everything printed about a failure goes through `scrub`.
+ */
+const knownSecrets = new Set<string>();
+
+function rememberSecrets(tree: CanonicalConfig, env: Record<string, string | undefined>): void {
+  mapLeaves(tree, (value) => {
+    for (const m of value.matchAll(/\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g)) {
+      const secret = env[m[1]!];
+      // Shorter values (a port, "true") would redact ordinary words.
+      if (secret !== undefined && secret.length >= 4) knownSecrets.add(secret);
+    }
+    return value;
+  });
+}
+
+/**
+ * `text` with every known secret value replaced, longest first. Error bodies
+ * reach here decoded (see `readableBody`); the encoded forms cover text that
+ * quotes a secret some other way.
+ */
+function scrub(text: string): string {
+  const forms = [...knownSecrets].flatMap((s) => [
+    s,
+    JSON.stringify(s).slice(1, -1),
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'),
+    encodeURIComponent(s),
+  ]);
+  return [...new Set(forms)].sort((a, b) => b.length - a.length).reduce((t, s) => t.split(s).join('<redacted>'), text);
 }
 
 /**
@@ -218,7 +293,7 @@ const ALLOW_FILE = 'channelvault.allow.json';
 async function readAllow(root: string): Promise<AllowEntry[]> {
   const file = path.join(root, ALLOW_FILE);
   if (!existsSync(file)) return [];
-  const parsed = JSON.parse(await readFile(file, 'utf8')) as { ignore?: AllowEntry[] };
+  const parsed = await readJson<{ ignore?: AllowEntry[] }>(file);
   return parsed.ignore ?? [];
 }
 
@@ -229,6 +304,7 @@ async function readAllow(root: string): Promise<AllowEntry[]> {
  */
 async function writeTree(root: string, fetched: CanonicalConfig, source: string, flags: EnvFlags): Promise<void> {
   const envFile = envFilePath(root, flags);
+  const previousMeta = await preflightTree(root, envFile);
   const env = await loadEnv(envFile);
   const templated = templatize(fetched, await existingTree(root), env);
   const scan = scanSecrets(templated.config, {
@@ -245,24 +321,125 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   }
   const config = scan.config;
   const envUpdates = { ...templated.envUpdates, ...scan.envUpdates };
+  rememberSecrets(config, { ...env, ...envUpdates });
+  // A known secret repeated somewhere no rule recognised is still in plain
+  // text; say where (the env file's own values only, not all of process.env).
+  const echoes = findEchoes(config, { ...(await readEnvFile(envFile)), ...envUpdates });
 
-  await clearManaged(root);
-  await engine.explode(config, { root });
-  await writeMeta(root, source, config);
-  const backup = await backupEnvFile(envFile, envUpdates, path.join(root, '.secrets'));
-  await updateEnvFile(envFile, envUpdates);
+  // Secrets first: a tree whose placeholders have no values behind them is
+  // the one state a pull must never leave. If the env file can't be written,
+  // the tree is untouched.
+  await mkdir(root, { recursive: true });
+  await mkdir(path.dirname(envFile), { recursive: true });
   const rel = path.relative(root, envFile);
-  if (backup || (existsSync(envFile) && !rel.startsWith('..') && !path.isAbsolute(rel))) await ensureEnvIgnored(root);
+  const envInTree = !rel.startsWith('..') && !path.isAbsolute(rel);
+  const backup = await backupEnvFile(envFile, envUpdates, path.join(root, '.secrets'));
+  if (backup || (envInTree && Object.keys(envUpdates).length > 0)) await ensureEnvIgnored(root, envInTree ? envFile : undefined);
+  await updateEnvFile(envFile, envUpdates);
+
+  await replaceTree(root, config);
+  await writeMeta(root, source, fetched, previousMeta);
   if (scan.findings.length > 0) process.stdout.write(`extracted ${scan.findings.length} secret(s) found in values\n`);
   const updated = Object.keys(envUpdates).length;
   if (updated > 0) process.stdout.write(`stored ${updated} secret value(s) in ${envFile}\n`);
   if (backup) process.stdout.write(`previous env file kept as ${backup}\n`);
   for (const note of templated.notes) process.stderr.write(`note: ${note}\n`);
+  for (const e of echoes) {
+    process.stderr.write(`warning: the value of ${e.name} also appears in plain text at ${e.where}\n`);
+  }
+  if (existsSync(envFile) && gitWouldCommit(envFile)) {
+    process.stderr.write(`warning: git does not ignore ${envFile}, so its secret values could be committed; add it to .gitignore\n`);
+  }
 }
 
-async function clearManaged(root: string): Promise<void> {
-  await Promise.all(MANAGED_DIRS.map((d) => rm(path.join(root, d), RM_OPTS)));
+/**
+ * True when `file` is inside a git work tree and not ignored there (or is
+ * already tracked). Outside a repository, or without git, there is nothing to
+ * commit it to.
+ */
+function gitWouldCommit(file: string): boolean {
+  const r = spawnSync('git', ['check-ignore', '-q', path.basename(file)], { cwd: path.dirname(file) });
+  return r.status === 1;
 }
+
+/** `p` with links resolved as far as it exists (the rest may not be created yet). */
+async function resolvedPath(p: string): Promise<string> {
+  const abs = path.resolve(p);
+  let existing = abs;
+  while (!existsSync(existing) && path.dirname(existing) !== existing) existing = path.dirname(existing);
+  return path.join(await realpath(existing), path.relative(existing, abs));
+}
+
+/** `child` is `parent` or inside it (case-insensitively on Windows). */
+function isWithin(child: string, parent: string): boolean {
+  const norm = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  const rel = path.relative(norm(parent), norm(child));
+  // `..runtime.env` is a file name, not a step up.
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/**
+ * Everything that can stop `pull`/`explode` must be checked before either
+ * writes: they update the env file, then replace the managed directories,
+ * then rewrite `channelvault.json`. Returns the existing metadata, if any.
+ */
+async function preflightTree(root: string, envFile: string): Promise<SyncMeta | null> {
+  // The swap deletes these, so the env file must not live in one: neither by
+  // the path given (a link inside one is removed with it) nor by where links
+  // lead.
+  const [realRoot, realEnv] = await Promise.all([resolvedPath(root), resolvedPath(envFile)]);
+  const doomed = [...MANAGED_DIRS, STAGING_DIR].find(
+    (d) => isWithin(path.resolve(envFile), path.resolve(root, d)) || isWithin(realEnv, path.join(realRoot, d)),
+  );
+  if (doomed) fail(`the env file ${envFile} is inside ${doomed}/, which this command replaces; keep it elsewhere`);
+
+  const metaPath = path.join(root, 'channelvault.json');
+  if (existsSync(metaPath)) {
+    let meta: unknown;
+    try {
+      meta = await readJson(metaPath);
+    } catch (err) {
+      meta = err;
+    }
+    if (meta === null || typeof meta !== 'object' || Array.isArray(meta) || meta instanceof Error || typeof (meta as SyncMeta).source !== 'string') {
+      fail(
+        `${metaPath} is unreadable or not channelvault metadata${meta instanceof Error ? ` (${meta.message})` : ''}; nothing was written. ` +
+          'Restore it (for example `git checkout -- channelvault.json`) and retry.',
+      );
+    }
+    return meta as SyncMeta;
+  }
+  // The managed directories must be ones channelvault wrote.
+  const foreign = MANAGED_DIRS.filter((d) => existsSync(path.join(root, d)));
+  if (foreign.length > 0) {
+    fail(
+      `${root} is not a channelvault tree (no channelvault.json) but has ${foreign.map((d) => `${d}/`).join(', ')}, ` +
+        'which this command would replace; nothing was written. Use a new or empty directory ' +
+        '(or, if an earlier pull or explode into it was interrupted, delete those directories).',
+    );
+  }
+  return null;
+}
+
+/**
+ * Explode into a staging directory inside the tree, then swap it in one
+ * managed directory at a time. A failure while exploding leaves the old tree
+ * as it was; only the swap itself (a few renames) can be interrupted.
+ */
+async function replaceTree(root: string, config: CanonicalConfig): Promise<void> {
+  const staging = path.join(root, STAGING_DIR);
+  await rm(staging, RM_OPTS);
+  try {
+    await engine.explode(config, { root: staging });
+    for (const d of MANAGED_DIRS) {
+      await rm(path.join(root, d), RM_OPTS);
+      if (existsSync(path.join(staging, d))) await rename(path.join(staging, d), path.join(root, d));
+    }
+  } finally {
+    await rm(staging, RM_OPTS);
+  }
+}
+
 
 function assertTree(root: string): void {
   if (!existsSync(path.join(root, 'server', 'configuration.json'))) {
@@ -286,7 +463,7 @@ async function readTreeOrigin(root: string): Promise<TreeOrigin> {
   const metaPath = path.join(root, 'channelvault.json');
   if (!existsSync(metaPath)) return 'unknown';
   try {
-    const meta = JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta;
+    const meta = await readJson<SyncMeta>(metaPath);
     if (typeof meta.source === 'string') {
       if (meta.source.startsWith('file:')) return 'xml';
       if (/^https?:\/\//i.test(meta.source)) return 'live';
@@ -342,29 +519,16 @@ function collect(value: string, previous: string[] | undefined): string[] {
 async function readKnown(root: string): Promise<Known | undefined> {
   const metaPath = path.join(root, 'channelvault.json');
   if (!existsSync(metaPath)) return undefined;
-  return (JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta).resources;
+  return knownFrom((await readJson<SyncMeta>(metaPath)).resources);
 }
 
 async function writeKnown(root: string, known: Known): Promise<void> {
   const metaPath = path.join(root, 'channelvault.json');
   if (!existsSync(metaPath)) return;
-  const meta = JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta;
+  const meta = await readJson<SyncMeta>(metaPath);
   if (!meta.resources) return; // an older tree: leave it to the next pull
   meta.resources = known;
   await writeFile(metaPath, JSON.stringify(meta, null, 2) + '\n', 'utf8');
-}
-
-/** The tree now knows what it created and has forgotten what it deleted. */
-function afterChanges(known: Known, applied: Change[]): Known {
-  const key = { channel: 'channels', library: 'libraries', codeTemplate: 'codeTemplates' } as const;
-  const next: Known = { channels: [...known.channels], libraries: [...known.libraries], codeTemplates: [...known.codeTemplates] };
-  for (const c of applied) {
-    if (c.kind === 'globalScripts') continue;
-    const ids = next[key[c.kind]];
-    if (c.op === 'create' && !ids.includes(c.id)) ids.push(c.id);
-    if (c.op === 'delete') next[key[c.kind]] = ids.filter((id) => id !== c.id);
-  }
-  return next;
 }
 
 function printChanges(plan: Plan): void {
@@ -440,13 +604,34 @@ async function scopedPush(
     return;
   }
 
-  const result = await applyPlan(client, plan, local, remote, scope);
+  // The prompt may have been open for a while: re-check that nothing in the
+  // plan changed on the server meanwhile. Each channel save re-checks its own
+  // revision once more; the gap after that last check can't be closed from
+  // here, because Mirth accepts a stale revision.
+  const fresh = await client.getServerConfiguration();
+  const moved = changedSince(plan, remote, fresh);
+  if (moved.length > 0 && !flags.force) {
+    fail(`changed on the server while this push was being confirmed:\n  ${moved.join('\n  ')}\npull and try again, or pass --force`);
+  }
+  // Apply against the fresh snapshot, so whatever is sent for resources
+  // outside the plan (the rest of the library list) is the server's latest.
+  const result = await applyPlan(client, plan, local, fresh, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
   // resources that did go through don't read as conflicts next time.
-  if (result.touchedIds.size > 0) {
-    await refreshRevisions(root, await client.getServerConfiguration(), result.touchedIds);
+  try {
+    const after = await client.getServerConfiguration();
+    const refreshedLibraries: Change[] = librariesOf(local)
+      .filter(l => result.touchedIds.has(String(l['id'])))
+      .map(l => ({ kind: 'library', op: 'update', id: String(l['id']), label: String(l['name']) }));
+    const changedAgain = [...result.applied, ...refreshedLibraries].filter(c => !savedChangeMatches(c, local, after));
+    if (changedAgain.length > 0) fail(`changed again after saving: ${[...new Set(changedAgain.map(c => c.label))].join(', ')}; pull and review before retrying`);
+    if (result.touchedIds.size > 0) await refreshRevisions(root, after, result.touchedIds);
+    if (known) await writeKnown(root, knownAfterPush(known, result.applied, result.touchedIds, after));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!result.failed) fail(`applied ${result.applied.length} change(s), but could not refresh the local sync baseline: ${message}; inspect the server before retrying`);
+    process.stderr.write(`warning: could not refresh the local sync baseline: ${scrub(message)}\n`);
   }
-  if (known) await writeKnown(root, afterChanges(known, result.applied));
   if (result.failed) {
     const { change, error } = result.failed;
     fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}`);
@@ -456,7 +641,7 @@ async function scopedPush(
   if (toDeploy.length > 0) {
     const failures = await deployChannels(client, toDeploy, nameOf);
     process.stdout.write(`deployed ${toDeploy.length - failures.length} of ${toDeploy.length} channel(s)\n`);
-    for (const f of failures) process.stderr.write(`deploy failed: ${f.name}: ${f.error}\n`);
+    for (const f of failures) process.stderr.write(`deploy failed: ${f.name}: ${scrub(f.error)}\n`);
     if (failures.length > 0) process.exitCode = 1;
   }
 }
@@ -481,27 +666,49 @@ async function wholeServerPush(
     process.stdout.write('Channel, library and template changes:\n');
     printChanges(plan);
   }
-  if (plan.notPushed.length > 0) process.stdout.write(`also replaced: ${plan.notPushed.join(', ')}\n`);
-  // A full replace deletes what the tree lacks, including work created on the
-  // server since the pull, which a scoped push would have left alone.
+  // A full replace also deletes what the server has and the tree never had
+  // (created since the pull). That is both a deletion and someone else's
+  // work: it needs --allow-deletes and --force, and the preview names it.
+  for (const r of plan.serverOnly) process.stdout.write(`  delete  ${r} (created on the server since the last pull)\n`);
+  // Mirth keeps its own configuration map unless told to overwrite it.
+  const keptMap = plan.notPushed.includes('configurationMap') && !flags.overwriteConfigMap;
+  const replaced = plan.notPushed.filter((k) => !(keptMap && k === 'configurationMap'));
+  if (replaced.length > 0) process.stdout.write(`also replaced: ${replaced.join(', ')}\n`);
+  if (keptMap) process.stdout.write('configuration map differs but is kept (--overwrite-config-map replaces it)\n');
   if (plan.serverOnly.length > 0 && !flags.force) {
-    fail(
-      `these were created on the server since the last pull and would be deleted:\n  ${plan.serverOnly.join('\n  ')}\n` +
-        `pull first, or pass --force to delete them`,
-    );
+    fail('the replace would delete resources created on the server since the last pull; pull first, or pass --force (and --allow-deletes)');
+  }
+  const deletions = plan.changes.filter((c) => c.op === 'delete').length + plan.serverOnly.length;
+  if (deletions > 0 && !flags.allowDeletes) {
+    fail(`the replace deletes ${deletions} resource(s) from the server; pass --allow-deletes`);
   }
   checkPlan(plan, flags);
   if (!flags.yes && !(await confirm('Continue?'))) {
     process.stdout.write('aborted.\n');
     return;
   }
+  // The preview was made from `remote`; anything changed since would be
+  // overwritten without having been shown.
+  const fresh = await client.getServerConfiguration();
+  if (!sameServerConfig(remote, fresh) && !flags.force) {
+    fail('the server changed while this push was being confirmed; pull and try again, or pass --force');
+  }
+  // Force permits concurrent edits, but never grants deletion consent.
+  const freshPlan = planPush(local, fresh, {}, known);
+  if (!flags.allowDeletes && (freshPlan.serverOnly.length > 0 || freshPlan.changes.some(c => c.op === 'delete'))) {
+    fail('the replace now deletes resources from the server; review the new plan and pass --allow-deletes');
+  }
   await client.putServerConfiguration(local, {
     deploy: flags.deploy === true,
     overwriteConfigMap: flags.overwriteConfigMap === true,
   });
+  const after = await client.getServerConfiguration();
+  if (planPush(local, after).changes.length > 0) {
+    fail('applied the whole-server replacement, but resources changed again after saving; pull and review before retrying');
+  }
   const ids = resourceIds(local);
-  await refreshRevisions(root, await client.getServerConfiguration(), new Set([...ids.channels, ...ids.libraries, ...ids.codeTemplates]));
-  if (known) await writeKnown(root, ids);
+  await refreshRevisions(root, after, new Set([...Object.keys(ids.channels), ...Object.keys(ids.libraries), ...Object.keys(ids.codeTemplates)]));
+  if (known) await writeKnown(root, resourceIds(after));
   process.stdout.write(`pushed ${root} -> ${target}\n`);
 }
 
@@ -511,7 +718,11 @@ const program = new Command();
 program
   .name('channelvault')
   .description('Git-style pull/push/diff for Mirth Connect')
-  .version('0.1.0');
+  .version(VERSION)
+  // An unused argument is almost always a flag lost in transit (e.g. a script
+  // runner passing a literal `--`); fail rather than silently drop it.
+  // Subcommands defined below inherit this.
+  .allowExcessArguments(false);
 
 addExtractFlag(addEnvFlag(
   program
@@ -551,6 +762,7 @@ addExtractFlag(addEnvFlag(addConnectionFlags(
     .argument('<dir>', 'working-tree directory'),
 ))).action(async (dir: string, flags: ConnectionFlags & EnvFlags) => {
   const root = path.resolve(dir);
+  await preflightTree(root, envFilePath(root, flags)); // before fetching a whole server for nothing
   const config = await withClient(flags, (client) => client.getServerConfiguration());
   const cfg = resolveClientConfig(flags);
   await writeTree(root, config, `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`, flags);
@@ -613,9 +825,15 @@ addEnvFlag(addConnectionFlags(
 addEnvFlag(addConnectionFlags(
   program
     .command('diff')
-    .description('Diff a working tree against the live server configuration')
-    .argument('<dir>', 'working-tree directory'),
+    .description('Diff a working tree against the live server configuration (exit 0 = same, 1 = differences, 2 = error)')
+    .argument('<dir>', 'working-tree directory')
+    // Usage errors must not read as "differences found" either.
+    .exitOverride((err) => {
+      process.exitCode = err.exitCode === 0 ? 0 : 2;
+      throw err;
+    }),
 )).action(async (dir: string, flags: ConnectionFlags & EnvFlags) => {
+  errorExitCode = 2;
   const root = path.resolve(dir);
   assertTree(root);
 
@@ -631,8 +849,9 @@ addEnvFlag(addConnectionFlags(
   // Redact both sides the same way, so neither can print a secret and a raw
   // secret held on both sides doesn't read as a difference.
   const allow = await readAllow(root);
-  const treeView = scanSecrets(tree, { mode: 'redact', allow });
-  const serverView = scanSecrets(templatedRemote, { mode: 'redact', allow });
+  // Line endings are normalised too: push ignores them because Mirth rewrites them on save.
+  const treeView = scanSecrets(redactKnownSecrets(normalizeEolDeep(tree)), { mode: 'redact', allow });
+  const serverView = scanSecrets(redactKnownSecrets(normalizeEolDeep(templatedRemote)), { mode: 'redact', allow });
   if (treeView.findings.length > 0) {
     process.stderr.write(`note: the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets\n`);
   }
@@ -676,10 +895,16 @@ addEnvFlag(addConnectionFlags(
       if (chunk !== '') chunks.push(chunk);
     }
     const out = chunks.join('\n');
-    if (out === '') {
+    // A secret changed on the server is drift too, even though both sides show
+    // the same placeholder; name it, never its value.
+    const secretDrift = Object.keys(envUpdates);
+    if (out === '' && secretDrift.length === 0) {
       process.stdout.write('no differences — working tree matches the server.\n');
     } else {
-      process.stdout.write(out + '\n');
+      if (out !== '') process.stdout.write(out + '\n');
+      if (secretDrift.length > 0) {
+        process.stdout.write(`secret values differ between the server and the env file: ${secretDrift.join(', ')}\n`);
+      }
       process.exitCode = 1;
     }
   } finally {
@@ -698,7 +923,7 @@ program
     const s = summarize(config);
     const metaPath = path.join(root, 'channelvault.json');
     if (existsSync(metaPath)) {
-      const meta = JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta;
+      const meta = await readJson<SyncMeta>(metaPath);
       process.stdout.write(`source:  ${meta.source}\n`);
       process.stdout.write(`pulled:  ${meta.pulledAt}\n`);
       process.stdout.write(`engine:  ${meta.engineVersion ?? 'unknown'}\n`);
@@ -712,9 +937,18 @@ program
   });
 
 program.parseAsync().catch((err: unknown) => {
-  process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
-  if (!(err instanceof CliError) && err instanceof Error && process.env.CHANNELVAULT_DEBUG) {
-    process.stderr.write(`${err.stack}\n`);
+  // Commander has already printed it and set the exit code.
+  if (err instanceof CommanderError) return;
+  process.stderr.write(`error: ${scrub(err instanceof Error ? err.message : String(err))}\n`);
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && UNTRUSTED_CERT_CODES.has(code)) {
+    process.stderr.write(
+      "hint: the server's TLS certificate is not trusted. For a self-signed certificate (Mirth's default), " +
+        'pass --insecure, which turns certificate verification off.\n',
+    );
   }
-  process.exitCode = 1;
+  if (!(err instanceof CliError) && err instanceof Error && process.env.CHANNELVAULT_DEBUG) {
+    process.stderr.write(`${scrub(err.stack ?? '')}\n`);
+  }
+  process.exitCode = errorExitCode;
 });

@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { scanSecrets, type SecretKind } from '../src/secrets/detect.js';
-import { backupEnvFile, ENV_BACKUPS_KEPT } from '../src/secrets/envfile.js';
+import { findEchoes, scanSecrets, type SecretKind } from '../src/secrets/detect.js';
+import { backupEnvFile, ENV_BACKUPS_KEPT, formatValue, parseEnv, readEnvFile, updateEnvFile } from '../src/secrets/envfile.js';
 import { render, templatize } from '../src/secrets/index.js';
 import { XmlConfigAdapter } from '../src/xml/index.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
@@ -35,6 +35,13 @@ describe('scanSecrets', () => {
     ['authorization-header', "headers.put('Authorization', 'Basic c3ZjOnMzY3JldFB3');", 'c3ZjOnMzY3JldFB3'],
     ['assignment', "var password = 's3cretPw';", 's3cretPw'],
     ['assignment', '{"apiKey": "k-12345678"}', 'k-12345678'],
+    ['assignment', "var pass = 's3cretPw';", 's3cretPw'],
+    ['assignment', "var dbPass = 's3cretPw';", 's3cretPw'],
+    ['assignment', "var DB_PASS = 's3cretPw';", 's3cretPw'],
+    ['assignment', "var password = 'correct horse 42';", 'correct horse 42'],
+    ['setter-call', "conn.setPassword('s3cretPw');", 's3cretPw'],
+    ['connection-string', 'var url = "jdbc:sqlserver://db;password = s3cret Pw;encrypt=true";', 's3cret Pw'],
+    ['connection-string', '// jdbc:sqlserver://db;password=s3cretPw', 's3cretPw'],
     ['db-connection-call', "var db = DatabaseConnectionFactory.createDatabaseConnection(driver, url, 'svc', 's3cretPw');", 's3cretPw'],
     ['aws-access-key', `var k = '${aws}';`, aws],
     ['jwt', `var t = "${jwt}";`, jwt],
@@ -62,8 +69,34 @@ describe('scanSecrets', () => {
     ['a password read from config', "var password = $cfg('db.password');"],
     ['an empty assignment', "var password = '';"],
     ['a word that merely contains token', "var tokenizer = 'whitespace';"],
+    ['a word that merely ends in pass', "var bypass = 'always'; var compass = 'north';"],
+    ['a comparison with pass', "if (pass == 'none') return;"],
+    ['a word ending in Pass that is not a password', "var byPass = 'enabled'; var firstPass = 'true';"],
+    ['prose assigned to a secret-named variable', "var secret = 'Not configured yet';"],
+    ['a script that starts by assigning a call', "password = getPass(); pwd = $('x');"],
+    ['compact script code that assigns a call', "var pwd;pwd=$('db.password');"],
+    ['a password taken from a variable', 'var password = getPassword(); conn.setPassword(password);'],
   ])('ignores %s', (_label, script) => {
     expect(scanSecrets(withScript(script), { mode: 'find' }).findings).toEqual([]);
+  });
+
+  // In a config field (not a script) the whole value is the connection string.
+  it.each([
+    ['jdbc:sqlserver://localhost;password=fixture-925;encrypt=true', 'fixture-925'],
+    ['jdbc:sqlserver://localhost;password =fixture-925;encrypt=true', 'fixture-925'],
+    ['jdbc:sqlserver://localhost;password= fixture-925;encrypt=true', 'fixture-925'],
+    ['jdbc:sqlserver://localhost;password = fixture-925;encrypt=true', 'fixture-925'],
+    ['jdbc:sqlserver://localhost;password=fixture(s3cret);encrypt=true', 'fixture(s3cret)'],
+    ['jdbc:sqlserver://db;password=fixture()s3cret;encrypt=true', 'fixture()s3cret'],
+    ['jdbc:sqlserver://db;password=fixture-s3cret(;encrypt=true', 'fixture-s3cret('],
+    ['Password=s3cretPw;Server=db.internal;User Id=svc', 's3cretPw'],
+    ['Server=db.internal; Password=s3cretPw; User Id=svc', 's3cretPw'],
+  ])('finds the password in a connection-string field: %s', (url, secret) => {
+    const cfg: CanonicalConfig = { channels: { channel: [{ id: 'c1', name: 'Lab Feed', sourceConnector: { properties: { url } } }] } };
+    const extracted = scanSecrets(cfg, { mode: 'extract' });
+    expect(extracted.findings.map((f) => f.kind)).toEqual(['connection-string']);
+    expect(Object.values(extracted.envUpdates)).toEqual([secret]);
+    expect(render(extracted.config, extracted.envUpdates)).toEqual(cfg);
   });
 
   it('honours the allow list by location, kind and context', () => {
@@ -264,5 +297,128 @@ describe('CLI: explode with secrets inside values', () => {
     await writeFile(path.join(tree, 'channelvault.allow.json'), JSON.stringify({ ignore }));
     const r = cli('explode', backupXml, tree);
     expect(r.status, r.stderr).toBe(0);
+  });
+});
+
+describe('env values dotenv cannot carry', () => {
+  it('stores a CRLF value with quotes base64-encoded and reads it back exactly', async () => {
+    const value = '{\r\n  "alerts": ["a", "b"]\r\n}';
+    const formatted = formatValue(value);
+    expect(formatted).toMatch(/^cv-base64:/);
+    expect(parseEnv(`K=${formatted}`)['K']).toBe(value);
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-b64-'));
+    try {
+      const file = path.join(dir, '.env');
+      await updateEnvFile(file, { K: value, PLAIN: 'abc' });
+      expect(await readEnvFile(file)).toEqual({ K: value, PLAIN: 'abc' });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps plain values readable', () => {
+    expect(formatValue('abc123')).toBe('abc123');
+    expect(formatValue('has space')).toBe("'has space'");
+  });
+});
+
+describe('CLI safety', () => {
+  const repo = fileURLToPath(new URL('..', import.meta.url));
+  const fixture = path.join(repo, 'test', 'fixtures', 'serverConfiguration.sample.xml');
+  const cli = (...args: string[]) =>
+    spawnSync(process.execPath, ['--import', 'tsx', path.join(repo, 'src', 'cli.ts'), ...args], { cwd: repo, encoding: 'utf8' });
+
+  it('leaves the tree untouched when the env file cannot be written', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-order-'));
+    try {
+      const tree = path.join(dir, 'tree');
+      const envIsADirectory = path.join(dir, 'env-dir');
+      await mkdir(envIsADirectory);
+      const r = cli('explode', fixture, tree, '--dotenv', envIsADirectory);
+      expect(r.status).toBe(1);
+      expect(existsSync(path.join(tree, 'channels'))).toBe(false);
+      expect(existsSync(path.join(tree, 'server'))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('refuses to replace directories in a folder that is not a channelvault tree', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-foreign-'));
+    try {
+      await mkdir(path.join(dir, 'server'));
+      await writeFile(path.join(dir, 'server', 'index.ts'), 'app code');
+      const r = cli('explode', fixture, dir, '--extract-secrets');
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('not a channelvault tree');
+      expect(await readFile(path.join(dir, 'server', 'index.ts'), 'utf8')).toBe('app code');
+      expect(existsSync(path.join(dir, '.env'))).toBe(false);
+      expect(existsSync(path.join(dir, 'channels'))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('refuses such a folder for pull before connecting to the server', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-foreign-pull-'));
+    try {
+      await mkdir(path.join(dir, 'channels'));
+      // Port 1 is never a Mirth server: reaching it would fail with "cannot reach".
+      const r = spawnSync(process.execPath, ['--import', 'tsx', path.join(repo, 'src', 'cli.ts'), 'pull', dir], {
+        cwd: repo, encoding: 'utf8', env: { ...process.env, MIRTH_HOST: '127.0.0.1', MIRTH_PORT: '1', MIRTH_USER: 'u', MIRTH_PASS: 'p' },
+      });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('not a channelvault tree');
+      expect(r.stderr).not.toContain('cannot reach');
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('warns when git would commit an env file kept outside the tree', async () => {
+    const repoDir = await mkdtemp(path.join(tmpdir(), 'channelvault-gitignore-'));
+    try {
+      expect(spawnSync('git', ['init', '-q'], { cwd: repoDir }).status).toBe(0);
+      const outside = path.join(repoDir, 'secrets.destination');
+      const r = cli('explode', fixture, path.join(repoDir, 'tree'), '--extract-secrets', '--dotenv', outside);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain(`git does not ignore ${outside}`);
+
+      // The default env file sits in the tree, whose .gitignore covers it.
+      const inside = cli('explode', fixture, path.join(repoDir, 'tree2'), '--extract-secrets');
+      expect(inside.status).toBe(0);
+      expect(inside.stderr).not.toContain('git does not ignore');
+    } finally {
+      await rm(repoDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('reports the version in package.json', async () => {
+    const { version } = JSON.parse(await readFile(path.join(repo, 'package.json'), 'utf8')) as { version: string };
+    expect(cli('--version').stdout.trim()).toBe(version);
+  });
+
+  it('rejects an argument it would otherwise drop, such as a flag after a literal --', () => {
+    const r = cli('status', 'tree', '--', '--extract-secrets');
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('too many arguments');
+  });
+});
+
+describe('repeats of a known secret', () => {
+  it('finds the default-value idiom', () => {
+    const script = "apiKey = apiKey || 'k-1234567890abcdef';";
+    const { findings, config, envUpdates } = scanSecrets(withScript(script), { mode: 'extract' });
+    expect(findings.map((f) => f.kind)).toEqual(['assignment']);
+    expect(scriptOf(config)).toBe("apiKey = apiKey || '{{env:LAB_FEED__DEPLOYSCRIPT__PASSWORD}}';");
+    expect(scriptOf(render(config, envUpdates))).toBe(script);
+    expect(scanSecrets(withScript("token = opts.token ?? 'Hunter22!';"), { mode: 'find' }).findings).toHaveLength(1);
+  });
+
+  it('reports a known value still in plain text somewhere no rule matched', () => {
+    const cfg = withScript("callApi('https://x.example.org', 'k-1234567890abcdef');");
+    expect(findEchoes(cfg, { API_KEY: 'k-1234567890abcdef', SHORT: 'callApi' })).toEqual([
+      { name: 'API_KEY', where: 'Lab Feed › deployScript' },
+    ]);
   });
 });

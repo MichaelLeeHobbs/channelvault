@@ -1,0 +1,23 @@
+/**
+ * A self-signed certificate for localhost / 127.0.0.1 (valid to 2126), for tests
+ * of certificate errors. Test-only: the key protects nothing.
+ */
+export const TEST_KEY = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZGLcANJz4GQVOfXD
+qyKv1pPWVsyjWsnu4B2h+YGlqw2hRANCAARuvEeB7tdx2d0i/97GXQrpY2k5swny
+ABB6sKQwXvkHbbxNf+cgf/0XWbRv9ovAIVGgFgc61t6KavxtpEwKDxpc
+-----END PRIVATE KEY-----
+`;
+
+export const TEST_CERT = `-----BEGIN CERTIFICATE-----
+MIIBmzCCAUGgAwIBAgIUA0+3Z6Fjw+zmCKv9jVsBI4OgllwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkyNTAyMjAzOVoYDzIxMjYwOTAx
+MDIyMDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAARuvEeB7tdx2d0i/97GXQrpY2k5swnyABB6sKQwXvkHbbxNf+cgf/0X
+WbRv9ovAIVGgFgc61t6KavxtpEwKDxpco28wbTAdBgNVHQ4EFgQUsX6VhqH+SPs9
+J8/9bXw3R1KnBOYwHwYDVR0jBBgwFoAUsX6VhqH+SPs9J8/9bXw3R1KnBOYwDwYD
+VR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZI
+zj0EAwIDSAAwRQIgfiOxbXwgROZWqB6LAvPZECwHzNggKzyE0adEUPouONgCIQDr
+zZNmfxbtU58+OD2625kk4PFbMd6Ni4KQwrCaEMiQVg==
+-----END CERTIFICATE-----
+`;

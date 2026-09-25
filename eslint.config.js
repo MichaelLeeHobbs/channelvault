@@ -5,7 +5,8 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist/', 'node_modules/', 'coverage/', 'out/', '*.local.json'],
+    // Build output, dependencies, and the scratch directories .gitignore excludes.
+    ignores: ['dist/', 'node_modules/', 'coverage/', 'out/', '*.local.json', 'scratch/', 'tmp/', 'tmp-out/'],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

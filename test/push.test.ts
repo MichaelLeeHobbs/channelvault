@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, symlink, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { MirthClientExt } from '../src/client/index.js';
 import { createExplodeEngine } from '../src/explode/index.js';
-import { librariesInSync, librariesToSend, planPush, resourceIds, type Plan } from '../src/push/index.js';
+import { changedSince, librariesInSync, librariesToSend, planPush, resourceIds, type Plan } from '../src/push/index.js';
 import { applyPlan, refreshRevisions } from '../src/push/apply.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
 
@@ -74,6 +74,55 @@ describe('planPush', () => {
     const plan = planPush(local, remote);
     expect(plan.changes).toEqual([]);
     expect(plan.notPushed).toEqual([]);
+  });
+
+  it('refuses a copied channel directory that kept its source id', () => {
+    const local = server();
+    (local['channels'] as Obj)['channel'] = [ch(local, 0), ch(local, 1), channel('c1', 'Alpha Copy', { deployScript: 'return 1;' })];
+    expect(() => planPush(local, server())).toThrow(/channels "Alpha", "Alpha Copy" share id c1/);
+  });
+
+  it('refuses duplicate library and code template ids', () => {
+    const local = server();
+    const copy = library('L1', 'Formatting Copy', [template('t1', 'pad2')]);
+    (local['codeTemplateLibraries'] as Obj)['codeTemplateLibrary'] = [lib(local, 0), lib(local, 1), copy];
+    expect(() => planPush(local, server())).toThrow(/libraries "Formatting", "Formatting Copy" share id L1[\s\S]*code templates "pad", "pad2" share id t1/);
+  });
+
+  it('refuses to create a channel beside a same-named server channel', () => {
+    const local = server();
+    (local['channels'] as Obj)['channel'] = [ch(local, 0), ch(local, 1), channel('c9', 'Beta')];
+    expect(() => planPush(local, server(), { channels: ['c9'] })).toThrow(/a name another channel holds:\n {2}"Beta": ids c2, c9/);
+  });
+
+  // Saves run one at a time and before deletes, so the old holder still has
+  // the name when the new channel is saved.
+  it.each<[string, (local: CanonicalConfig) => void]>([
+    ['a rename frees', (local) => {
+      ch(local, 1)['name'] = 'Beta Old';
+      (local['channels'] as Obj)['channel'] = [ch(local, 0), ch(local, 1), channel('c9', 'Beta')];
+    }],
+    ['a delete frees', (local) => {
+      (local['channels'] as Obj)['channel'] = [ch(local, 0), channel('c9', 'Beta')];
+    }],
+    ['a swap exchanges', (local) => {
+      ch(local, 0)['name'] = 'Beta';
+      ch(local, 1)['name'] = 'Alpha';
+    }],
+    ['differs only in case from', (local) => {
+      (local['channels'] as Obj)['channel'] = [ch(local, 0), ch(local, 1), channel('c9', 'BETA')];
+    }],
+  ])('refuses to save a channel under a name %s in the same push', (_label, change) => {
+    const local = server();
+    change(local);
+    expect(() => planPush(local, server())).toThrow(/a name another channel holds/);
+  });
+
+  it('allows renaming a channel to a new name, or changing only its case', () => {
+    const local = server();
+    ch(local, 0)['name'] = 'Alpha 2';
+    ch(local, 1)['name'] = 'BETA';
+    expect(planPush(local, server()).changes.map((c) => `${c.op} ${c.label}`)).toEqual(['update Alpha 2', 'update BETA']);
   });
 
   it('plans channel create, update and delete, and redeploys what changed', () => {
@@ -164,7 +213,7 @@ describe('planPush', () => {
     const local = server();
     lib(local, 0)['description'] = 'local edit';
     lib(local, 1)['description'] = 'out of scope edit';
-    const sent = librariesToSend(local, server(), { libraries: ['Formatting'] });
+    const sent = librariesToSend(local, server(), { libraries: ['Formatting'] }, planPush(local, server(), { libraries: ['Formatting'] }));
     expect(sent.map((l) => l['description'] ?? null)).toEqual(['local edit', null]);
   });
 });
@@ -371,4 +420,88 @@ it('ignores tag and dependency fields that Mirth flips between absent and null',
   const remote = server();
   Object.assign(ch(remote, 0)['exportData'] as Obj, { channelTags: null, dependentIds: null, dependencyIds: null });
   expect(planPush(server(), remote).changes).toEqual([]);
+});
+
+it('treats a lone CR like any other line ending (Mirth rewrites both as LF on save)', () => {
+  const local = server();
+  ch(local, 0)['deployScript'] = '// ack\rhl7Listener(msg);';
+  const remote = server();
+  ch(remote, 0)['deployScript'] = '// ack\nhl7Listener(msg);';
+  expect(planPush(local, remote).changes).toEqual([]);
+});
+
+describe('second review regressions', () => {
+  it('keeps a library created on the server since the pull when another library changes', () => {
+    const remote = server();
+    ((remote['codeTemplateLibraries'] as Obj)['codeTemplateLibrary'] as Obj[]).push(library('L9', 'Theirs', []));
+    const local = server();
+    lib(local, 0)['description'] = 'changed';
+    const known = resourceIds(server());
+    const plan = planPush(local, remote, {}, known);
+    expect(plan.serverOnly).toEqual(['library "Theirs"']);
+    expect(librariesToSend(local, remote, {}, plan).map((l) => l['id'])).toEqual(['L1', 'L2', 'L9']);
+  });
+
+  it('redeploys channels that lose a library, and those of a deleted library', () => {
+    const local = server();
+    lib(local, 1)['enabledChannelIds'] = { string: ['c1'] }; // Routing moves from c2 to c1
+    expect(planPush(local, server()).deployIds.sort()).toEqual(['c1', 'c2']);
+    const without = server();
+    ((without['codeTemplateLibraries'] as Obj)['codeTemplateLibrary'] as Obj[]).pop(); // delete Routing (c2)
+    expect(planPush(without, server()).deployIds).toEqual(['c2']);
+  });
+
+  it('refuses when a planned resource changed while the push was being confirmed', () => {
+    const local = server();
+    ch(local, 0)['deployScript'] = 'changed';
+    const plan = planPush(local, server());
+    const after = server();
+    ch(after, 0)['revision'] = 2;
+    expect(changedSince(plan, server(), after)).toEqual(['channel "Alpha"']);
+    expect(changedSince(plan, server(), server())).toEqual([]);
+  });
+
+  it('refuses a channel save when the server revision moved after planning', async () => {
+    const local = server();
+    ch(local, 0)['deployScript'] = 'changed';
+    const { client, calls } = fakeClient({ id: 'c1', revision: 2, exportData: { metadata: {} } });
+    const result = await applyPlan(client, planPush(local, server()), local, server(), {});
+    expect(result.failed?.error).toMatch(/changed on the server during the push \(revision 2, planned against 1\)/);
+    expect(calls).toEqual([]);
+    const forced = await applyPlan(fakeClient({ id: 'c1', revision: 2, exportData: {} }).client, planPush(local, server()), local, server(), {}, { force: true });
+    expect(forced.failed).toBeUndefined();
+  });
+});
+
+describe('filesystem safety', () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(tmpdir(), 'channelvault-fs-'));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
+
+  it('keeps channels whose names differ only in case apart', async () => {
+    const cfg = server();
+    ch(cfg, 1)['name'] = 'alpha'; // "Alpha" and "alpha"
+    const engine = createExplodeEngine();
+    await engine.explode(cfg, { root });
+    expect(await engine.implode({ root })).toEqual(cfg);
+  });
+
+  it('rejects a marker that reaches outside the tree through a junction or symlink', async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), 'channelvault-outside-'));
+    try {
+      await writeFile(path.join(outside, 'deploy.js'), 'OUTSIDE');
+      const engine = createExplodeEngine();
+      await engine.explode(server(), { root });
+      const scripts = path.join(root, 'channels', 'Alpha', 'scripts');
+      await rm(scripts, { recursive: true });
+      await symlink(outside, scripts, 'junction');
+      await expect(engine.implode({ root })).rejects.toThrow(/escapes the working tree through a link/);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
 });

@@ -21,27 +21,29 @@ A team running Mirth can keep every channel, code template and script in git, re
   - `@file`/`@ref` markers can't point outside the tree.
   - Operations mixing the two transports are refused.
   - A tripwire test keeps real exports out of `test/fixtures`.
-- **Not yet:** CI and tests for the CLI commands.
+- **CLI failure tests and promotion:** subprocess tests cover failed saves, refreshes, deployment errors, cancelled/interrupted confirmations, and concurrent edits. `pnpm test:integration` creates two disposable Mirth servers and verifies a real promotion with destination credentials and independent revisions.
+- **CI:** the GitHub Actions workflow is checked in; a hosted run remains to be verified after push.
 
 ## M1: Safe to point at production
 
 1. ~~**Scoped push with a preview.**~~ Done (2026-09-24).
 2. **Per-environment values.**
-   - The same tree deploys to dev and prod, with values from `--env-file .env.dev` or `.env.prod`.
-   - The mechanism already exists; what's missing is a documented promotion workflow and a test that promotes between two servers.
+   - The same tree deploys to dev and prod, with values from `--dotenv .env.dev` or `.env.prod`.
+   - Documented in the README and exercised by `pnpm test:integration` against two disposable Mirth 4.5.2 servers. Each destination needs its own working copy and baseline; independent server revisions are not comparable clocks.
 3. **Global scripts as files.** Today they stay inline in `server/configuration.json`.
 4. **Safe to script.**
    - Done: `push` without a terminal fails straight away unless `--yes` is passed.
-   - Document `diff`'s exit codes (0 = clean, 1 = differences, other = error) for scheduled drift checks.
+   - Done: `diff` exits 0 = clean, 1 = differences, 2 = error (documented in the README).
 5. **Secret coverage.**
    - Done (2026-09-24): key names (`*password`, `*secret`, `*token`, `*passphrase`), every configuration-map value, and secrets inside values (URL and connection-string credentials, auth headers, `createDatabaseConnection` calls, script assignments, private keys, known token formats). `pull`/`explode` refuse until each finding is extracted or allowed. On the private 2.7 MB export: 29 by key name, 6 in values, no false positives.
+   - Done: DICOM (`passcode`, `keyPW`, `keyStorePW`, `trustStorePW`), `*Key` names, `pass`-style script variables and `set…Password('…')` calls.
    - Remaining: check against a full real server, including connector types the private export lacks (Database Reader/Writer, Web Service Sender).
 
 *Exit check:* against the Docker server, a round trip of `pull`, an edit to one step, and a scoped `push` changes only that channel. This passes today (`test/integration/live.test.ts`). A promotion between two Docker servers with different env files leaves the right values on each.
 
 ## M2: A workflow developers can use
 
-- **CI.** GitHub Actions running typecheck, lint, test and build on Node 20 and 22, on Linux and Windows. Add a job that starts the Docker Mirth server and runs `test/integration/live.test.ts`.
+- **CI.** Implemented in `.github/workflows/ci.yml`: typecheck, lint, tests, build and packaging on Node 20.18.1, 22 and 24, on Linux and Windows, plus the disposable two-server promotion suite on Linux. Hosted execution is pending the next push.
 - **Tests for Rhino code.** A loader so code templates can be called from vitest/Jest, and a harness that provides `msg`, `channelMap`, `$c` and the other Mirth globals to channel scripts.
 - **Rhino lint.** An ESLint preset for Mirth's Rhino runtime: no template literals, `async`, `?.` or `class`; `let` rather than `const` inside loops.
 - **Step order you can edit.**
@@ -49,14 +51,13 @@ A team running Mirth can keep every channel, code template and script in git, re
   - Either present each transformer as one ordered list, or make the file-name prefix `<n>` authoritative.
   - Which to choose depends on whether Mirth runs steps in list order or by `sequenceNumber` (see open questions).
 - **Version coverage.** Fixtures exported from Docker for each supported Mirth / OIE version, run through every round-trip test.
-- **Test gaps.** CLI tests for `pull`, `push` and `diff`, a coverage threshold, and a test that exploding the same config twice produces identical files.
+- **Test gaps.** A coverage threshold, deterministic repeated-explode coverage, native terminal interaction beyond the pipe-driven confirmation tests, and more server versions. CLI failure/retry/confirmation tests and real pull/push/diff promotion coverage are implemented.
 
 *Exit check:* green CI on every push, including the live job.
 
 ## M3: First release
 
 - Publish to npm with provenance.
-- Take the version from `package.json` instead of the literals in `src/cli.ts`.
 - A README walkthrough from `docker compose up` to a reviewed `push`.
 
 ## Backlog
@@ -64,7 +65,6 @@ A team running Mirth can keep every channel, code template and script in git, re
 - **Other secret stores.** AWS Secrets Manager, and possibly others, behind the same `{{env:NAME}}` placeholders so trees don't change.
 - **Converting between the XML and live shapes.** Only needed to push a tree built from a backup file.
 - **Login and TLS.** A `--token` login option, a no-echo password prompt, `--cafile`, and a warning when `--insecure` turns verification off.
-- **Login errors** shouldn't include the response body (`src/client/index.ts`).
 - **Cleanup list.** `clearManaged` should get its directory list from the explode engine.
 - **More resources.** Alerts, server resources and the configuration map as separately syncable resources.
 
@@ -105,3 +105,30 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - Key-name matching missed credentials in URLs, connection strings, headers and scripts. The detector scans every value, and `pull`/`explode` write nothing until each finding is extracted (`--extract-secrets`) or allowed in the committed `channelvault.allow.json`. Refusing beats warning: a warning scrolls past and the secret lands in git.
 - Findings are reported by location and kind only. Extraction replaces just the secret substring, so scripts stay readable and `render` restores them exactly.
 - When a pull changes a value already in `.env`, the old file is copied to `.secrets/` (git-ignored) and only the newest 5 are kept. Rejected: unlimited history, which leaves every past password in plain text on disk.
+
+**2026-09-24: Findings from the first real-config trial (40 channels, 112 code templates, Mirth 4.5.2, isolated server).**
+- Round trip exact, 39 secrets moved to `.env`, scoped push and `diff` converge.
+- Fixed from the trial: a configuration-map value (JSON with CRLF) that no dotenv quoting can carry is stored as `cv-base64:`; `.env` is written before the tree, so a failed write never leaves placeholders without values; the default-value idiom `apiKey = apiKey || '…'` is detected, and a known secret repeated in plain text is warned about; a lone CR is treated like other line endings (Mirth rewrites it as LF on save, which made push re-send forever); `--env-file` became `--dotenv` because Node scans the whole command line for `--env-file`; unused arguments are an error (a script runner's literal `--` had silently dropped `--extract-secrets`); `channelvault.json` is not rewritten for a timestamp alone.
+
+**2026-09-24: Third review (stale snapshots, baselines, write safety).**
+- `channelvault.json` now records each resource's revision at the last sync, plus a hash of the global scripts. A local delete of something the server changed since then is a conflict, and so is a global-scripts push over a server-side change. Older trees (ids only) keep working and upgrade on the next pull.
+- After confirmation, pushes re-read the server and apply against that fresh copy; the library list (saved as a whole) must be unchanged. `--whole-server` treats resources created since the pull as deletions (needs `--allow-deletes` and `--force`, named in the preview) and re-checks the whole config before replacing it.
+- Explode checks every write's real directory before creating it; XML is validated before conversion; the tree is written to a staging directory and swapped in.
+- Library saves do not change template contents (verified on 4.5.2), so the library list only has to be current at the library level.
+- Dependencies: undici 7.29, fast-xml-parser 5 (no audit findings).
+
+**2026-09-24: Fourth review and executable release checks.**
+- Closing confirmation input now fails and logs out. A post-save refresh failure preserves the original partial-push diagnosis. Whole-server force rechecks deletion consent against the final snapshot.
+- Revision refresh verifies the saved content before adopting the server's revision, including whole-server replacement. A concurrent edit observed after saving leaves the old baseline and fails for review.
+- Pull hashes the actual fetched global scripts before replacing secrets with placeholders. Existing file symlinks are rejected before explode writes through them.
+- CI is defined and the two-server promotion has passed locally on Mirth 4.5.2. These checks qualify synthetic configuration operations, not live external integrations or other engine versions.
+
+**2026-09-24: Release review fixes.**
+- `pull`/`explode` refuse a directory holding managed directories without `channelvault.json`: they replace those directories, and a project's own `server/` was deleted.
+- `push` refuses duplicate ids in the tree: a copied directory keeps its source's id, so its save overwrote the original. It also refuses to save a channel under a name another channel holds, even one freed by a delete or rename in the same push, because saves run one at a time before deletes.
+- `diff` errors exit 2, so 1 always means differences.
+- The env file is replaced by rename, not rewritten in place, and a warning names it when git would commit it.
+- Connection failures name the address and cause (and suggest `--insecure` for an untrusted certificate); login errors omit the response body, and other error bodies are secret-redacted.
+- Third-party review follow-up: errors are printed with every env value behind the tree's placeholders replaced, and error bodies have credential fields redacted, because a server's error can echo the submitted payload. Connection-string passwords may contain parentheses; only call syntax is excluded. `pull`/`explode` validate `channelvault.json` and the env file's location before writing anything.
+- Fourth review follow-up: error bodies are decoded (JSON values, XML text) before redaction, so escaping cannot hide an echoed secret. Connection strings are told from script assignments by syntax (`password=value` has no spaces around `=`), not by excluding password characters. The env-file preflight checks the given path as well as the resolved one.
+- Fifth review follow-up: server response bodies are left out of error messages unless `CHANNELVAULT_DEBUG` is set. Redacting them could never be complete (a body can echo a credential escaped, truncated or reformatted), and a credential in a CI log costs more than a less specific error. In a script, connection-string passwords are searched for only in string literals and comments; in config fields the whole value is searched, with spaces allowed around `=` as drivers accept them.

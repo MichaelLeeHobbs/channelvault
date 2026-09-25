@@ -22,7 +22,37 @@
  */
 import { CookieJar } from 'tough-cookie';
 import { Agent } from 'undici';
+import { redactSecretsInText } from '../secrets/detect.js';
+import { isSecretKey } from '../secrets/index.js';
 import type { ApiError, CanonicalConfig, ClientConfig, MirthClient } from '../types.js';
+
+/** TLS verification failures, typically a self-signed or privately issued server certificate. */
+export const UNTRUSTED_CERT_CODES: ReadonlySet<string> = new Set([
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  // Not an expired certificate or a host-name mismatch: turning verification
+  // off is the wrong advice for those, and their messages already say why.
+]);
+
+/**
+ * fetch reports every network failure as "fetch failed" and keeps the reason
+ * (ECONNREFUSED, a certificate error) in `cause`; surface it, with its code.
+ */
+function connectionError(url: string, err: unknown): Error & { code?: string } {
+  let cause = err instanceof Error ? (err.cause as (Error & { code?: string; errors?: unknown[] }) | undefined) : undefined;
+  // Several addresses tried (IPv4 and IPv6): report the first attempt.
+  if (cause instanceof AggregateError && cause.errors[0] instanceof Error) cause = cause.errors[0] as Error & { code?: string };
+  const detail = cause?.message || (err instanceof Error ? err.message : String(err));
+  const code = cause?.code;
+  const error = new Error(
+    `cannot reach ${new URL(url).origin}: ${detail}${code && !detail.includes(code) ? ` (${code})` : ''}`,
+    { cause: err },
+  ) as Error & { code?: string };
+  error.code = code;
+  return error;
+}
 
 /** Optional flags accepted by `putServerConfiguration` (Mirth query params). */
 export interface PutServerConfigurationOptions {
@@ -141,7 +171,7 @@ class MirthClientImpl implements MirthClientExt {
           password: this.config.password,
         });
 
-        const response = await fetch(loginUrl, {
+        const response = await this.send(loginUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
@@ -149,15 +179,14 @@ class MirthClientImpl implements MirthClientExt {
             Accept: 'application/json',
           },
           body: body.toString(),
-          // @ts-expect-error - dispatcher is a Node.js/undici specific option
-          dispatcher: this.dispatcher,
         });
 
         await this.storeCookies(response, this.baseUrl);
 
         if (!response.ok) {
-          const text = await response.text();
-          throw new Error(`Login failed: HTTP ${response.status} - ${text.substring(0, 200)}`);
+          // Not the body: a login endpoint's error page can echo the request.
+          await response.body?.cancel();
+          throw new Error(`Login failed: HTTP ${response.status} ${response.statusText}`.trimEnd());
         }
 
         const result = (await response.json()) as Record<string, unknown>;
@@ -190,14 +219,12 @@ class MirthClientImpl implements MirthClientExt {
     try {
       const logoutUrl = `${this.baseUrl}/users/_logout`;
       const cookieString = await this.cookieJar.getCookieString(logoutUrl);
-      await fetch(logoutUrl, {
+      await this.send(logoutUrl, {
         method: 'POST',
         headers: {
           'X-Requested-With': 'XMLHttpRequest',
           ...(cookieString ? { Cookie: cookieString } : {}),
         },
-        // @ts-expect-error - dispatcher is a Node.js/undici specific option
-        dispatcher: this.dispatcher,
       });
     } finally {
       this.authenticated = false;
@@ -339,13 +366,7 @@ class MirthClientImpl implements MirthClientExt {
       headers.Cookie = cookieString;
     }
 
-    const response = await fetch(url, {
-      method,
-      headers,
-      body: options.body,
-      // @ts-expect-error - dispatcher is a Node.js/undici specific option
-      dispatcher: this.dispatcher,
-    });
+    const response = await this.send(url, { method, headers, body: options.body });
 
     await this.storeCookies(response, url);
 
@@ -361,6 +382,19 @@ class MirthClientImpl implements MirthClientExt {
     }
 
     return response;
+  }
+
+  /** fetch through this client's pool, with network failures explained. */
+  private async send(url: string, init: RequestInit): Promise<Response> {
+    try {
+      return await fetch(url, {
+        ...init,
+        // @ts-expect-error - dispatcher is a Node.js/undici specific option
+        dispatcher: this.dispatcher,
+      });
+    } catch (err) {
+      throw connectionError(url, err);
+    }
   }
 
   /** Build an absolute URL with an optional query string. */
@@ -384,9 +418,10 @@ class MirthClientImpl implements MirthClientExt {
 
   /** Persist any `set-cookie` from a response into the jar. */
   private async storeCookies(response: Response, url: string): Promise<void> {
-    const setCookieHeader = response.headers.get('set-cookie');
-    if (setCookieHeader) {
-      await this.cookieJar.setCookie(setCookieHeader, url);
+    // One entry per header: get('set-cookie') joins them with ", ", which also
+    // appears inside a cookie's Expires date.
+    for (const cookie of response.headers.getSetCookie()) {
+      await this.cookieJar.setCookie(cookie, url);
     }
   }
 
@@ -399,18 +434,65 @@ class MirthClientImpl implements MirthClientExt {
       // ignore body read errors
     }
 
-    // Keep a short plain-text or JSON reason (Mirth's HTML error pages say only
-    // "Request failed.", so they add nothing).
-    const text = typeof body === 'string' ? body.replace(/\s+/g, ' ').trim() : '';
-    const reason = text !== '' && !/^<(!doctype|html)/i.test(text) ? `: ${text.slice(0, 300)}` : '';
+    // An error body can echo the payload sent, credentials included, in any
+    // form (escaped, truncated, reformatted), so no redaction of it is
+    // complete: it is left out unless asked for. When included it is whole and
+    // unnormalized, so the caller's scrub of known values can still match.
+    const text = typeof body === 'string' ? redactSecretsInText(readableBody(body)).trim() : '';
+    const reason =
+      text === '' ? '' : this.config.includeResponseBodies ? `: ${text}` : ' (server response withheld; it may echo credentials)';
     const message = `HTTP ${response.status}: ${response.statusText}${reason}`;
     const error = new Error(message) as Error & ApiError;
     error.status = response.status;
     error.statusText = response.statusText;
     error.message = message;
-    error.body = body;
+    error.body = text;
     return error;
   }
+}
+
+const XML_ENTITIES: Readonly<Record<string, string>> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+
+/**
+ * An error body as the text a person reads: JSON as its decoded values, XML as
+ * its decoded text. Anything that redacts by value (the CLI knows the secrets
+ * sent) then sees a secret as it was sent, not escaped as `\"` or `&amp;`.
+ * Credential fields are replaced while their names are still known.
+ */
+export function readableBody(body: string): string {
+  const trimmed = body.trim();
+  // Any JSON value: a bare string can carry \u escapes too.
+  if (/^[[{"]/.test(trimmed)) {
+    try {
+      return flattenJson(JSON.parse(trimmed) as unknown);
+    } catch {
+      // not JSON after all
+    }
+  }
+  if (!trimmed.startsWith('<')) return trimmed;
+  // Mirth's HTML error pages say only "Request failed.", so they add nothing.
+  if (/^<(!doctype|html)/i.test(trimmed)) return '';
+  // A marker that survives removing the tags.
+  const REDACTED = '\u0000redacted\u0000';
+  return trimmed
+    .replace(/<([\w.:-]+)>[^<]*<\/\1>/g, (whole, key: string) => (isSecretKey(key) ? ` ${key}: ${REDACTED} ` : whole))
+    .replace(/<[^>]*>/g, ' ')
+    .split(REDACTED)
+    .join('<redacted>')
+    .replace(/&(#x[0-9a-f]+|#[0-9]+|amp|lt|gt|quot|apos);/gi, (whole, e: string) =>
+      e[0] === '#'
+        ? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10))
+        : (XML_ENTITIES[e.toLowerCase()] ?? whole),
+    );
+}
+
+function flattenJson(value: unknown, key = ''): string {
+  if (typeof value === 'string') return key !== '' && isSecretKey(key) && value !== '' ? '<redacted>' : value;
+  if (Array.isArray(value)) return value.map((v) => flattenJson(v, key)).join('; ');
+  if (value !== null && typeof value === 'object') {
+    return Object.entries(value).map(([k, v]) => `${k}: ${flattenJson(v, k)}`).join(', ');
+  }
+  return String(value);
 }
 
 /**

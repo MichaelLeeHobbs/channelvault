@@ -2,7 +2,7 @@
  * XML canonical adapter for Mirth Connect "Backup Config" documents.
  *
  * Converts a Mirth `serverConfiguration` XML document to/from the canonical
- * config (a plain JSON object tree). `fast-xml-parser` v4 does the tokenizing in
+ * config (a plain JSON object tree). `fast-xml-parser` v5 does the tokenizing in
  * its order-preserving mode; the conversion to the canonical object shape and
  * the serializer are ours, because fxp's object mode is lossy in ways a
  * round-trip test built on the same parser cannot see (it regroups interleaved
@@ -38,7 +38,7 @@
  *
  * plus document order of the rebuilt XML equal to the source's (see tests).
  */
-import { XMLParser } from 'fast-xml-parser';
+import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import type { CanonicalConfig, Json, XmlAdapter } from '../types.js';
 
 /**
@@ -342,6 +342,13 @@ export class XmlConfigAdapter implements XmlAdapter {
     if (/<!DOCTYPE/i.test(normalized.slice(0, normalized.search(/<[A-Za-z_]/)))) {
       // A DTD could declare entities we would not expand; Mirth never emits one.
       throw new Error('XmlConfigAdapter.parse: DOCTYPE declarations are not supported');
+    }
+    // fxp's parser accepts unclosed elements, so a truncated backup would read
+    // as a smaller, "valid" configuration; validate the whole document first.
+    const valid = XMLValidator.validate(normalized);
+    if (valid !== true) {
+      const { line, col, msg } = valid.err;
+      throw new Error(`XmlConfigAdapter.parse: not well-formed XML at line ${line}, column ${col}: ${msg}`);
     }
     const nodes = parser.parse(normalized) as OrderedNode[];
     const root = nodes.find((n) => nodeName(n) === ROOT_KEY);

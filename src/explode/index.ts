@@ -14,8 +14,9 @@
  * Invariant: `implode(explode(config))` deep-equals `config`.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
@@ -27,6 +28,7 @@ import {
   type ExplodeOptions,
   type Json,
 } from '../types.js';
+import { parseJson, readJson } from '../json.js';
 
 // --- shared helpers --------------------------------------------------------
 
@@ -83,22 +85,20 @@ function slug(name: unknown): string {
   s = s.replace(/\s+/g, '-');
   // Trim leading/trailing dashes/dots.
   s = s.replace(/^[-.]+|[-.]+$/g, '');
-  return s.length > 0 ? s : 'unnamed';
+  if (s.length === 0) return 'unnamed';
+  // Windows reserves these device names in every directory.
+  return /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(s) ? `${s}-` : s;
 }
 
-/** Deterministically resolve slug collisions within a namespace. */
+/**
+ * Deterministically resolve slug collisions within a namespace. Compared
+ * case-insensitively: on Windows and macOS `Alpha` and `alpha` are the same
+ * directory, and one would silently overwrite the other.
+ */
 function uniqueSlug(base: string, used: Set<string>): string {
-  if (!used.has(base)) {
-    used.add(base);
-    return base;
-  }
-  let n = 2;
-  let candidate = `${base}-${n}`;
-  while (used.has(candidate)) {
-    n += 1;
-    candidate = `${base}-${n}`;
-  }
-  used.add(candidate);
+  let candidate = base;
+  for (let n = 2; used.has(candidate.toLowerCase()); n += 1) candidate = `${base}-${n}`;
+  used.add(candidate.toLowerCase());
   return candidate;
 }
 
@@ -107,13 +107,42 @@ function relPosix(fromDir: string, toFile: string): string {
   return path.relative(fromDir, toFile).split(path.sep).join('/');
 }
 
+/** The real path of the tree being exploded, for the write check below. */
+const explodeRoot = new AsyncLocalStorage<string>();
+
+/**
+ * Refuse a write whose real directory is outside the tree: the names are
+ * sanitised, but a symlink or junction already inside the tree could still
+ * redirect it.
+ */
+async function assertInsideTree(filePath: string): Promise<void> {
+  const root = explodeRoot.getStore();
+  if (root === undefined) return;
+  // Check the nearest directory that already exists, before creating any:
+  // mkdir through a link would already have created directories outside.
+  let dir = path.dirname(filePath);
+  while (!existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+  const real = await realpath(dir);
+  if (real !== root && !real.startsWith(root + path.sep)) {
+    throw new Error(`refusing to write outside the working tree: ${filePath}`);
+  }
+  // A safe parent does not make an existing file link safe to overwrite.
+  const existing = await lstat(filePath).catch((err: NodeJS.ErrnoException) => {
+    if (err.code !== 'ENOENT') throw err;
+    return undefined;
+  });
+  if (existing?.isSymbolicLink()) throw new Error(`refusing to write through a file link: ${filePath}`);
+}
+
 async function writeFileMkdir(filePath: string, data: string): Promise<void> {
+  await assertInsideTree(filePath);
   await mkdir(path.dirname(filePath), { recursive: true });
   // NO added trailing newline — code strings must round-trip byte-identical.
   await writeFile(filePath, data);
 }
 
 async function writeJson(filePath: string, value: Json): Promise<void> {
+  await assertInsideTree(filePath);
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, JSON.stringify(value, null, 2));
 }
@@ -181,7 +210,8 @@ async function extractFromObject(
       const friendlyBase =
         key in CHANNEL_SCRIPT_FRIENDLY
           ? `scripts/${CHANNEL_SCRIPT_FRIENDLY[key]}`
-          : ctx.friendly ?? `_code/${[...ctx.prefixParts, key].join('.')}`;
+          : // One filename segment: config keys are untrusted and may hold '/' or '..'.
+            ctx.friendly ?? `_code/${slug([...ctx.prefixParts, key].join('.'))}`;
       const filePath = resolveUnique(ctx.codeDir, `${friendlyBase}.js`, ctx.usedPaths);
       await writeFileMkdir(filePath, raw);
       out[key] = { '@file': relPosix(ctx.jsonDir, filePath) };
@@ -207,18 +237,13 @@ function resolveUnique(baseDir: string, relName: string, used: Set<string>): str
   const dirSlug = dir === '.' ? '' : dir;
   // Build slugged segments for the directory portion (preserve structure).
   const segs = dirSlug.split('/').filter(Boolean);
+  // Case-insensitive, like uniqueSlug.
   let rel = [...segs, `${stem}${ext}`].join('/');
-  if (used.has(rel)) {
-    let n = 2;
-    let candidate = [...segs, `${stem}-${n}${ext}`].join('/');
-    while (used.has(candidate)) {
-      n += 1;
-      candidate = [...segs, `${stem}-${n}${ext}`].join('/');
-    }
-    rel = candidate;
-  }
-  used.add(rel);
-  return path.join(baseDir, ...rel.split('/'));
+  for (let n = 2; used.has(rel.toLowerCase()); n += 1) rel = [...segs, `${stem}-${n}${ext}`].join('/');
+  used.add(rel.toLowerCase());
+  const full = path.resolve(baseDir, ...rel.split('/'));
+  if (!full.startsWith(path.resolve(baseDir) + path.sep)) throw new Error(`script path escapes its directory: ${relName}`);
+  return full;
 }
 
 /**
@@ -622,6 +647,11 @@ async function splitCollection(
 }
 
 async function explode(config: CanonicalConfig, opts: ExplodeOptions): Promise<void> {
+  await mkdir(opts.root, { recursive: true });
+  await explodeRoot.run(await realpath(opts.root), () => explodeInto(config, opts));
+}
+
+async function explodeInto(config: CanonicalConfig, opts: ExplodeOptions): Promise<void> {
   const root = opts.root;
   const serverDir = path.join(root, 'server');
   const skeleton = deepClone(config) as Record<string, Json>;
@@ -849,6 +879,19 @@ function resolveWithinRoot(root: string, jsonDir: string, rel: string): string {
 }
 
 /**
+ * Read a marker target, re-checking containment on the real path: the text
+ * check above can't see a symlink or junction inside the tree that points
+ * outside it.
+ */
+async function readWithinRoot(root: string, target: string, rel: string): Promise<string> {
+  const [realRoot, realTarget] = await Promise.all([realpath(root), realpath(target)]);
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+    throw new Error(`marker path escapes the working tree through a link: ${rel}`);
+  }
+  return readFile(realTarget, 'utf8');
+}
+
+/**
  * Recursively resolve markers in a parsed JSON value. `jsonDir` is the directory
  * of the JSON file this value came from (markers are relative to it); `root` is
  * the working-tree root that every marker target must stay within.
@@ -868,13 +911,13 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
   if (isFileRef(value)) {
     const target = resolveWithinRoot(root, jsonDir, value['@file']);
     // Raw read, NO trimming — byte-identical round-trip.
-    return readFile(target, 'utf8');
+    return readWithinRoot(root, target, value['@file']);
   }
 
   if (isRefMarker(value)) {
     const target = resolveWithinRoot(root, jsonDir, value['@ref']);
-    const text = await readFile(target, 'utf8');
-    const parsed = JSON.parse(text) as Json;
+    const text = await readWithinRoot(root, target, value['@ref']);
+    const parsed = parseJson<Json>(text, target);
     return resolveMarkers(parsed, path.dirname(target), root);
   }
 
@@ -895,8 +938,7 @@ async function implode(opts: ExplodeOptions): Promise<CanonicalConfig> {
   const root = path.resolve(opts.root);
   const serverDir = path.join(root, 'server');
   const configPath = path.join(serverDir, 'configuration.json');
-  const text = await readFile(configPath, 'utf8');
-  const parsed = JSON.parse(text) as Json;
+  const parsed = await readJson<Json>(configPath);
   const resolved = await resolveMarkers(parsed, serverDir, root);
   return resolved as CanonicalConfig;
 }

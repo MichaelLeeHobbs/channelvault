@@ -12,17 +12,19 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
+    "docs",
     "README.md",
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20.18.1"
   },
   "scripts": {
     "build": "tsup",
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:integration": "node scripts/test-integration.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint --fix ."
@@ -30,9 +32,9 @@
   "dependencies": {
     "commander": "^12.1.0",
     "dotenv": "^18.0.3",
-    "fast-xml-parser": "^4.5.0",
+    "fast-xml-parser": "^5.11.1",
     "tough-cookie": "^5.0.0",
-    "undici": "^7.0.0"
+    "undici": "^7.29.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",

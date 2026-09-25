@@ -9,8 +9,8 @@
  */
 import { createHash } from 'node:crypto';
 
-import type { CanonicalConfig } from '../types.js';
-import { derivedName, hasPlaceholder, mapLeaves, placeholder, type Env, type Leaf } from './index.js';
+import { CHANNEL_SCRIPT_KEYS, CODE_KEYS, type CanonicalConfig } from '../types.js';
+import { derivedName, hasPlaceholder, isSecretKey, mapLeaves, placeholder, type Env, type Leaf } from './index.js';
 
 export type SecretKind =
   | 'private-key'
@@ -19,6 +19,7 @@ export type SecretKind =
   | 'authorization-header'
   | 'db-connection-call'
   | 'assignment'
+  | 'setter-call'
   | 'aws-access-key'
   | 'jwt'
   | 'github-token'
@@ -34,7 +35,8 @@ interface Rule {
   kind: SecretKind;
   /** Suffix for the env variable name. */
   suffix: string;
-  spans(value: string): Span[];
+  /** `script`: the value is JavaScript (a step, template or channel script). */
+  spans(value: string, script: boolean): Span[];
 }
 
 /** Spans of capture group `group` (0 = whole match) of every match of `re`. */
@@ -91,6 +93,54 @@ function dbConnectionSpans(value: string): Span[] {
   return out;
 }
 
+/**
+ * The tail of `name = 'literal'` / `name: "literal"`: an optional default-value
+ * prefix (`name || `, `name ?? `), then a quoted literal of 4+ characters on one
+ * line. Braces are excluded so `${var}` templates and placeholders don't match. A
+ * literal with spaces must also hold a digit or symbol, so prose such as
+ * `secret = 'Not configured yet'` is not a secret.
+ */
+const ASSIGNED = String.raw`["']?\s*[:=]\s*(?:[\w$.[\]'"]+\s*(?:\|\||\?\?)\s*)?(["'])((?=\S)(?:[^"'{}\s]{4,}|(?=[^"'{}\n]*[0-9@#$%^&*+=~|\\/<>_])[^"'{}\n]{4,}))\1`;
+
+/** A connection-string value: up to the next delimiter, without surrounding spaces. */
+const CONN_VALUE = String.raw`([^;&'"\s](?:[^;&'"\n]*[^;&'"\s])?)`;
+
+/**
+ * String literals and comments of a script: where a connection string can
+ * appear as text. Regex literals are not recognised, so a quote inside one
+ * can shift what counts as a literal.
+ */
+function textSpans(code: string): Span[] {
+  const out: Span[] = [];
+  let i = 0;
+  while (i < code.length) {
+    const c = code[i]!;
+    const next = code[i + 1];
+    if (c === '/' && (next === '/' || next === '*')) {
+      const close = next === '/' ? code.indexOf('\n', i) : code.indexOf('*/', i + 2);
+      const end = close < 0 ? code.length : close;
+      out.push({ start: i + 2, end });
+      i = end + 2;
+    } else if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1;
+      while (j < code.length && code[j] !== c && (c === '`' || code[j] !== '\n')) j += code[j] === '\\' ? 2 : 1;
+      out.push({ start: i + 1, end: Math.min(j, code.length) });
+      i = j + 1;
+    } else {
+      i += 1;
+    }
+  }
+  return out;
+}
+
+/** Apply `spans` to a whole data value, but only to the text parts of a script. */
+function outsideCode(spans: (value: string) => Span[]): (value: string, script: boolean) => Span[] {
+  return (value, script) =>
+    script
+      ? textSpans(value).flatMap((t) => spans(value.slice(t.start, t.end)).map((s) => ({ start: s.start + t.start, end: s.end + t.start })))
+      : spans(value);
+}
+
 // Earlier rules win where spans overlap: a private key block may contain text
 // other rules match, and `token = 'ghp_…'` is one secret, not two.
 const RULES: Rule[] = [
@@ -106,7 +156,19 @@ const RULES: Rule[] = [
   // user:password@host. The user part stops at ';', '?' and '&' so a JDBC
   // parameter like `user=svc@srv` is not mistaken for credentials.
   { kind: 'url-credentials', suffix: 'PASSWORD', spans: regexSpans(/\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'";?&]+:([^\s@'"/;?&]+)@/gi, 1) },
-  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/[;?&]\s*(?:password|pwd)\s*=\s*([^;&'"\s]+)/gi, 1) },
+  // Drivers trim around `=` and the value, so spaces are allowed there. In a
+  // script only string literals and comments are searched: `pwd=$('x')` is code.
+  {
+    kind: 'connection-string',
+    suffix: 'PASSWORD',
+    spans: outsideCode(regexSpans(new RegExp(String.raw`[;?&]\s*(?:password|pwd)\s*=\s*${CONN_VALUE}`, 'gi'), 1)),
+  },
+  // Leading the whole value (`Password=…;Server=…`), when another key=value follows.
+  {
+    kind: 'connection-string',
+    suffix: 'PASSWORD',
+    spans: outsideCode(regexSpans(new RegExp(String.raw`^\s*(?:password|pwd)\s*=\s*${CONN_VALUE}(?=\s*;\s*[\w ]+=)`, 'gi'), 1)),
+  },
   // Case-sensitive, and the credential must contain a digit or a base64/token
   // symbol, so prose like "Basic authentication" does not match.
   {
@@ -117,13 +179,25 @@ const RULES: Rule[] = [
   { kind: 'db-connection-call', suffix: 'DB_PASSWORD', spans: dbConnectionSpans },
   // name = 'literal' where the name ends in a secret word: password, dbPassword,
   // db_password, DB_PASSWORD, apiKey, authToken… (not tokenizer, not ==).
+  // Also the default-value idiom: apiKey = apiKey || 'literal' (or ??).
   {
     kind: 'assignment',
     suffix: 'PASSWORD',
-    spans: regexSpans(
-      /(?<![\w$])[\w$]*?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|token)["']?\s*[:=]\s*(["'])([^"'{}\s]{4,})\1/gi,
-      2,
-    ),
+    spans: regexSpans(new RegExp(`(?<![\\w$])[\\w$]*?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|token)${ASSIGNED}`, 'gi'), 2),
+  },
+  // `pass` as a whole name or a word boundary within one (pass, dbPass,
+  // DB_PASS, sftp_pass), case-sensitive so bypass and compass don't match,
+  // and not after words that make it an ordinary noun (byPass, firstPass).
+  {
+    kind: 'assignment',
+    suffix: 'PASSWORD',
+    spans: regexSpans(new RegExp(`(?<![\\w$])(?:pass|PASS|[\\w$]*[a-z0-9](?<!(?:[bB]y|[fF]irst|[sS]econd|[tT]hird|[lL]ast|[nN]ext|[oO]ne|[sS]ingle|[mM]ulti|[eE]very|[cC]om|[sS]ur|[oO]ver|[uU]nder))(?:Pass|PASS)|[\\w$]*_(?:pass|PASS))${ASSIGNED}`, 'g'), 2),
+  },
+  // conn.setPassword('literal'), props.setApiKey("literal")…
+  {
+    kind: 'setter-call',
+    suffix: 'PASSWORD',
+    spans: regexSpans(/\bset[A-Za-z]*(?:Password|Passwd|Passphrase|Secret|Token|ApiKey)\s*\(\s*(["'])([^"'\n]{4,})\1\s*\)/g, 2),
   },
 ];
 
@@ -167,16 +241,39 @@ interface Hit extends Span {
 }
 
 /** Every secret span in `value`, earlier rules winning overlaps, in position order. */
-function hitsIn(value: string): Hit[] {
+function hitsIn(value: string, script = false): Hit[] {
   const taken: Hit[] = [];
   for (const rule of RULES) {
-    for (const span of rule.spans(value)) {
+    for (const span of rule.spans(value, script)) {
       if (span.end <= span.start || isReference(value.slice(span.start, span.end))) continue;
       if (taken.some((t) => span.start < t.end && t.start < span.end)) continue;
       taken.push({ ...span, rule });
     }
   }
   return taken.sort((a, b) => a.start - b.start);
+}
+
+const SCRIPT_KEYS: ReadonlySet<string> = new Set<string>([...CODE_KEYS, ...CHANNEL_SCRIPT_KEYS]);
+
+/** Script leaves: step, template and channel code, and the global scripts. */
+function isScript(leaf: Leaf): boolean {
+  return SCRIPT_KEYS.has(leaf.key) || leaf.section === 'globalScripts';
+}
+
+/** `value` with every secret a rule recognises replaced by a marker, for messages. */
+export function redactSecretsInText(text: string): string {
+  // Credential fields echoed as JSON ("passcode": "…") or XML (<keyPW>…</keyPW>),
+  // by the field names `templatize` extracts, then the value rules.
+  const value = text
+    .replace(/("([\w.-]+)"\s*:\s*")((?:[^"\\]|\\.)+)"/g, (whole, head: string, key: string) => (isSecretKey(key) ? `${head}<redacted>"` : whole))
+    .replace(/<([\w.:-]+)>([^<]+)<\/\1>/g, (whole, key: string) => (isSecretKey(key) ? `<${key}><redacted></${key}>` : whole));
+  let out = '';
+  let at = 0;
+  for (const h of hitsIn(value)) {
+    out += `${value.slice(at, h.start)}<redacted ${h.rule.kind}>`;
+    at = h.end;
+  }
+  return out + value.slice(at);
 }
 
 /** Hash of the string with every secret removed: stable while its text is, and holds no secret. */
@@ -203,12 +300,19 @@ export function scanSecrets(config: CanonicalConfig, opts: { mode: ScanMode; all
   const envUpdates: Record<string, string> = {};
   const assigned = new Map<string, string>(); // name -> value, this run
 
+  // Names placeholders already use belong to their locations; each new
+  // placeholder gets its own name, so rotating one secret never changes another.
+  const inUse = new Set<string>();
+  mapLeaves(config, (value) => {
+    for (const m of value.matchAll(/\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g)) inUse.add(m[1]!);
+    return value;
+  });
   const nameFor = (leaf: Leaf, rule: Rule, value: string): string => {
     const base = `${derivedName(leaf)}__${rule.suffix}`;
     for (let n = 1; ; n += 1) {
       const name = n === 1 ? base : `${base}_${n}`;
-      const current = assigned.get(name) ?? env[name];
-      if (current === undefined || current === value) {
+      if (assigned.has(name) || inUse.has(name)) continue;
+      if (env[name] === undefined || env[name] === value) {
         assigned.set(name, value);
         // A value the environment already holds (the file, or CI's process
         // environment) is not written to the file again.
@@ -219,7 +323,7 @@ export function scanSecrets(config: CanonicalConfig, opts: { mode: ScanMode; all
   };
 
   const out = mapLeaves(config, (value, leaf) => {
-    const hits = hitsIn(value);
+    const hits = hitsIn(value, isScript(leaf));
     if (hits.length === 0) return value;
     const context = contextOf(value, hits);
     let result = '';
@@ -237,6 +341,25 @@ export function scanSecrets(config: CanonicalConfig, opts: { mode: ScanMode; all
   });
 
   return { config: out, findings, envUpdates };
+}
+
+/**
+ * Known secret values that still appear verbatim somewhere in `config`: a
+ * repeat no rule recognised (a default argument, a URL fragment). Values
+ * shorter than 8 characters are skipped; short ones such as a database name
+ * reused as a password match too much ordinary text.
+ */
+export function findEchoes(config: CanonicalConfig, secrets: Env): Array<{ name: string; where: string }> {
+  const values = Object.entries(secrets).filter((e): e is [string, string] => typeof e[1] === 'string' && e[1].length >= 8);
+  const out: Array<{ name: string; where: string }> = [];
+  if (values.length === 0) return out;
+  mapLeaves(config, (value, leaf) => {
+    for (const [name, secret] of values) {
+      if (value.includes(secret)) out.push({ name, where: [...leaf.labels, leaf.key].join(' › ') });
+    }
+    return value;
+  });
+  return out;
 }
 
 export function formatFindings(findings: Finding[]): string {

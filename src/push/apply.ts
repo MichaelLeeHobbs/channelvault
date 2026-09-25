@@ -2,11 +2,12 @@
  * Carry out a push plan against a server, and afterwards copy the server's new
  * revision numbers back into the tree so the next push compares like with like.
  */
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { readdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 
 import type { MirthClientExt } from '../client/index.js';
+import { readJson } from '../json.js';
 import type { CanonicalConfig, Json } from '../types.js';
 import {
   findChannel,
@@ -46,6 +47,7 @@ export async function applyPlan(
   local: CanonicalConfig,
   remote: CanonicalConfig,
   scope: Scope,
+  opts: { force?: boolean } = {},
 ): Promise<ApplyResult> {
   const applied: Change[] = [];
   const touchedIds = new Set<string>();
@@ -58,7 +60,7 @@ export async function applyPlan(
           // One PUT replaces the whole list and bumps every library's revision.
           if (!librariesSent) {
             const inSync = librariesInSync(local, remote);
-            await client.putCodeTemplateLibraries(librariesToSend(local, remote, scope));
+            await client.putCodeTemplateLibraries(librariesToSend(local, remote, scope, plan));
             librariesSent = true;
             // Take the server's new revision only where the tree now holds what
             // was sent; a stale out-of-scope library must keep its old revision
@@ -76,7 +78,9 @@ export async function applyPlan(
         } else if (kind === 'channel' && change.op === 'delete') {
           await client.deleteChannel(change.id);
         } else if (kind === 'channel') {
-          await client.putChannel(await withServerAssociations(client, findChannel(local, change.id)!, change.op));
+          await client.putChannel(
+            await withServerAssociations(client, findChannel(local, change.id)!, change.op, findChannel(remote, change.id), opts.force === true),
+          );
         } else {
           await client.putGlobalScripts(local['globalScripts']);
         }
@@ -98,9 +102,21 @@ export async function applyPlan(
  */
 const ASSOCIATIONS = ['channelTags', 'dependentIds', 'dependencyIds'];
 
-async function withServerAssociations(client: MirthClientExt, channel: Obj, op: Change['op']): Promise<Obj> {
+async function withServerAssociations(
+  client: MirthClientExt,
+  channel: Obj,
+  op: Change['op'],
+  planned: Obj | undefined,
+  force: boolean,
+): Promise<Obj> {
   if (op !== 'update') return channel;
   const server = await client.getChannel(String(channel['id']));
+  // Last check before the save (Mirth itself does not reject a stale
+  // revision): someone saved this channel after the plan was made.
+  const [now, then] = [Number(server?.['revision'] ?? 0), Number(planned?.['revision'] ?? 0)];
+  if (!force && now > then) {
+    throw new Error(`changed on the server during the push (revision ${now}, planned against ${then}); pull and try again`);
+  }
   const serverExport = server?.['exportData'] as Obj | undefined;
   if (!serverExport) return channel;
   const exportData: Obj = { ...((channel['exportData'] as Obj | undefined) ?? {}) };
@@ -157,14 +173,14 @@ async function jsonFiles(dir: string, name: string): Promise<string[]> {
  */
 export async function refreshRevisions(root: string, server: CanonicalConfig, ids: Set<string>): Promise<void> {
   for (const file of await jsonFiles(path.join(root, 'channels'), 'channel.json')) {
-    const json = JSON.parse(await readFile(file, 'utf8')) as Obj;
+    const json = await readJson<Obj>(file);
     if (ids.has(String(json['id'])) && copyVersionFields(json, findChannel(server, String(json['id'])))) {
       await writeFile(file, JSON.stringify(json, null, 2));
     }
   }
   const serverLibs = new Map(librariesOf(server).map((l) => [String(l['id']), l]));
   for (const file of await jsonFiles(path.join(root, 'codeTemplates'), 'library.json')) {
-    const json = JSON.parse(await readFile(file, 'utf8')) as Obj;
+    const json = await readJson<Obj>(file);
     let changed = ids.has(String(json['id'])) && copyVersionFields(json, serverLibs.get(String(json['id'])));
     const container = json['codeTemplates'] as Obj | undefined;
     for (const t of list(container?.['codeTemplate'])) {
