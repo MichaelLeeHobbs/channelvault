@@ -57,7 +57,7 @@ A team running Mirth can keep every channel, code template and script in git, re
 
 ## M3: First release
 
-- Publish to npm with provenance.
+- Publish to npm with provenance. Done for 0.1.0 as `@ubercode/channelvault`: published by hand (npm cannot configure a trusted publisher before a package exists); later versions publish from a `vX.Y.Z` tag through `.github/workflows/publish.yml` with provenance.
 - A README walkthrough from `docker compose up` to a reviewed `push`.
 
 ## Backlog
