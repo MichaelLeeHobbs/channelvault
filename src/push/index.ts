@@ -465,6 +465,22 @@ export function sameServerConfig(a: CanonicalConfig, b: CanonicalConfig): boolea
   return same(ra as Json, rb as Json);
 }
 
+/** Only adopt a save's revision while the server still holds the content sent. */
+export function savedChangeMatches(change: Change, local: CanonicalConfig, remote: CanonicalConfig): boolean {
+  if (change.kind === 'globalScripts') return same(local['globalScripts'], remote['globalScripts']);
+  const find = (config: CanonicalConfig): Obj | undefined => change.kind === 'channel'
+    ? findChannel(config, change.id)
+    : change.kind === 'codeTemplate'
+      ? findTemplate(config, change.id)
+      : librariesOf(config).find(l => idOf(l) === change.id);
+  const after = find(remote);
+  if (change.op === 'delete') return after === undefined;
+  const sent = find(local);
+  if (!sent || !after) return false;
+  const shape = change.kind === 'library' ? libraryShape : stripVolatile;
+  return same(shape(sent), shape(after));
+}
+
 /** Find a code template by id in a config. */
 export function findTemplate(c: CanonicalConfig, id: string): Obj | undefined {
   for (const lib of librariesOf(c)) for (const t of templatesOf(lib)) if (idOf(t) === id) return t;

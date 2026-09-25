@@ -1,0 +1,19 @@
+services:
+  source:
+    image: nextgenhealthcare/connect:4.5.2
+    environment:
+      DATABASE: derby
+      KEYSTORE_STOREPASS: changeit
+      KEYSTORE_KEYPASS: changeit
+      _MP_SERVER_STARTUPDEPLOY: 'false'
+    ports:
+      - '127.0.0.1::8443'
+  target:
+    image: nextgenhealthcare/connect:4.5.2
+    environment:
+      DATABASE: derby
+      KEYSTORE_STOREPASS: changeit
+      KEYSTORE_KEYPASS: changeit
+      _MP_SERVER_STARTUPDEPLOY: 'false'
+    ports:
+      - '127.0.0.1::8443'

@@ -26,6 +26,8 @@ import {
   changedSince,
   channelsOf,
   knownAfterPush,
+  librariesOf,
+  savedChangeMatches,
   knownFrom,
   normalizeEolDeep,
   planPush,
@@ -126,9 +128,15 @@ async function withClient<T>(flags: ConnectionFlags, fn: (client: MirthClientExt
 
 async function confirm(question: string): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const controller = new AbortController();
+  rl.once('close', () => controller.abort());
+  rl.once('SIGINT', () => controller.abort());
   try {
-    const answer = (await rl.question(`${question} [y/N] `)).trim().toLowerCase();
+    const answer = (await rl.question(`${question} [y/N] `, { signal: controller.signal })).trim().toLowerCase();
     return answer === 'y' || answer === 'yes';
+  } catch (err) {
+    if (controller.signal.aborted) fail('confirmation interrupted; nothing was pushed');
+    throw err;
   } finally {
     rl.close();
   }
@@ -283,7 +291,7 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   await updateEnvFile(envFile, envUpdates);
 
   await replaceTree(root, config);
-  await writeMeta(root, source, config);
+  await writeMeta(root, source, fetched);
   if (scan.findings.length > 0) process.stdout.write(`extracted ${scan.findings.length} secret(s) found in values\n`);
   const updated = Object.keys(envUpdates).length;
   if (updated > 0) process.stdout.write(`stored ${updated} secret value(s) in ${envFile}\n`);
@@ -491,9 +499,20 @@ async function scopedPush(
   const result = await applyPlan(client, plan, local, fresh, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
   // resources that did go through don't read as conflicts next time.
-  const after = await client.getServerConfiguration();
-  if (result.touchedIds.size > 0) await refreshRevisions(root, after, result.touchedIds);
-  if (known) await writeKnown(root, knownAfterPush(known, result.applied, result.touchedIds, after));
+  try {
+    const after = await client.getServerConfiguration();
+    const refreshedLibraries: Change[] = librariesOf(local)
+      .filter(l => result.touchedIds.has(String(l['id'])))
+      .map(l => ({ kind: 'library', op: 'update', id: String(l['id']), label: String(l['name']) }));
+    const changedAgain = [...result.applied, ...refreshedLibraries].filter(c => !savedChangeMatches(c, local, after));
+    if (changedAgain.length > 0) fail(`changed again after saving: ${[...new Set(changedAgain.map(c => c.label))].join(', ')}; pull and review before retrying`);
+    if (result.touchedIds.size > 0) await refreshRevisions(root, after, result.touchedIds);
+    if (known) await writeKnown(root, knownAfterPush(known, result.applied, result.touchedIds, after));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!result.failed) fail(`applied ${result.applied.length} change(s), but could not refresh the local sync baseline: ${message}; inspect the server before retrying`);
+    process.stderr.write(`warning: could not refresh the local sync baseline: ${message}\n`);
+  }
   if (result.failed) {
     const { change, error } = result.failed;
     fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}`);
@@ -547,14 +566,23 @@ async function wholeServerPush(
   }
   // The preview was made from `remote`; anything changed since would be
   // overwritten without having been shown.
-  if (!sameServerConfig(remote, await client.getServerConfiguration()) && !flags.force) {
+  const fresh = await client.getServerConfiguration();
+  if (!sameServerConfig(remote, fresh) && !flags.force) {
     fail('the server changed while this push was being confirmed; pull and try again, or pass --force');
+  }
+  // Force permits concurrent edits, but never grants deletion consent.
+  const freshPlan = planPush(local, fresh, {}, known);
+  if (!flags.allowDeletes && (freshPlan.serverOnly.length > 0 || freshPlan.changes.some(c => c.op === 'delete'))) {
+    fail('the replace now deletes resources from the server; review the new plan and pass --allow-deletes');
   }
   await client.putServerConfiguration(local, {
     deploy: flags.deploy === true,
     overwriteConfigMap: flags.overwriteConfigMap === true,
   });
   const after = await client.getServerConfiguration();
+  if (planPush(local, after).changes.length > 0) {
+    fail('applied the whole-server replacement, but resources changed again after saving; pull and review before retrying');
+  }
   const ids = resourceIds(local);
   await refreshRevisions(root, after, new Set([...Object.keys(ids.channels), ...Object.keys(ids.libraries), ...Object.keys(ids.codeTemplates)]));
   if (known) await writeKnown(root, resourceIds(after));

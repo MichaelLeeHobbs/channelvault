@@ -21,14 +21,15 @@ A team running Mirth can keep every channel, code template and script in git, re
   - `@file`/`@ref` markers can't point outside the tree.
   - Operations mixing the two transports are refused.
   - A tripwire test keeps real exports out of `test/fixtures`.
-- **Not yet:** CI and tests for the CLI commands.
+- **CLI failure tests and promotion:** subprocess tests cover failed saves, refreshes, deployment errors, cancelled/interrupted confirmations, and concurrent edits. `pnpm test:integration` creates two disposable Mirth servers and verifies a real promotion with destination credentials and independent revisions.
+- **CI:** the GitHub Actions workflow is checked in; a hosted run remains to be verified after push.
 
 ## M1: Safe to point at production
 
 1. ~~**Scoped push with a preview.**~~ Done (2026-09-24).
 2. **Per-environment values.**
    - The same tree deploys to dev and prod, with values from `--dotenv .env.dev` or `.env.prod`.
-   - The mechanism already exists; what's missing is a documented promotion workflow and a test that promotes between two servers.
+   - Documented in the README and exercised by `pnpm test:integration` against two disposable Mirth 4.5.2 servers. Each destination needs its own working copy and baseline; independent server revisions are not comparable clocks.
 3. **Global scripts as files.** Today they stay inline in `server/configuration.json`.
 4. **Safe to script.**
    - Done: `push` without a terminal fails straight away unless `--yes` is passed.
@@ -41,7 +42,7 @@ A team running Mirth can keep every channel, code template and script in git, re
 
 ## M2: A workflow developers can use
 
-- **CI.** GitHub Actions running typecheck, lint, test and build on Node 20 and 22, on Linux and Windows. Add a job that starts the Docker Mirth server and runs `test/integration/live.test.ts`.
+- **CI.** Implemented in `.github/workflows/ci.yml`: typecheck, lint, tests, build and packaging on Node 20.18.1, 22 and 24, on Linux and Windows, plus the disposable two-server promotion suite on Linux. Hosted execution is pending the next push.
 - **Tests for Rhino code.** A loader so code templates can be called from vitest/Jest, and a harness that provides `msg`, `channelMap`, `$c` and the other Mirth globals to channel scripts.
 - **Rhino lint.** An ESLint preset for Mirth's Rhino runtime: no template literals, `async`, `?.` or `class`; `let` rather than `const` inside loops.
 - **Step order you can edit.**
@@ -49,7 +50,7 @@ A team running Mirth can keep every channel, code template and script in git, re
   - Either present each transformer as one ordered list, or make the file-name prefix `<n>` authoritative.
   - Which to choose depends on whether Mirth runs steps in list order or by `sequenceNumber` (see open questions).
 - **Version coverage.** Fixtures exported from Docker for each supported Mirth / OIE version, run through every round-trip test.
-- **Test gaps.** CLI tests for `pull`, `push` and `diff`, a coverage threshold, and a test that exploding the same config twice produces identical files.
+- **Test gaps.** A coverage threshold, deterministic repeated-explode coverage, native terminal interaction beyond the pipe-driven confirmation tests, and more server versions. CLI failure/retry/confirmation tests and real pull/push/diff promotion coverage are implemented.
 
 *Exit check:* green CI on every push, including the live job.
 
@@ -116,3 +117,9 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - Explode checks every write's real directory before creating it; XML is validated before conversion; the tree is written to a staging directory and swapped in.
 - Library saves do not change template contents (verified on 4.5.2), so the library list only has to be current at the library level.
 - Dependencies: undici 7.29, fast-xml-parser 5 (no audit findings).
+
+**2026-09-24: Fourth review and executable release checks.**
+- Closing confirmation input now fails and logs out. A post-save refresh failure preserves the original partial-push diagnosis. Whole-server force rechecks deletion consent against the final snapshot.
+- Revision refresh verifies the saved content before adopting the server's revision, including whole-server replacement. A concurrent edit observed after saving leaves the old baseline and fails for review.
+- Pull hashes the actual fetched global scripts before replacing secrets with placeholders. Existing file symlinks are rejected before explode writes through them.
+- CI is defined and the two-server promotion has passed locally on Mirth 4.5.2. These checks qualify synthetic configuration operations, not live external integrations or other engine versions.

@@ -98,6 +98,18 @@ describe('2. explode never writes outside the tree', () => {
     await expect(createExplodeEngine().explode(server(), { root })).rejects.toThrow(/refusing to write outside the working tree/);
     expect(await readdir(outside)).toEqual([]);
   });
+
+  // Windows needs SeCreateSymbolicLinkPrivilege for file links; directory
+  // junctions are covered above on both platforms. Linux CI exercises this.
+  it.skipIf(process.platform === 'win32')('refuses an existing file symlink, even when its parent is inside the tree', async () => {
+    const root = path.join(dir, 'tree');
+    const outside = path.join(dir, 'outside.js');
+    await mkdir(path.join(root, 'channels', 'Alpha', 'scripts'), { recursive: true });
+    await writeFile(outside, 'keep this file');
+    await symlink(outside, path.join(root, 'channels', 'Alpha', 'scripts', 'deploy.js'), 'file');
+    await expect(createExplodeEngine().explode(server(), { root })).rejects.toThrow(/refusing to write/);
+    expect(await readFile(outside, 'utf8')).toBe('keep this file');
+  });
 });
 
 describe('3. deleting a resource the server changed since the pull', () => {

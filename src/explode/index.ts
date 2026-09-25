@@ -16,7 +16,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
@@ -125,6 +125,12 @@ async function assertInsideTree(filePath: string): Promise<void> {
   if (real !== root && !real.startsWith(root + path.sep)) {
     throw new Error(`refusing to write outside the working tree: ${filePath}`);
   }
+  // A safe parent does not make an existing file link safe to overwrite.
+  const existing = await lstat(filePath).catch((err: NodeJS.ErrnoException) => {
+    if (err.code !== 'ENOENT') throw err;
+    return undefined;
+  });
+  if (existing?.isSymbolicLink()) throw new Error(`refusing to write through a file link: ${filePath}`);
 }
 
 async function writeFileMkdir(filePath: string, data: string): Promise<void> {

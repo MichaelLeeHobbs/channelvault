@@ -105,7 +105,26 @@ MIRTH_HOST=localhost MIRTH_PORT=8443 MIRTH_USER=admin MIRTH_PASS=admin \
 
 To try channelvault on a **real** configuration, use `docker compose -f docker-compose.isolated.yml up -d` instead: the same server with no outbound network (a deployed channel cannot reach anything), startup deploy off, and port 8443 on localhost only. `down` deletes it and everything in it.
 
-`test/integration/live.test.ts` runs against it when `MIRTH_HOST` is set and the server answers, and skips otherwise.
+`pnpm test:integration` creates two disposable Mirth 4.5.2 servers on random localhost ports, imports only the synthetic fixture, and drives the CLI through a promotion with different destination credentials and independent revision history. It verifies conflict refusal, an explicit override, preserved tags and unrelated channels, and a clean repeat push. It removes its containers and network on success or failure. Docker is required; unavailable servers fail the command.
+
+`test/integration/live.test.ts` is an optional additional suite for a disposable server you manage yourself. It runs when `MIRTH_HOST` is set; connection failures fail the suite. It writes the server configuration, so do not point it at a production or shared server.
+
+### Promoting between environments
+
+Use a separate working copy and env file for each server. Resource revisions and the sync baseline belong to the server that supplied them; they are not comparable version numbers across independent servers. Do not alternate a single working copy between destinations.
+
+For an initial promotion, copy the reviewed source tree into a destination working copy and supply all of its placeholders in a destination env file. The example below assumes the `MIRTH_*` connection variables point to the destination:
+
+```sh
+channelvault diff ./destination --dotenv .env.destination
+channelvault push ./destination --dotenv .env.destination --channel "Report Distributor"
+```
+
+Review the destination differences before overriding an independent revision history with `--force`. The initial source baseline cannot establish whether an independently managed destination changed since its last review. After the first successful push, keep the destination working copy and its refreshed baseline for subsequent changes. `--force` permits overwriting concurrent edits, while deletions still require `--allow-deletes`. A scoped push does not promote the configuration map or other server settings; manage those separately.
+
+### Checks
+
+`pnpm typecheck`, `pnpm lint`, `pnpm test`, and `pnpm build` run the local checks. GitHub Actions defines those checks and packaging on Windows and Linux with Node 20.18.1, 22, and 24, plus the disposable two-server promotion on Linux. CLI tests cover partial saves and retries, failed refreshes, deployment failures, confirmation cancellation and EOF, and concurrent edits. File-symlink write protection is tested on Linux; directory junction protection is also tested on Windows.
 
 ## License
 
