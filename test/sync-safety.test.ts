@@ -162,7 +162,7 @@ describe('--whole-server needs deletion consent for server-only resources', () =
       expect(refused.out).toContain('pass --allow-deletes');
       expect(mirth.writes).toEqual([]);
 
-      const allowed = await cli(['push', tree, '--whole-server', '--force', '--allow-deletes', '--yes', '--no-https'], env);
+      const allowed = await cli(['push', tree, '--whole-server', '--force', '--allow-deletes', '--yes', '--no-https', '--backup-dir', path.join(dir, 'backups')], env);
       expect(allowed.status, allowed.out).toBe(0);
       expect(mirth.writes.map((w) => `${w.method} ${w.path}`)).toEqual(['PUT /api/server/configuration']);
     } finally {

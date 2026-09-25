@@ -118,6 +118,15 @@ describe('planPush', () => {
     expect(() => planPush(local, server())).toThrow(/a name another channel holds/);
   });
 
+  it('allows a whole replace (--whole-server, restore) whose result has no clash, since it lands at once', () => {
+    const local = server();
+    ch(local, 0)['name'] = 'Beta';
+    ch(local, 1)['name'] = 'Alpha';
+    expect(planPush(local, server(), {}, undefined, { wholeReplace: true }).changes.map((c) => `${c.op} ${c.label}`)).toEqual(['update Beta', 'update Alpha']);
+    (local['channels'] as Obj)['channel'] = [ch(local, 0), channel('c1', 'Beta')];
+    expect(() => planPush(local, server(), {}, undefined, { wholeReplace: true })).toThrow(/share id c1/);
+  });
+
   it('allows renaming a channel to a new name, or changing only its case', () => {
     const local = server();
     ch(local, 0)['name'] = 'Alpha 2';
