@@ -16,8 +16,11 @@ export type Env = Readonly<Record<string, string | undefined>>;
 
 const PLACEHOLDER = /\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g;
 
-/** Credential-bearing keys: `password`, `smtpPassword`, `proxyPassword`, `secret`, `apiToken`… */
-const SECRET_KEY = /(password|passphrase|secret|token)$/i;
+/**
+ * Credential-bearing keys: `password`, `smtpPassword`, `passPhrase`, `apiToken`,
+ * and the DICOM connector's `passcode`, `keyPW`, `keyStorePW`, `trustStorePW`.
+ */
+const SECRET_KEY = /(password|passwd|passphrase|passcode|secret|token|pw|pwd|(?:api|access|secret|private)[_-]?key)$/i;
 
 /** Mirth's configuration-map entry value holder (XML and live shapes). */
 const CONFIG_PROPERTY = 'com.mirth.connect.util.ConfigurationProperty';

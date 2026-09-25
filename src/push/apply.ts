@@ -2,11 +2,12 @@
  * Carry out a push plan against a server, and afterwards copy the server's new
  * revision numbers back into the tree so the next push compares like with like.
  */
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { readdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 
 import type { MirthClientExt } from '../client/index.js';
+import { readJson } from '../json.js';
 import type { CanonicalConfig, Json } from '../types.js';
 import {
   findChannel,
@@ -172,14 +173,14 @@ async function jsonFiles(dir: string, name: string): Promise<string[]> {
  */
 export async function refreshRevisions(root: string, server: CanonicalConfig, ids: Set<string>): Promise<void> {
   for (const file of await jsonFiles(path.join(root, 'channels'), 'channel.json')) {
-    const json = JSON.parse(await readFile(file, 'utf8')) as Obj;
+    const json = await readJson<Obj>(file);
     if (ids.has(String(json['id'])) && copyVersionFields(json, findChannel(server, String(json['id'])))) {
       await writeFile(file, JSON.stringify(json, null, 2));
     }
   }
   const serverLibs = new Map(librariesOf(server).map((l) => [String(l['id']), l]));
   for (const file of await jsonFiles(path.join(root, 'codeTemplates'), 'library.json')) {
-    const json = JSON.parse(await readFile(file, 'utf8')) as Obj;
+    const json = await readJson<Obj>(file);
     let changed = ids.has(String(json['id'])) && copyVersionFields(json, serverLibs.get(String(json['id'])));
     const container = json['codeTemplates'] as Obj | undefined;
     for (const t of list(container?.['codeTemplate'])) {

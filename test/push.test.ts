@@ -76,6 +76,55 @@ describe('planPush', () => {
     expect(plan.notPushed).toEqual([]);
   });
 
+  it('refuses a copied channel directory that kept its source id', () => {
+    const local = server();
+    (local['channels'] as Obj)['channel'] = [ch(local, 0), ch(local, 1), channel('c1', 'Alpha Copy', { deployScript: 'return 1;' })];
+    expect(() => planPush(local, server())).toThrow(/channels "Alpha", "Alpha Copy" share id c1/);
+  });
+
+  it('refuses duplicate library and code template ids', () => {
+    const local = server();
+    const copy = library('L1', 'Formatting Copy', [template('t1', 'pad2')]);
+    (local['codeTemplateLibraries'] as Obj)['codeTemplateLibrary'] = [lib(local, 0), lib(local, 1), copy];
+    expect(() => planPush(local, server())).toThrow(/libraries "Formatting", "Formatting Copy" share id L1[\s\S]*code templates "pad", "pad2" share id t1/);
+  });
+
+  it('refuses to create a channel beside a same-named server channel', () => {
+    const local = server();
+    (local['channels'] as Obj)['channel'] = [ch(local, 0), ch(local, 1), channel('c9', 'Beta')];
+    expect(() => planPush(local, server(), { channels: ['c9'] })).toThrow(/a name another channel holds:\n {2}"Beta": ids c2, c9/);
+  });
+
+  // Saves run one at a time and before deletes, so the old holder still has
+  // the name when the new channel is saved.
+  it.each<[string, (local: CanonicalConfig) => void]>([
+    ['a rename frees', (local) => {
+      ch(local, 1)['name'] = 'Beta Old';
+      (local['channels'] as Obj)['channel'] = [ch(local, 0), ch(local, 1), channel('c9', 'Beta')];
+    }],
+    ['a delete frees', (local) => {
+      (local['channels'] as Obj)['channel'] = [ch(local, 0), channel('c9', 'Beta')];
+    }],
+    ['a swap exchanges', (local) => {
+      ch(local, 0)['name'] = 'Beta';
+      ch(local, 1)['name'] = 'Alpha';
+    }],
+    ['differs only in case from', (local) => {
+      (local['channels'] as Obj)['channel'] = [ch(local, 0), ch(local, 1), channel('c9', 'BETA')];
+    }],
+  ])('refuses to save a channel under a name %s in the same push', (_label, change) => {
+    const local = server();
+    change(local);
+    expect(() => planPush(local, server())).toThrow(/a name another channel holds/);
+  });
+
+  it('allows renaming a channel to a new name, or changing only its case', () => {
+    const local = server();
+    ch(local, 0)['name'] = 'Alpha 2';
+    ch(local, 1)['name'] = 'BETA';
+    expect(planPush(local, server()).changes.map((c) => `${c.op} ${c.label}`)).toEqual(['update Alpha 2', 'update BETA']);
+  });
+
   it('plans channel create, update and delete, and redeploys what changed', () => {
     const local = server();
     ch(local, 0)['deployScript'] = 'logger.info("x"); return;';

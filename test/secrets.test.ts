@@ -65,6 +65,24 @@ describe('templatize', () => {
     expect(dest(config, 0)['useAuthentication']).toBe(true);
   });
 
+  // Secret-bearing property names of the stock connectors (Mirth 4.x), beside
+  // same-connector fields that must stay in the tree.
+  it.each<[string, string[], string[]]>([
+    ['DICOM', ['passcode', 'keyPW', 'keyStorePW', 'trustStorePW'], ['username', 'keyStore', 'trustStore', 'applicationEntity']],
+    ['Database', ['password'], ['username', 'url', 'driver']],
+    ['HTTP / Web Service', ['password'], ['username', 'authenticationType', 'wsdlUrl']],
+    ['SMTP', ['password'], ['username', 'smtpHost']],
+    ['File (SFTP)', ['password', 'passPhrase'], ['username', 'keyFile', 'host']],
+    ['custom plugin', ['apiKey', 'accessKey', 'secretKey', 'privateKey', 'passwd', 'pwd'], ['keyName', 'publicKey']],
+  ])('templatizes the %s connector credentials and nothing else', (_connector, secret, plain) => {
+    const properties = Object.fromEntries([...secret, ...plain].map((k) => [k, `value-of-${k}`]));
+    const cfg: CanonicalConfig = { channels: { channel: [{ id: 'c', name: 'C', destinationConnectors: { connector: [{ name: 'D', properties }] } }] } };
+    const { config } = templatize(cfg, null, {});
+    const out = (((channel(config)['destinationConnectors'] as Obj)['connector'] as Obj[])[0]!['properties'] as Obj);
+    for (const k of secret) expect(out[k], k).toMatch(/^\{\{env:C__D__[A-Z_]+\}\}$/);
+    for (const k of plain) expect(out[k], k).toBe(`value-of-${k}`);
+  });
+
   it('round-trips through render', () => {
     const { config, envUpdates } = templatize(liveConfig(), null, {});
     expect(render(config, envUpdates)).toEqual(liveConfig());

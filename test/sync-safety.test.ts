@@ -1,5 +1,5 @@
 /**
- * Regressions for the third review: stale library snapshots, script-path
+ * Sync and write safety: stale library snapshots, script-path
  * escapes, deletes of changed resources, whole-server deletion consent,
  * truncated XML, redeploys of server-only channels, duplicate env lines.
  */
@@ -62,7 +62,7 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
-describe('1. library pushes use a fresh snapshot', () => {
+describe('library pushes use a fresh snapshot', () => {
   it('stops when any library changed or appeared while confirming, and sends the fresh ones', () => {
     const local = server();
     libs(local)[0]!['description'] = 'L1 edit';
@@ -78,7 +78,7 @@ describe('1. library pushes use a fresh snapshot', () => {
   });
 });
 
-describe('2. explode never writes outside the tree', () => {
+describe('explode never writes outside the tree', () => {
   it('keeps a key with path segments inside _code', async () => {
     const cfg: CanonicalConfig = {
       channels: { channel: [channel('c1', 'Alpha', { extension: { 'x/../../../../../../escaped': { script: 'evil();' } } })] },
@@ -112,7 +112,7 @@ describe('2. explode never writes outside the tree', () => {
   });
 });
 
-describe('3. deleting a resource the server changed since the pull', () => {
+describe('deleting a resource the server changed since the pull', () => {
   it('is a conflict, not just a delete', () => {
     const known = resourceIds(server()); // pulled at revision 1
     const remote = server();
@@ -134,7 +134,7 @@ describe('3. deleting a resource the server changed since the pull', () => {
   });
 });
 
-describe('4. --whole-server needs deletion consent for server-only resources', () => {
+describe('--whole-server needs deletion consent for server-only resources', () => {
   const repo = fileURLToPath(new URL('..', import.meta.url));
   const cli = (args: string[], env: Record<string, string>) =>
     new Promise<{ status: number | null; out: string }>((resolve) => {
@@ -171,7 +171,7 @@ describe('4. --whole-server needs deletion consent for server-only resources', (
   });
 });
 
-describe('5. a truncated XML backup is rejected before anything is written', () => {
+describe('a truncated XML backup is rejected before anything is written', () => {
   it('fails to parse', () => {
     expect(() => new XmlConfigAdapter().parse('<serverConfiguration version="4.5.2"><channels></serverConfiguration>')).toThrow(
       /not well-formed XML/,
@@ -199,7 +199,7 @@ describe('5. a truncated XML backup is rejected before anything is written', () 
   });
 });
 
-describe('6. library redeploys include channels created on the server', () => {
+describe('library redeploys include channels created on the server', () => {
   it('uses the channels as they will be after the push', () => {
     const local = server();
     libs(local)[0]!['includeNewChannels'] = true;
@@ -211,7 +211,7 @@ describe('6. library redeploys include channels created on the server', () => {
   });
 });
 
-describe('7. env file updates', () => {
+describe('env file updates', () => {
   it('replaces every assignment of a name (dotenv uses the last one)', async () => {
     const file = path.join(dir, '.env');
     await writeFile(file, 'PASSWORD=old-first\nOTHER=x\nPASSWORD=old-effective\n');

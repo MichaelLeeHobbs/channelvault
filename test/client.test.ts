@@ -88,6 +88,26 @@ describe('createMirthClient', () => {
       expect(client.isAuthenticated()).toBe(false);
     });
 
+    it('does not put the response body in a login failure', async () => {
+      fetchMock.mockResolvedValueOnce(new Response('<echo>username=admin&password=s3cret</echo>', { status: 500, statusText: 'Server Error' }));
+
+      const client = createMirthClient(CONFIG);
+      const error = await client.login().then(() => undefined, (err: unknown) => err as Error);
+      expect(error?.message).toBe('Login failed: HTTP 500 Server Error');
+    });
+
+    it('keeps every cookie when the server sets several', async () => {
+      const headers = new Headers({ 'content-type': 'application/json' });
+      headers.append('set-cookie', 'JSESSIONID=abc123; Path=/; Expires=Wed, 21 Oct 2099 07:28:00 GMT');
+      headers.append('set-cookie', 'ROUTEID=node2; Path=/');
+      fetchMock
+        .mockResolvedValueOnce(new Response(JSON.stringify(LOGIN_SUCCESS), { headers }))
+        .mockResolvedValueOnce(jsonResponse({ serverConfiguration: {} }));
+
+      await createMirthClient(CONFIG).getServerConfiguration();
+      expect(call(1)[1].headers.Cookie).toBe('JSESSIONID=abc123; ROUTEID=node2');
+    });
+
     it('shares a single in-flight login promise (singleflight)', async () => {
       fetchMock.mockResolvedValueOnce(loginResponse());
 
@@ -190,6 +210,16 @@ describe('createMirthClient', () => {
       const client = createMirthClient(CONFIG);
       await expect(client.deployChannel('c1')).rejects.toThrow('HTTP 500: Server Error: Script compile error at line 3');
       await expect(client.deployChannel('c1')).rejects.toThrow(/^HTTP 500: Server Error$/);
+    });
+
+    it('redacts a secret the error body echoes', async () => {
+      fetchMock
+        .mockResolvedValueOnce(loginResponse())
+        .mockResolvedValueOnce(new Response('invalid url jdbc:x://db;user=svc;password=hunter22x;ssl=true', { status: 500, statusText: 'Server Error' }));
+
+      const error = await createMirthClient(CONFIG).deployChannel('c1').then(() => undefined, (err: unknown) => err as Error & { body?: unknown });
+      expect(error?.message).toContain('password=<redacted connection-string>;ssl=true');
+      expect(JSON.stringify(error)).not.toContain('hunter22x');
     });
   });
 

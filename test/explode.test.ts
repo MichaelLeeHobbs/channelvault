@@ -374,3 +374,12 @@ describe('implode marker containment (path traversal)', () => {
     expect((imploded as Record<string, unknown>).body).toBe('return 1;');
   });
 });
+
+describe('implode of a malformed file', () => {
+  it('names the file that does not parse', async () => {
+    await engine.explode({ channels: { channel: [{ id: 'c1', name: 'Alpha' }] } }, { root });
+    const file = path.join(root, 'channels', 'Alpha', 'channel.json');
+    await writeFile(file, '{ "id": "c1", <<<<<<< HEAD');
+    await expect(engine.implode({ root })).rejects.toThrow(`${file}: `);
+  });
+});

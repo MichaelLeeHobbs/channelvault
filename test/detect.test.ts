@@ -35,6 +35,12 @@ describe('scanSecrets', () => {
     ['authorization-header', "headers.put('Authorization', 'Basic c3ZjOnMzY3JldFB3');", 'c3ZjOnMzY3JldFB3'],
     ['assignment', "var password = 's3cretPw';", 's3cretPw'],
     ['assignment', '{"apiKey": "k-12345678"}', 'k-12345678'],
+    ['assignment', "var pass = 's3cretPw';", 's3cretPw'],
+    ['assignment', "var dbPass = 's3cretPw';", 's3cretPw'],
+    ['assignment', "var DB_PASS = 's3cretPw';", 's3cretPw'],
+    ['assignment', "var password = 'correct horse 42';", 'correct horse 42'],
+    ['setter-call', "conn.setPassword('s3cretPw');", 's3cretPw'],
+    ['connection-string', 'Password=s3cretPw;Server=db.internal;User Id=svc', 's3cretPw'],
     ['db-connection-call', "var db = DatabaseConnectionFactory.createDatabaseConnection(driver, url, 'svc', 's3cretPw');", 's3cretPw'],
     ['aws-access-key', `var k = '${aws}';`, aws],
     ['jwt', `var t = "${jwt}";`, jwt],
@@ -62,6 +68,12 @@ describe('scanSecrets', () => {
     ['a password read from config', "var password = $cfg('db.password');"],
     ['an empty assignment', "var password = '';"],
     ['a word that merely contains token', "var tokenizer = 'whitespace';"],
+    ['a word that merely ends in pass', "var bypass = 'always'; var compass = 'north';"],
+    ['a comparison with pass', "if (pass == 'none') return;"],
+    ['a word ending in Pass that is not a password', "var byPass = 'enabled'; var firstPass = 'true';"],
+    ['prose assigned to a secret-named variable', "var secret = 'Not configured yet';"],
+    ['a script that starts by assigning a call', "password = getPass(); pwd = $('x');"],
+    ['a password taken from a variable', 'var password = getPassword(); conn.setPassword(password);'],
   ])('ignores %s', (_label, script) => {
     expect(scanSecrets(withScript(script), { mode: 'find' }).findings).toEqual([]);
   });
@@ -308,6 +320,61 @@ describe('CLI safety', () => {
     } finally {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
+  });
+
+  it('refuses to replace directories in a folder that is not a channelvault tree', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-foreign-'));
+    try {
+      await mkdir(path.join(dir, 'server'));
+      await writeFile(path.join(dir, 'server', 'index.ts'), 'app code');
+      const r = cli('explode', fixture, dir, '--extract-secrets');
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('not a channelvault tree');
+      expect(await readFile(path.join(dir, 'server', 'index.ts'), 'utf8')).toBe('app code');
+      expect(existsSync(path.join(dir, '.env'))).toBe(false);
+      expect(existsSync(path.join(dir, 'channels'))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('refuses such a folder for pull before connecting to the server', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-foreign-pull-'));
+    try {
+      await mkdir(path.join(dir, 'channels'));
+      // Port 1 is never a Mirth server: reaching it would fail with "cannot reach".
+      const r = spawnSync(process.execPath, ['--import', 'tsx', path.join(repo, 'src', 'cli.ts'), 'pull', dir], {
+        cwd: repo, encoding: 'utf8', env: { ...process.env, MIRTH_HOST: '127.0.0.1', MIRTH_PORT: '1', MIRTH_USER: 'u', MIRTH_PASS: 'p' },
+      });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('not a channelvault tree');
+      expect(r.stderr).not.toContain('cannot reach');
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('warns when git would commit an env file kept outside the tree', async () => {
+    const repoDir = await mkdtemp(path.join(tmpdir(), 'channelvault-gitignore-'));
+    try {
+      expect(spawnSync('git', ['init', '-q'], { cwd: repoDir }).status).toBe(0);
+      const outside = path.join(repoDir, 'secrets.destination');
+      const r = cli('explode', fixture, path.join(repoDir, 'tree'), '--extract-secrets', '--dotenv', outside);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain(`git does not ignore ${outside}`);
+
+      // The default env file sits in the tree, whose .gitignore covers it.
+      const inside = cli('explode', fixture, path.join(repoDir, 'tree2'), '--extract-secrets');
+      expect(inside.status).toBe(0);
+      expect(inside.stderr).not.toContain('git does not ignore');
+    } finally {
+      await rm(repoDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it('reports the version in package.json', async () => {
+    const { version } = JSON.parse(await readFile(path.join(repo, 'package.json'), 'utf8')) as { version: string };
+    expect(cli('--version').stdout.trim()).toBe(version);
   });
 
   it('rejects an argument it would otherwise drop, such as a flag after a literal --', () => {

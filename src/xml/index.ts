@@ -2,7 +2,7 @@
  * XML canonical adapter for Mirth Connect "Backup Config" documents.
  *
  * Converts a Mirth `serverConfiguration` XML document to/from the canonical
- * config (a plain JSON object tree). `fast-xml-parser` v4 does the tokenizing in
+ * config (a plain JSON object tree). `fast-xml-parser` v5 does the tokenizing in
  * its order-preserving mode; the conversion to the canonical object shape and
  * the serializer are ours, because fxp's object mode is lossy in ways a
  * round-trip test built on the same parser cannot see (it regroups interleaved

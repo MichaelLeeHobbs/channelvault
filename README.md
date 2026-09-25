@@ -60,17 +60,22 @@ channelvault diff <dir>                     # tree vs live server
 channelvault status <dir>                   # summary of a tree
 ```
 
-`channelvault <command> --help` lists the flags. Server connection comes from flags or `MIRTH_HOST`, `MIRTH_PORT`, `MIRTH_USER`, `MIRTH_PASS`; prefer the env var over `--pass`, which shows up in process listings.
+`channelvault <command> --help` lists the flags. Server connection comes from flags or `MIRTH_HOST`, `MIRTH_PORT`, `MIRTH_USER`, `MIRTH_PASS`; prefer the env var over `--pass`, which shows up in process listings. Mirth's default certificate is self-signed; `--insecure` accepts it by turning verification off.
+
+`diff` exits 0 when the tree matches the server, 1 when they differ, and 2 on any error (including a bad flag), so a scheduled drift check can tell drift from an outage.
+
+`pull` and `explode` replace `server/`, `channels/`, `codeTemplates/` and `channelGroups/` in `<dir>`, so they refuse a directory that has any of those but no `channelvault.json`.
 
 ## Secrets and per-environment values
 
-`explode` and `pull` keep the credentials they detect out of the tree. Detection is heuristic (see below), so review a first pull of a real server before committing it. Connector passwords, tokens and secrets, and every configuration-map value, become `{{env:NAME}}` placeholders, and their values go to `<dir>/.env`, which is added to the tree's `.gitignore`. `push` and `implode` fill the placeholders back in and refuse to run if any are missing, naming each one.
+`explode` and `pull` keep the credentials they detect out of the tree. Detection is heuristic (see below), so review a first pull of a real server before committing it. Fields named like credentials (passwords, passphrases, passcodes, tokens, secrets, API/access/private keys, and DICOM's `keyPW`, `keyStorePW` and `trustStorePW`), and every configuration-map value, become `{{env:NAME}}` placeholders, and their values go to `<dir>/.env`, which is added to the tree's `.gitignore`. `push` and `implode` fill the placeholders back in and refuse to run if any are missing, naming each one.
 
 - You can add placeholders yourself anywhere, in JSON or in a `.js` file (for example `"host": "{{env:DB_HOST}}"`). A re-pull keeps them as long as they still resolve to what the server holds.
 - `--dotenv .env.prod` selects another environment. Variables already set in the process environment take precedence over the file, so CI can supply them directly.
+- If git would commit the env file (for example `--dotenv` pointing outside the tree, into a repository that doesn't ignore it), `pull` and `explode` warn.
 - A password rotated on the server updates `.env` on the next `pull`, and `diff` reports it by name only. The previous env file is kept in the tree's `.secrets/` (git-ignored, newest 5 only) whenever a value in it changes. An extracted secret inside a script survives server-side edits to the rest of that script.
 
-Secrets inside values are caught too: credentials in URLs and connection strings, `Authorization` headers, `createDatabaseConnection(…, 'password')` calls, password/key assignments in scripts, private keys, and AWS, GitHub, Slack and JWT tokens. If `pull` or `explode` finds one, it writes nothing and lists each finding by location and kind (never the value). Then either:
+Secrets inside values are caught too: credentials in URLs and connection strings, `Authorization` headers, `createDatabaseConnection(…, 'password')` and `setPassword('…')` calls, password/key assignments in scripts (`password`, `dbPass`, `DB_PASS`, `apiKey`…), private keys, and AWS, GitHub, Slack and JWT tokens. If `pull` or `explode` finds one, it writes nothing and lists each finding by location and kind (never the value). Then either:
 
 - rerun with `--extract-secrets`, which replaces just the secret part with a placeholder, or
 - list a false positive in `channelvault.allow.json` (committed): `{ "ignore": [{ "location": "<as printed>", "kind": "assignment", "context": "<as printed>", "note": "why" }] }`. `context` identifies the surrounding text, so the entry stops applying if that text changes.
@@ -87,6 +92,7 @@ channelvault push ./mirth --channel "ADT Router"         # just this channel (re
 channelvault push ./mirth --library Formatting --deploy  # one library, then redeploy the channels using it
 ```
 
+- **Copies**: every channel, library and code template is saved by its `id`, and a copied directory keeps its source's. `push` refuses a tree where two resources share an id, and a save under a name another channel holds (case-insensitive), even one a delete or rename in the same push frees: push that delete or rename first. Give a copy a new UUID.
 - **Deletions** (a channel directory or template you removed) need `--allow-deletes`. Something created on the server since your last pull is never treated as a deletion; `push` leaves it alone and says so.
 - **Conflicts**: if the server's copy has a newer revision than your tree (someone saved it in the Administrator since your last pull), `push` refuses. Pull, merge in git, and push again, or pass `--force`.
 - **`--deploy`** redeploys the channels that changed and the channels a changed code-template library is enabled for, but only those deployed on the server right now; it never starts a channel someone took down. Failures are reported per channel.

@@ -2,8 +2,9 @@
  * `.env` file read/update. Updates rewrite only the lines they touch, so
  * comments and hand-added variables survive a pull.
  */
+import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { appendFile, chmod, copyFile, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, copyFile, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { parse } from 'dotenv';
@@ -90,7 +91,18 @@ export async function updateEnvFile(file: string, updates: Record<string, string
   const readBack = parseEnv(text);
   const wrong = names.filter((n) => readBack[n] !== updates[n]);
   if (wrong.length > 0) throw new Error(`env file update would not read back correctly for ${wrong.join(', ')}; nothing written`);
-  await writeFile(file, text, { encoding: 'utf8', mode: 0o600 });
+  // Write beside it and rename over it: a crash mid-write must not truncate
+  // what may be the only copy of these secrets. Through a link, replace the
+  // file it points to, not the link.
+  const target = existsSync(file) ? await realpath(file) : file;
+  const temp = `${target}.${process.pid}-${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    await writeFile(temp, text, { encoding: 'utf8', mode: 0o600 });
+    await rename(temp, target);
+  } catch (err) {
+    await rm(temp, { force: true });
+    throw err;
+  }
 }
 
 /** How many superseded env files to keep; old secrets should not pile up on disk. */

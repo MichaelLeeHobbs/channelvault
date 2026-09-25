@@ -33,9 +33,10 @@ A team running Mirth can keep every channel, code template and script in git, re
 3. **Global scripts as files.** Today they stay inline in `server/configuration.json`.
 4. **Safe to script.**
    - Done: `push` without a terminal fails straight away unless `--yes` is passed.
-   - Document `diff`'s exit codes (0 = clean, 1 = differences, other = error) for scheduled drift checks.
+   - Done: `diff` exits 0 = clean, 1 = differences, 2 = error (documented in the README).
 5. **Secret coverage.**
    - Done (2026-09-24): key names (`*password`, `*secret`, `*token`, `*passphrase`), every configuration-map value, and secrets inside values (URL and connection-string credentials, auth headers, `createDatabaseConnection` calls, script assignments, private keys, known token formats). `pull`/`explode` refuse until each finding is extracted or allowed. On the private 2.7 MB export: 29 by key name, 6 in values, no false positives.
+   - Done: DICOM (`passcode`, `keyPW`, `keyStorePW`, `trustStorePW`), `*Key` names, `pass`-style script variables and `set…Password('…')` calls.
    - Remaining: check against a full real server, including connector types the private export lacks (Database Reader/Writer, Web Service Sender).
 
 *Exit check:* against the Docker server, a round trip of `pull`, an edit to one step, and a scoped `push` changes only that channel. This passes today (`test/integration/live.test.ts`). A promotion between two Docker servers with different env files leaves the right values on each.
@@ -57,7 +58,6 @@ A team running Mirth can keep every channel, code template and script in git, re
 ## M3: First release
 
 - Publish to npm with provenance.
-- Take the version from `package.json` instead of the literals in `src/cli.ts`.
 - A README walkthrough from `docker compose up` to a reviewed `push`.
 
 ## Backlog
@@ -65,7 +65,6 @@ A team running Mirth can keep every channel, code template and script in git, re
 - **Other secret stores.** AWS Secrets Manager, and possibly others, behind the same `{{env:NAME}}` placeholders so trees don't change.
 - **Converting between the XML and live shapes.** Only needed to push a tree built from a backup file.
 - **Login and TLS.** A `--token` login option, a no-echo password prompt, `--cafile`, and a warning when `--insecure` turns verification off.
-- **Login errors** shouldn't include the response body (`src/client/index.ts`).
 - **Cleanup list.** `clearManaged` should get its directory list from the explode engine.
 - **More resources.** Alerts, server resources and the configuration map as separately syncable resources.
 
@@ -123,3 +122,10 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - Revision refresh verifies the saved content before adopting the server's revision, including whole-server replacement. A concurrent edit observed after saving leaves the old baseline and fails for review.
 - Pull hashes the actual fetched global scripts before replacing secrets with placeholders. Existing file symlinks are rejected before explode writes through them.
 - CI is defined and the two-server promotion has passed locally on Mirth 4.5.2. These checks qualify synthetic configuration operations, not live external integrations or other engine versions.
+
+**2026-09-24: Release review fixes.**
+- `pull`/`explode` refuse a directory holding managed directories without `channelvault.json`: they replace those directories, and a project's own `server/` was deleted.
+- `push` refuses duplicate ids in the tree: a copied directory keeps its source's id, so its save overwrote the original. It also refuses to save a channel under a name another channel holds, even one freed by a delete or rename in the same push, because saves run one at a time before deletes.
+- `diff` errors exit 2, so 1 always means differences.
+- The env file is replaced by rename, not rewritten in place, and a warning names it when git would commit it.
+- Connection failures name the address and cause (and suggest `--insecure` for an untrusted certificate); login errors omit the response body, and other error bodies are secret-redacted.

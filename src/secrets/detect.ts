@@ -19,6 +19,7 @@ export type SecretKind =
   | 'authorization-header'
   | 'db-connection-call'
   | 'assignment'
+  | 'setter-call'
   | 'aws-access-key'
   | 'jwt'
   | 'github-token'
@@ -91,6 +92,15 @@ function dbConnectionSpans(value: string): Span[] {
   return out;
 }
 
+/**
+ * The tail of `name = 'literal'` / `name: "literal"`: an optional default-value
+ * prefix (`name || `, `name ?? `), then a quoted literal of 4+ characters on one
+ * line. Braces are excluded so `${var}` templates and placeholders don't match. A
+ * literal with spaces must also hold a digit or symbol, so prose such as
+ * `secret = 'Not configured yet'` is not a secret.
+ */
+const ASSIGNED = String.raw`["']?\s*[:=]\s*(?:[\w$.[\]'"]+\s*(?:\|\||\?\?)\s*)?(["'])((?=\S)(?:[^"'{}\s]{4,}|(?=[^"'{}\n]*[0-9@#$%^&*+=~|\\/<>_])[^"'{}\n]{4,}))\1`;
+
 // Earlier rules win where spans overlap: a private key block may contain text
 // other rules match, and `token = 'ghp_…'` is one secret, not two.
 const RULES: Rule[] = [
@@ -106,7 +116,11 @@ const RULES: Rule[] = [
   // user:password@host. The user part stops at ';', '?' and '&' so a JDBC
   // parameter like `user=svc@srv` is not mistaken for credentials.
   { kind: 'url-credentials', suffix: 'PASSWORD', spans: regexSpans(/\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'";?&]+:([^\s@'"/;?&]+)@/gi, 1) },
-  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/[;?&]\s*(?:password|pwd)\s*=\s*([^;&'"\s]+)/gi, 1) },
+  // The value ends at a delimiter, so `; pwd = $('x')` in a script is a call, not a password.
+  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/[;?&]\s*(?:password|pwd)\s*=\s*([^;&'"\s()]+)(?=[;&'"\s]|$)/gi, 1) },
+  // Leading the whole value (`Password=…;Server=…`): only when another key=value
+  // follows, so a script starting `password = getPass();` is not one.
+  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/^\s*(?:password|pwd)\s*=\s*([^;&'"\s()]+)(?=\s*;\s*[\w ]+=)/gi, 1) },
   // Case-sensitive, and the credential must contain a digit or a base64/token
   // symbol, so prose like "Basic authentication" does not match.
   {
@@ -121,10 +135,21 @@ const RULES: Rule[] = [
   {
     kind: 'assignment',
     suffix: 'PASSWORD',
-    spans: regexSpans(
-      /(?<![\w$])[\w$]*?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|token)["']?\s*[:=]\s*(?:[\w$.[\]'"]+\s*(?:\|\||\?\?)\s*)?(["'])([^"'{}\s]{4,})\1/gi,
-      2,
-    ),
+    spans: regexSpans(new RegExp(`(?<![\\w$])[\\w$]*?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|token)${ASSIGNED}`, 'gi'), 2),
+  },
+  // `pass` as a whole name or a word boundary within one (pass, dbPass,
+  // DB_PASS, sftp_pass), case-sensitive so bypass and compass don't match,
+  // and not after words that make it an ordinary noun (byPass, firstPass).
+  {
+    kind: 'assignment',
+    suffix: 'PASSWORD',
+    spans: regexSpans(new RegExp(`(?<![\\w$])(?:pass|PASS|[\\w$]*[a-z0-9](?<!(?:[bB]y|[fF]irst|[sS]econd|[tT]hird|[lL]ast|[nN]ext|[oO]ne|[sS]ingle|[mM]ulti|[eE]very|[cC]om|[sS]ur|[oO]ver|[uU]nder))(?:Pass|PASS)|[\\w$]*_(?:pass|PASS))${ASSIGNED}`, 'g'), 2),
+  },
+  // conn.setPassword('literal'), props.setApiKey("literal")…
+  {
+    kind: 'setter-call',
+    suffix: 'PASSWORD',
+    spans: regexSpans(/\bset[A-Za-z]*(?:Password|Passwd|Passphrase|Secret|Token|ApiKey)\s*\(\s*(["'])([^"'\n]{4,})\1\s*\)/g, 2),
   },
 ];
 
@@ -178,6 +203,17 @@ function hitsIn(value: string): Hit[] {
     }
   }
   return taken.sort((a, b) => a.start - b.start);
+}
+
+/** `value` with every secret a rule recognises replaced by a marker, for messages. */
+export function redactSecretsInText(value: string): string {
+  let out = '';
+  let at = 0;
+  for (const h of hitsIn(value)) {
+    out += `${value.slice(at, h.start)}<redacted ${h.rule.kind}>`;
+    at = h.end;
+  }
+  return out + value.slice(at);
 }
 
 /** Hash of the string with every secret removed: stable while its text is, and holds no secret. */

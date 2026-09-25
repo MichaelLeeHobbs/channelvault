@@ -22,7 +22,36 @@
  */
 import { CookieJar } from 'tough-cookie';
 import { Agent } from 'undici';
+import { redactSecretsInText } from '../secrets/detect.js';
 import type { ApiError, CanonicalConfig, ClientConfig, MirthClient } from '../types.js';
+
+/** TLS verification failures, typically a self-signed or privately issued server certificate. */
+export const UNTRUSTED_CERT_CODES: ReadonlySet<string> = new Set([
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  // Not an expired certificate or a host-name mismatch: turning verification
+  // off is the wrong advice for those, and their messages already say why.
+]);
+
+/**
+ * fetch reports every network failure as "fetch failed" and keeps the reason
+ * (ECONNREFUSED, a certificate error) in `cause`; surface it, with its code.
+ */
+function connectionError(url: string, err: unknown): Error & { code?: string } {
+  let cause = err instanceof Error ? (err.cause as (Error & { code?: string; errors?: unknown[] }) | undefined) : undefined;
+  // Several addresses tried (IPv4 and IPv6): report the first attempt.
+  if (cause instanceof AggregateError && cause.errors[0] instanceof Error) cause = cause.errors[0] as Error & { code?: string };
+  const detail = cause?.message || (err instanceof Error ? err.message : String(err));
+  const code = cause?.code;
+  const error = new Error(
+    `cannot reach ${new URL(url).origin}: ${detail}${code && !detail.includes(code) ? ` (${code})` : ''}`,
+    { cause: err },
+  ) as Error & { code?: string };
+  error.code = code;
+  return error;
+}
 
 /** Optional flags accepted by `putServerConfiguration` (Mirth query params). */
 export interface PutServerConfigurationOptions {
@@ -141,7 +170,7 @@ class MirthClientImpl implements MirthClientExt {
           password: this.config.password,
         });
 
-        const response = await fetch(loginUrl, {
+        const response = await this.send(loginUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
@@ -149,15 +178,14 @@ class MirthClientImpl implements MirthClientExt {
             Accept: 'application/json',
           },
           body: body.toString(),
-          // @ts-expect-error - dispatcher is a Node.js/undici specific option
-          dispatcher: this.dispatcher,
         });
 
         await this.storeCookies(response, this.baseUrl);
 
         if (!response.ok) {
-          const text = await response.text();
-          throw new Error(`Login failed: HTTP ${response.status} - ${text.substring(0, 200)}`);
+          // Not the body: a login endpoint's error page can echo the request.
+          await response.body?.cancel();
+          throw new Error(`Login failed: HTTP ${response.status} ${response.statusText}`.trimEnd());
         }
 
         const result = (await response.json()) as Record<string, unknown>;
@@ -190,14 +218,12 @@ class MirthClientImpl implements MirthClientExt {
     try {
       const logoutUrl = `${this.baseUrl}/users/_logout`;
       const cookieString = await this.cookieJar.getCookieString(logoutUrl);
-      await fetch(logoutUrl, {
+      await this.send(logoutUrl, {
         method: 'POST',
         headers: {
           'X-Requested-With': 'XMLHttpRequest',
           ...(cookieString ? { Cookie: cookieString } : {}),
         },
-        // @ts-expect-error - dispatcher is a Node.js/undici specific option
-        dispatcher: this.dispatcher,
       });
     } finally {
       this.authenticated = false;
@@ -339,13 +365,7 @@ class MirthClientImpl implements MirthClientExt {
       headers.Cookie = cookieString;
     }
 
-    const response = await fetch(url, {
-      method,
-      headers,
-      body: options.body,
-      // @ts-expect-error - dispatcher is a Node.js/undici specific option
-      dispatcher: this.dispatcher,
-    });
+    const response = await this.send(url, { method, headers, body: options.body });
 
     await this.storeCookies(response, url);
 
@@ -361,6 +381,19 @@ class MirthClientImpl implements MirthClientExt {
     }
 
     return response;
+  }
+
+  /** fetch through this client's pool, with network failures explained. */
+  private async send(url: string, init: RequestInit): Promise<Response> {
+    try {
+      return await fetch(url, {
+        ...init,
+        // @ts-expect-error - dispatcher is a Node.js/undici specific option
+        dispatcher: this.dispatcher,
+      });
+    } catch (err) {
+      throw connectionError(url, err);
+    }
   }
 
   /** Build an absolute URL with an optional query string. */
@@ -384,9 +417,10 @@ class MirthClientImpl implements MirthClientExt {
 
   /** Persist any `set-cookie` from a response into the jar. */
   private async storeCookies(response: Response, url: string): Promise<void> {
-    const setCookieHeader = response.headers.get('set-cookie');
-    if (setCookieHeader) {
-      await this.cookieJar.setCookie(setCookieHeader, url);
+    // One entry per header: get('set-cookie') joins them with ", ", which also
+    // appears inside a cookie's Expires date.
+    for (const cookie of response.headers.getSetCookie()) {
+      await this.cookieJar.setCookie(cookie, url);
     }
   }
 
@@ -400,15 +434,16 @@ class MirthClientImpl implements MirthClientExt {
     }
 
     // Keep a short plain-text or JSON reason (Mirth's HTML error pages say only
-    // "Request failed.", so they add nothing).
-    const text = typeof body === 'string' ? body.replace(/\s+/g, ' ').trim() : '';
+    // "Request failed.", so they add nothing), with secrets redacted: an error
+    // body can echo the payload that was sent.
+    const text = typeof body === 'string' ? redactSecretsInText(body).replace(/\s+/g, ' ').trim() : '';
     const reason = text !== '' && !/^<(!doctype|html)/i.test(text) ? `: ${text.slice(0, 300)}` : '';
     const message = `HTTP ${response.status}: ${response.statusText}${reason}`;
     const error = new Error(message) as Error & ApiError;
     error.status = response.status;
     error.statusText = response.statusText;
     error.message = message;
-    error.body = body;
+    error.body = text;
     return error;
   }
 }

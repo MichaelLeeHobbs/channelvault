@@ -256,7 +256,31 @@ function channelsUsing(lib: Obj, allChannelIds: string[]): string[] {
   return allChannelIds.filter((id) => enabled.has(id));
 }
 
+/** Groups of `items` sharing a key, for the keys held more than once. */
+function duplicates(items: Obj[], key: (o: Obj) => string): Array<[string, Obj[]]> {
+  const groups = new Map<string, Obj[]>();
+  for (const o of items) groups.set(key(o), [...(groups.get(key(o)) ?? []), o]);
+  return [...groups].filter(([, group]) => group.length > 1);
+}
+
+/**
+ * A copied channel or library directory keeps its source's id, and every save
+ * addresses resources by id, so pushing it would overwrite the original.
+ */
+function assertUniqueIds(local: CanonicalConfig): void {
+  const libs = librariesOf(local);
+  const problems = [
+    ...duplicates(channelsOf(local), idOf).map(([id, g]) => `channels ${g.map((o) => `"${nameOf(o)}"`).join(', ')} share id ${id}`),
+    ...duplicates(libs, idOf).map(([id, g]) => `libraries ${g.map((o) => `"${nameOf(o)}"`).join(', ')} share id ${id}`),
+    ...duplicates(libs.flatMap(templatesOf), idOf).map(([id, g]) => `code templates ${g.map((o) => `"${nameOf(o)}"`).join(', ')} share id ${id}`),
+  ];
+  if (problems.length > 0) {
+    throw new Error(`the tree holds duplicate ids (a copied directory keeps its source's id):\n  ${problems.join('\n  ')}\ngive each copy a new id (a UUID) before pushing`);
+  }
+}
+
 export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope = {}, known?: Known): Plan {
+  assertUniqueIds(local);
   const everything = scope.channels === undefined && scope.libraries === undefined && scope.globalScripts === undefined;
   const channelScope = everything || scope.channels !== undefined;
   const libraryScope = everything || scope.libraries !== undefined;
@@ -318,6 +342,21 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
   const effective = new Map<string, Obj>();
   for (const r of channelsOf(remote)) if (!deletedChannels.has(idOf(r))) effective.set(idOf(r), r);
   for (const l of channelsOf(local)) if (writtenChannels.has(idOf(l))) effective.set(idOf(l), l);
+  // A saved channel may not take a name another channel holds, on the server
+  // now or after the push (a tree channel beside a same-named server channel
+  // with another id, as when servers were set up separately). Saves run before
+  // deletes and one at a time, so a name freed by a delete or rename in the
+  // same push is still taken when the save runs. Case-insensitive, to be safe.
+  const nameKey = (c: Obj) => nameOf(c).toLowerCase();
+  const holders = [...new Map([...channelsOf(remote), ...effective.values()].map((c) => [`${idOf(c)}\n${nameKey(c)}`, c])).values()];
+  const clashes = duplicates(holders, nameKey).filter(([, g]) => g.some((c) => writtenChannels.has(idOf(c))));
+  if (clashes.length > 0) {
+    throw new Error(
+      `the push would save a channel under a name another channel holds:\n  ` +
+        clashes.map(([, g]) => `"${nameOf(g[0]!)}": ids ${[...new Set(g.map(idOf))].join(', ')}`).join('\n  ') +
+        `\nrename one of them, or delete or rename the other in a push of its own first`,
+    );
+  }
 
   // Code templates and libraries
   if (libraryScope) {

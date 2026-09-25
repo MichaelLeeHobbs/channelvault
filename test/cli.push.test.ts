@@ -163,6 +163,21 @@ describe('CLI confirmation', () => {
     } finally { running.child.kill(); }
   });
 
+  it.each([
+    [[], 'configuration map differs but is kept'],
+    [['--overwrite-config-map'], 'also replaced: configurationMap'],
+  ])('says whether a whole-server push replaces the configuration map (%j)', async (flags, expected) => {
+    mirth.config['configurationMap'] = { entry: [] };
+    const running = startCli(pushArgs('--whole-server', ...flags), env, true);
+    try {
+      await running.waitFor('Continue?');
+      running.child.stdin.end('n\n');
+      const result = await running.finished;
+      expect(result.stdout).toContain(expected);
+      expect(result.stdout).not.toContain(flags.length ? 'is kept' : 'also replaced');
+    } finally { running.child.kill(); }
+  });
+
   it('cancels cleanly when the answer is no', async () => {
     await edit('Alpha');
     const running = startCli(pushArgs(), env, true);

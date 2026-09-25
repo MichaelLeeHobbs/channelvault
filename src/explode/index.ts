@@ -28,6 +28,7 @@ import {
   type ExplodeOptions,
   type Json,
 } from '../types.js';
+import { parseJson, readJson } from '../json.js';
 
 // --- shared helpers --------------------------------------------------------
 
@@ -916,7 +917,7 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
   if (isRefMarker(value)) {
     const target = resolveWithinRoot(root, jsonDir, value['@ref']);
     const text = await readWithinRoot(root, target, value['@ref']);
-    const parsed = JSON.parse(text) as Json;
+    const parsed = parseJson<Json>(text, target);
     return resolveMarkers(parsed, path.dirname(target), root);
   }
 
@@ -937,8 +938,7 @@ async function implode(opts: ExplodeOptions): Promise<CanonicalConfig> {
   const root = path.resolve(opts.root);
   const serverDir = path.join(root, 'server');
   const configPath = path.join(serverDir, 'configuration.json');
-  const text = await readFile(configPath, 'utf8');
-  const parsed = JSON.parse(text) as Json;
+  const parsed = await readJson<Json>(configPath);
   const resolved = await resolveMarkers(parsed, serverDir, root);
   return resolved as CanonicalConfig;
 }
