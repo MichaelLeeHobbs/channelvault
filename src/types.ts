@@ -94,6 +94,12 @@ export interface ClientConfig {
   https?: boolean;
   /** default false; set true for self-signed certs */
   disableTlsCheck?: boolean;
+  /**
+   * default false. Put the server's response body in error messages. A body
+   * can echo the credentials that were sent; it is decoded and has credential
+   * fields redacted, but the caller must still scrub known secret values.
+   */
+  includeResponseBodies?: boolean;
 }
 
 export interface ApiError {

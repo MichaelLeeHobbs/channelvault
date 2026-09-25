@@ -36,31 +36,50 @@ const writes = () => mirth.writes.map(w => `${w.method} ${w.path}`);
 const meta = async () => JSON.parse(await readFile(path.join(tree, 'channelvault.json'), 'utf8')) as { resources: { channels: Record<string, number> } };
 
 describe('CLI failure output', () => {
-  // Characters JSON and XML escape, so an echo differs from the value sent.
-  const passcode = 'fixture"pass\\code&<924>';
-  const xmlEscaped = passcode.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  it.each<[string, FakeResponse]>([
-    ['plain text', { status: 400, raw: `rejected value ${passcode} for DICOM` }],
-    ['a JSON sentence', { status: 400, body: { error: `rejected value ${passcode} for DICOM` } }],
-    ['an XML sentence', { status: 400, raw: `<error><message>rejected value ${xmlEscaped} for DICOM</message></error>` }],
-  ])('never prints an extracted credential that a failed save echoes back in %s', async (_format, response) => {
+  /** Pull a DICOM credential into the env file, then make the next channel save fail with `respond(credential)`. */
+  async function rejectEchoing(passcode: string, response: FakeResponse, extraEnv: NodeJS.ProcessEnv = {}) {
     const channels = channelsOf(mirth.config);
     channels[0]!['destinationConnectors'] = { connector: [{ metaDataId: 1, name: 'DICOM', properties: { passcode } }] };
     mirth.config['channels'] = { channel: channels };
     const pulled = await runCli(['pull', tree, '--no-https'], env);
     expect(pulled.status, pulled.stderr).toBe(0);
-    const channelJson = await readFile(path.join(tree, 'channels', 'Alpha', 'channel.json'), 'utf8');
-    expect(channelJson).toContain('{{env:');
-    expect(channelJson).not.toContain('924');
+    expect(await readFile(path.join(tree, 'channels', 'Alpha', 'channel.json'), 'utf8')).toContain('{{env:');
     await edit('Alpha');
-    // A sentence, not a credential field: only the CLI's knowledge of the env values can catch it.
     mirth.onRequest = req => req.method === 'PUT' && req.path === '/api/channels/c1' ? response : undefined;
-    const pushed = await runCli(pushArgs('--yes'), env);
+    const pushed = await runCli(pushArgs('--yes'), { ...env, ...extraEnv });
     expect(pushed.status).toBe(1);
+    return pushed;
+  }
+  /** No 12-character run of the credential is printed, so no fragment of a truncated or reformatted echo either. */
+  const expectNoFragment = (printed: string, passcode: string) => {
+    for (let i = 0; i + 12 <= passcode.length; i += 1) expect(printed).not.toContain(passcode.slice(i, i + 12));
+  };
+
+  it('withholds the server response by default', async () => {
+    const passcode = 'fixture-passcode-924';
+    const pushed = await rejectEchoing(passcode, { status: 400, raw: `rejected value ${passcode} for DICOM` });
+    expect(pushed.stderr).toContain('server response withheld');
+    expectNoFragment(pushed.stdout + pushed.stderr, passcode);
+  });
+
+  // With CHANNELVAULT_DEBUG the body is shown, so the CLI's scrub of known
+  // values must catch every way a server can echo one. A sentence, not a
+  // credential field, so field-name redaction cannot help.
+  const escaped = 'fixture"pass\\code&<924>'; // characters JSON and XML escape
+  const xml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const unicodeEscaped = (s: string) => [...s].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`).join('');
+  const long = `fixture-long-${'a1b2c3d4e5'.repeat(40)}`; // longer than any message truncation
+  it.each<[string, string, FakeResponse]>([
+    ['plain text', escaped, { status: 400, raw: `rejected value ${escaped} for DICOM` }],
+    ['a JSON sentence', escaped, { status: 400, body: { error: `rejected value ${escaped} for DICOM` } }],
+    ['an XML sentence', escaped, { status: 400, raw: `<error><message>rejected value ${xml(escaped)} for DICOM</message></error>` }],
+    ['a JSON string of \\u escapes', escaped, { status: 400, raw: `"rejected value ${unicodeEscaped(escaped)} for DICOM"` }],
+    ['a sentence with a 400-character credential', long, { status: 400, raw: `rejected value ${long} for DICOM` }],
+    ['a sentence whose credential has double spaces', 'fixture  double  925', { status: 400, raw: 'rejected value fixture  double  925 for DICOM' }],
+  ])('with CHANNELVAULT_DEBUG, redacts a credential echoed in %s', async (_format, passcode, response) => {
+    const pushed = await rejectEchoing(passcode, response, { CHANNELVAULT_DEBUG: '1' });
     expect(pushed.stderr).toContain('rejected value <redacted> for DICOM');
-    const printed = pushed.stdout + pushed.stderr;
-    for (const form of [passcode, JSON.stringify(passcode).slice(1, -1), xmlEscaped]) expect(printed).not.toContain(form);
-    expect(printed).not.toContain('924');
+    expectNoFragment(pushed.stdout + pushed.stderr, passcode);
   });
 });
 
@@ -146,13 +165,13 @@ describe('CLI partial pushes', () => {
   it('reports the failed save even when the subsequent refresh also fails', async () => {
     await edit('Alpha');
     mirth.onRequest = req => {
-      if (req.method === 'PUT') return { status: 503, body: 'save refused' };
+      if (req.method === 'PUT') return { status: 503, body: 'save refused' }; // withheld: only the status shows
       if (req.path === '/api/server/configuration' && mirth.writes.length) return { status: 502, body: 'refresh unavailable' };
     };
     const failed = await runCli(pushArgs('--yes'), env);
     expect(failed.status).toBe(1);
     expect(failed.stderr).toContain('applied 0 of 1; update Alpha failed');
-    expect(failed.stderr).toContain('save refused');
+    expect(failed.stderr).toContain('HTTP 503');
     expect((await meta()).resources.channels).toEqual({ c1: 1, c2: 1, c3: 1 });
   });
 

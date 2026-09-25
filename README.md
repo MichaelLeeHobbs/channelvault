@@ -72,7 +72,7 @@ channelvault status <dir>                   # summary of a tree
 
 - You can add placeholders yourself anywhere, in JSON or in a `.js` file (for example `"host": "{{env:DB_HOST}}"`). A re-pull keeps them as long as they still resolve to what the server holds.
 - `--dotenv .env.prod` selects another environment. Variables already set in the process environment take precedence over the file, so CI can supply them directly.
-- Error messages redact the env file's values and credential fields when a server's error response echoes them, whether as plain text, JSON or XML (decoded before redaction). Redaction matches known values and field names, so a secret echoed in some other transformed form (for example base64) is not recognised.
+- A server's error response can echo the credentials that were sent, so error messages leave it out and show only the HTTP status. `CHANNELVAULT_DEBUG=1` includes it, decoded from JSON or XML, with credential fields and the env file's values redacted. That redaction matches known values and field names, so a secret the server transformed some other way (for example base64) is not recognised: don't use `CHANNELVAULT_DEBUG` where output is logged or shared.
 - If git would commit the env file (for example `--dotenv` pointing outside the tree, into a repository that doesn't ignore it), `pull` and `explode` warn.
 - A password rotated on the server updates `.env` on the next `pull`, and `diff` reports it by name only. The previous env file is kept in the tree's `.secrets/` (git-ignored, newest 5 only) whenever a value in it changes. An extracted secret inside a script survives server-side edits to the rest of that script.
 

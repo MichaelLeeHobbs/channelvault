@@ -113,6 +113,8 @@ function resolveClientConfig(flags: ConnectionFlags): ClientConfig {
     password,
     https: flags.https !== false,
     disableTlsCheck: flags.insecure === true,
+    // Opt-in: error bodies can echo credentials (see `scrub`, applied to all output).
+    includeResponseBodies: Boolean(process.env.CHANNELVAULT_DEBUG),
   };
 }
 

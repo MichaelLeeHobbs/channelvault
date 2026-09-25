@@ -434,9 +434,13 @@ class MirthClientImpl implements MirthClientExt {
       // ignore body read errors
     }
 
-    // Keep a short reason, redacted: an error body can echo the payload sent.
-    const text = typeof body === 'string' ? redactSecretsInText(readableBody(body)).replace(/\s+/g, ' ').trim() : '';
-    const reason = text !== '' ? `: ${text.slice(0, 300)}` : '';
+    // An error body can echo the payload sent, credentials included, in any
+    // form (escaped, truncated, reformatted), so no redaction of it is
+    // complete: it is left out unless asked for. When included it is whole and
+    // unnormalized, so the caller's scrub of known values can still match.
+    const text = typeof body === 'string' ? redactSecretsInText(readableBody(body)).trim() : '';
+    const reason =
+      text === '' ? '' : this.config.includeResponseBodies ? `: ${text}` : ' (server response withheld; it may echo credentials)';
     const message = `HTTP ${response.status}: ${response.statusText}${reason}`;
     const error = new Error(message) as Error & ApiError;
     error.status = response.status;
@@ -457,7 +461,8 @@ const XML_ENTITIES: Readonly<Record<string, string>> = { amp: '&', lt: '<', gt: 
  */
 export function readableBody(body: string): string {
   const trimmed = body.trim();
-  if (/^[[{]/.test(trimmed)) {
+  // Any JSON value: a bare string can carry \u escapes too.
+  if (/^[[{"]/.test(trimmed)) {
     try {
       return flattenJson(JSON.parse(trimmed) as unknown);
     } catch {

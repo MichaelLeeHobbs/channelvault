@@ -10,6 +10,9 @@ const CONFIG: ClientConfig = {
   https: true,
 };
 
+/** With response bodies in error messages (the CLI's CHANNELVAULT_DEBUG). */
+const DEBUG_CONFIG: ClientConfig = { ...CONFIG, includeResponseBodies: true };
+
 const BASE = 'https://mirth.example.com:8443/api';
 
 /** Build a JSON Response with a default set-cookie header. */
@@ -201,26 +204,35 @@ describe('createMirthClient', () => {
       });
     });
 
-    it("puts a plain-text reason in the message, but not an HTML error page", async () => {
+    it('withholds the response body by default, since it can echo credentials', async () => {
+      fetchMock
+        .mockResolvedValueOnce(loginResponse())
+        .mockResolvedValueOnce(new Response('rejected value s3cret for DICOM', { status: 400, statusText: 'Bad Request' }));
+
+      const error = await createMirthClient(CONFIG).deployChannel('c1').then(() => undefined, (err: unknown) => err as Error);
+      expect(error?.message).toBe('HTTP 400: Bad Request (server response withheld; it may echo credentials)');
+    });
+
+    it('includes a plain-text reason whole and unnormalized when asked, but not an HTML error page', async () => {
       fetchMock
         .mockResolvedValueOnce(loginResponse())
         .mockResolvedValueOnce(new Response('Script compile error\n at line 3', { status: 500, statusText: 'Server Error' }))
         .mockResolvedValueOnce(new Response('<html><body>Request failed.</body></html>', { status: 500, statusText: 'Server Error' }));
 
-      const client = createMirthClient(CONFIG);
-      await expect(client.deployChannel('c1')).rejects.toThrow('HTTP 500: Server Error: Script compile error at line 3');
+      const client = createMirthClient(DEBUG_CONFIG);
+      await expect(client.deployChannel('c1')).rejects.toThrow('HTTP 500: Server Error: Script compile error\n at line 3');
       await expect(client.deployChannel('c1')).rejects.toThrow(/^HTTP 500: Server Error$/);
     });
 
     it.each([
       ['JSON', '{"error":"invalid","passcode":"fixture-924","host":"pacs"}', 'error: invalid, passcode: <redacted>, host: pacs'],
-      ['XML', '<error><keyStorePW>fixture-924</keyStorePW><host>pacs</host></error>', 'keyStorePW: <redacted> pacs'],
+      ['XML', '<error><keyStorePW>fixture-924</keyStorePW><host>pacs</host></error>', 'keyStorePW: <redacted>'],
     ])('redacts a credential field echoed in a %s error body', async (_format, body, expected) => {
       fetchMock
         .mockResolvedValueOnce(loginResponse())
         .mockResolvedValueOnce(new Response(body, { status: 400, statusText: 'Bad Request' }));
 
-      const error = await createMirthClient(CONFIG).deployChannel('c1').then(() => undefined, (err: unknown) => err as Error);
+      const error = await createMirthClient(DEBUG_CONFIG).deployChannel('c1').then(() => undefined, (err: unknown) => err as Error);
       expect(error?.message).toContain(expected);
       expect(error?.message).toContain('pacs');
       expect(JSON.stringify(error)).not.toContain('fixture-924');
@@ -231,7 +243,7 @@ describe('createMirthClient', () => {
         .mockResolvedValueOnce(loginResponse())
         .mockResolvedValueOnce(new Response('invalid url jdbc:x://db;user=svc;password=hunter22x;ssl=true', { status: 500, statusText: 'Server Error' }));
 
-      const error = await createMirthClient(CONFIG).deployChannel('c1').then(() => undefined, (err: unknown) => err as Error & { body?: unknown });
+      const error = await createMirthClient(DEBUG_CONFIG).deployChannel('c1').then(() => undefined, (err: unknown) => err as Error & { body?: unknown });
       expect(error?.message).toContain('password=<redacted connection-string>;ssl=true');
       expect(JSON.stringify(error)).not.toContain('hunter22x');
     });

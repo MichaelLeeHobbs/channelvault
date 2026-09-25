@@ -40,12 +40,8 @@ describe('scanSecrets', () => {
     ['assignment', "var DB_PASS = 's3cretPw';", 's3cretPw'],
     ['assignment', "var password = 'correct horse 42';", 'correct horse 42'],
     ['setter-call', "conn.setPassword('s3cretPw');", 's3cretPw'],
-    ['connection-string', 'Password=s3cretPw;Server=db.internal;User Id=svc', 's3cretPw'],
-    ['connection-string', 'jdbc:sqlserver://localhost;password=fixture(s3cret);encrypt=true', 'fixture(s3cret)'],
-    ['connection-string', 'Password=fixture(s3cret);Server=db.internal', 'fixture(s3cret)'],
-    ['connection-string', 'jdbc:sqlserver://db;password=fixture()s3cret;encrypt=true', 'fixture()s3cret'],
-    ['connection-string', 'jdbc:sqlserver://db;password=fixture-s3cret(;encrypt=true', 'fixture-s3cret('],
-    ['connection-string', 'Server=db.internal; Password=s3cretPw; User Id=svc', 's3cretPw'],
+    ['connection-string', 'var url = "jdbc:sqlserver://db;password = s3cret Pw;encrypt=true";', 's3cret Pw'],
+    ['connection-string', '// jdbc:sqlserver://db;password=s3cretPw', 's3cretPw'],
     ['db-connection-call', "var db = DatabaseConnectionFactory.createDatabaseConnection(driver, url, 'svc', 's3cretPw');", 's3cretPw'],
     ['aws-access-key', `var k = '${aws}';`, aws],
     ['jwt', `var t = "${jwt}";`, jwt],
@@ -78,9 +74,29 @@ describe('scanSecrets', () => {
     ['a word ending in Pass that is not a password', "var byPass = 'enabled'; var firstPass = 'true';"],
     ['prose assigned to a secret-named variable', "var secret = 'Not configured yet';"],
     ['a script that starts by assigning a call', "password = getPass(); pwd = $('x');"],
+    ['compact script code that assigns a call', "var pwd;pwd=$('db.password');"],
     ['a password taken from a variable', 'var password = getPassword(); conn.setPassword(password);'],
   ])('ignores %s', (_label, script) => {
     expect(scanSecrets(withScript(script), { mode: 'find' }).findings).toEqual([]);
+  });
+
+  // In a config field (not a script) the whole value is the connection string.
+  it.each([
+    ['jdbc:sqlserver://localhost;password=fixture-925;encrypt=true', 'fixture-925'],
+    ['jdbc:sqlserver://localhost;password =fixture-925;encrypt=true', 'fixture-925'],
+    ['jdbc:sqlserver://localhost;password= fixture-925;encrypt=true', 'fixture-925'],
+    ['jdbc:sqlserver://localhost;password = fixture-925;encrypt=true', 'fixture-925'],
+    ['jdbc:sqlserver://localhost;password=fixture(s3cret);encrypt=true', 'fixture(s3cret)'],
+    ['jdbc:sqlserver://db;password=fixture()s3cret;encrypt=true', 'fixture()s3cret'],
+    ['jdbc:sqlserver://db;password=fixture-s3cret(;encrypt=true', 'fixture-s3cret('],
+    ['Password=s3cretPw;Server=db.internal;User Id=svc', 's3cretPw'],
+    ['Server=db.internal; Password=s3cretPw; User Id=svc', 's3cretPw'],
+  ])('finds the password in a connection-string field: %s', (url, secret) => {
+    const cfg: CanonicalConfig = { channels: { channel: [{ id: 'c1', name: 'Lab Feed', sourceConnector: { properties: { url } } }] } };
+    const extracted = scanSecrets(cfg, { mode: 'extract' });
+    expect(extracted.findings.map((f) => f.kind)).toEqual(['connection-string']);
+    expect(Object.values(extracted.envUpdates)).toEqual([secret]);
+    expect(render(extracted.config, extracted.envUpdates)).toEqual(cfg);
   });
 
   it('honours the allow list by location, kind and context', () => {

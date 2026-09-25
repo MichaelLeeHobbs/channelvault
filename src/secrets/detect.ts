@@ -9,7 +9,7 @@
  */
 import { createHash } from 'node:crypto';
 
-import type { CanonicalConfig } from '../types.js';
+import { CHANNEL_SCRIPT_KEYS, CODE_KEYS, type CanonicalConfig } from '../types.js';
 import { derivedName, hasPlaceholder, isSecretKey, mapLeaves, placeholder, type Env, type Leaf } from './index.js';
 
 export type SecretKind =
@@ -35,7 +35,8 @@ interface Rule {
   kind: SecretKind;
   /** Suffix for the env variable name. */
   suffix: string;
-  spans(value: string): Span[];
+  /** `script`: the value is JavaScript (a step, template or channel script). */
+  spans(value: string, script: boolean): Span[];
 }
 
 /** Spans of capture group `group` (0 = whole match) of every match of `re`. */
@@ -101,6 +102,45 @@ function dbConnectionSpans(value: string): Span[] {
  */
 const ASSIGNED = String.raw`["']?\s*[:=]\s*(?:[\w$.[\]'"]+\s*(?:\|\||\?\?)\s*)?(["'])((?=\S)(?:[^"'{}\s]{4,}|(?=[^"'{}\n]*[0-9@#$%^&*+=~|\\/<>_])[^"'{}\n]{4,}))\1`;
 
+/** A connection-string value: up to the next delimiter, without surrounding spaces. */
+const CONN_VALUE = String.raw`([^;&'"\s](?:[^;&'"\n]*[^;&'"\s])?)`;
+
+/**
+ * String literals and comments of a script: where a connection string can
+ * appear as text. Regex literals are not recognised, so a quote inside one
+ * can shift what counts as a literal.
+ */
+function textSpans(code: string): Span[] {
+  const out: Span[] = [];
+  let i = 0;
+  while (i < code.length) {
+    const c = code[i]!;
+    const next = code[i + 1];
+    if (c === '/' && (next === '/' || next === '*')) {
+      const close = next === '/' ? code.indexOf('\n', i) : code.indexOf('*/', i + 2);
+      const end = close < 0 ? code.length : close;
+      out.push({ start: i + 2, end });
+      i = end + 2;
+    } else if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1;
+      while (j < code.length && code[j] !== c && (c === '`' || code[j] !== '\n')) j += code[j] === '\\' ? 2 : 1;
+      out.push({ start: i + 1, end: Math.min(j, code.length) });
+      i = j + 1;
+    } else {
+      i += 1;
+    }
+  }
+  return out;
+}
+
+/** Apply `spans` to a whole data value, but only to the text parts of a script. */
+function outsideCode(spans: (value: string) => Span[]): (value: string, script: boolean) => Span[] {
+  return (value, script) =>
+    script
+      ? textSpans(value).flatMap((t) => spans(value.slice(t.start, t.end)).map((s) => ({ start: s.start + t.start, end: s.end + t.start })))
+      : spans(value);
+}
+
 // Earlier rules win where spans overlap: a private key block may contain text
 // other rules match, and `token = 'ghp_…'` is one secret, not two.
 const RULES: Rule[] = [
@@ -116,12 +156,19 @@ const RULES: Rule[] = [
   // user:password@host. The user part stops at ';', '?' and '&' so a JDBC
   // parameter like `user=svc@srv` is not mistaken for credentials.
   { kind: 'url-credentials', suffix: 'PASSWORD', spans: regexSpans(/\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'";?&]+:([^\s@'"/;?&]+)@/gi, 1) },
-  // A connection string writes `password=value` with no spaces around the `=`; a
-  // script writes `pwd = $('x')`. Telling them apart by that syntax, not by the
-  // password's characters, keeps every password shape detectable.
-  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/[;?&]\s*(?:password|pwd)=([^;&'"\s]+)/gi, 1) },
+  // Drivers trim around `=` and the value, so spaces are allowed there. In a
+  // script only string literals and comments are searched: `pwd=$('x')` is code.
+  {
+    kind: 'connection-string',
+    suffix: 'PASSWORD',
+    spans: outsideCode(regexSpans(new RegExp(String.raw`[;?&]\s*(?:password|pwd)\s*=\s*${CONN_VALUE}`, 'gi'), 1)),
+  },
   // Leading the whole value (`Password=…;Server=…`), when another key=value follows.
-  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/^\s*(?:password|pwd)=([^;&'"\s]+)(?=;\s*[\w ]+=)/gi, 1) },
+  {
+    kind: 'connection-string',
+    suffix: 'PASSWORD',
+    spans: outsideCode(regexSpans(new RegExp(String.raw`^\s*(?:password|pwd)\s*=\s*${CONN_VALUE}(?=\s*;\s*[\w ]+=)`, 'gi'), 1)),
+  },
   // Case-sensitive, and the credential must contain a digit or a base64/token
   // symbol, so prose like "Basic authentication" does not match.
   {
@@ -194,16 +241,23 @@ interface Hit extends Span {
 }
 
 /** Every secret span in `value`, earlier rules winning overlaps, in position order. */
-function hitsIn(value: string): Hit[] {
+function hitsIn(value: string, script = false): Hit[] {
   const taken: Hit[] = [];
   for (const rule of RULES) {
-    for (const span of rule.spans(value)) {
+    for (const span of rule.spans(value, script)) {
       if (span.end <= span.start || isReference(value.slice(span.start, span.end))) continue;
       if (taken.some((t) => span.start < t.end && t.start < span.end)) continue;
       taken.push({ ...span, rule });
     }
   }
   return taken.sort((a, b) => a.start - b.start);
+}
+
+const SCRIPT_KEYS: ReadonlySet<string> = new Set<string>([...CODE_KEYS, ...CHANNEL_SCRIPT_KEYS]);
+
+/** Script leaves: step, template and channel code, and the global scripts. */
+function isScript(leaf: Leaf): boolean {
+  return SCRIPT_KEYS.has(leaf.key) || leaf.section === 'globalScripts';
 }
 
 /** `value` with every secret a rule recognises replaced by a marker, for messages. */
@@ -269,7 +323,7 @@ export function scanSecrets(config: CanonicalConfig, opts: { mode: ScanMode; all
   };
 
   const out = mapLeaves(config, (value, leaf) => {
-    const hits = hitsIn(value);
+    const hits = hitsIn(value, isScript(leaf));
     if (hits.length === 0) return value;
     const context = contextOf(value, hits);
     let result = '';
