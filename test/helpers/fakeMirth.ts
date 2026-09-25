@@ -2,10 +2,21 @@
  * A minimal fake Mirth REST server (plain HTTP) for CLI tests: login, the
  * server configuration, and a record of every write it receives.
  */
+import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import type { CanonicalConfig, Json } from '../../src/types.js';
+import { XmlConfigAdapter } from '../../src/xml/index.js';
+
+const xml = new XmlConfigAdapter();
+
+/** Jackson's `@version` metadata as XML attributes (`@_version`), for the XML form of a JSON-shaped config. */
+function asXmlShape(value: Json): Json {
+  if (Array.isArray(value)) return value.map(asXmlShape);
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k.startsWith('@') && !k.startsWith('@_') ? `@_${k.slice(1)}` : k, asXmlShape(v)]));
+}
 
 export interface FakeRequest { method: string; path: string; body: string }
 /** `body` is sent as JSON; `raw` is sent as-is (plain text, XML). */
@@ -20,12 +31,14 @@ export interface FakeMirth {
   writes: FakeRequest[];
   requests: FakeRequest[];
   deployed: Set<string>;
+  /** What GET /server/id returns: fixed per installation, untouched by a configuration restore. */
+  serverId: string;
   onRequest?: (request: FakeRequest) => FakeResponse | void | Promise<FakeResponse | void>;
   close(): Promise<void>;
 }
 
 export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth> {
-  const state: FakeMirth = { port: 0, config: structuredClone(config), writes: [], requests: [], deployed: new Set(), close: async () => undefined };
+  const state: FakeMirth = { port: 0, config: structuredClone(config), writes: [], requests: [], deployed: new Set(), serverId: randomUUID(), close: async () => undefined };
   const server: Server = createServer((req, res) => {
     let body = '';
     req.on('data', (c: Buffer) => (body += c.toString('utf8')));
@@ -49,11 +62,22 @@ export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth
         return res.end(intercepted.raw);
       }
       if (intercepted) return json(intercepted.status, intercepted.body ?? {});
+      // XML when asked for it, as Mirth does (the backup/restore form).
+      const wantsXml = (req.headers.accept ?? '').includes('application/xml');
+      const sendsXml = (req.headers['content-type'] ?? '').includes('application/xml');
+      if (req.method === 'GET' && url.pathname === '/api/server/id') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        return res.end(state.serverId);
+      }
       if (req.method === 'GET' && url.pathname === '/api/server/configuration') {
+        if (wantsXml) {
+          res.writeHead(200, { 'Content-Type': 'application/xml' });
+          return res.end(xml.build(asXmlShape(state.config) as CanonicalConfig));
+        }
         return json(200, { serverConfiguration: state.config });
       }
       if (req.method === 'PUT' && url.pathname === '/api/server/configuration') {
-        state.config = (JSON.parse(body) as { serverConfiguration: CanonicalConfig }).serverConfiguration;
+        state.config = sendsXml ? xml.parse(body) : (JSON.parse(body) as { serverConfiguration: CanonicalConfig }).serverConfiguration;
         return json(200, {});
       }
       if (req.method === 'PUT' && url.pathname === '/api/server/globalScripts') {

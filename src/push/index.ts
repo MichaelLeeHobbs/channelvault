@@ -279,7 +279,17 @@ function assertUniqueIds(local: CanonicalConfig): void {
   }
 }
 
-export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope: Scope = {}, known?: Known): Plan {
+/**
+ * `wholeReplace`: the plan is for one PUT of the whole configuration
+ * (`--whole-server`, `restore`), not a sequence of per-resource saves.
+ */
+export function planPush(
+  local: CanonicalConfig,
+  remote: CanonicalConfig,
+  scope: Scope = {},
+  known?: Known,
+  opts: { wholeReplace?: boolean } = {},
+): Plan {
   assertUniqueIds(local);
   const everything = scope.channels === undefined && scope.libraries === undefined && scope.globalScripts === undefined;
   const channelScope = everything || scope.channels !== undefined;
@@ -347,8 +357,10 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
   // with another id, as when servers were set up separately). Saves run before
   // deletes and one at a time, so a name freed by a delete or rename in the
   // same push is still taken when the save runs. Case-insensitive, to be safe.
+  // A whole replace lands at once, so only the result must be free of clashes.
   const nameKey = (c: Obj) => nameOf(c).toLowerCase();
-  const holders = [...new Map([...channelsOf(remote), ...effective.values()].map((c) => [`${idOf(c)}\n${nameKey(c)}`, c])).values()];
+  const during = opts.wholeReplace ? [] : channelsOf(remote);
+  const holders = [...new Map([...during, ...effective.values()].map((c) => [`${idOf(c)}\n${nameKey(c)}`, c])).values()];
   const clashes = duplicates(holders, nameKey).filter(([, g]) => g.some((c) => writtenChannels.has(idOf(c))));
   if (clashes.length > 0) {
     throw new Error(

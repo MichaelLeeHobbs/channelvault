@@ -71,6 +71,12 @@ export interface PutServerConfigurationOptions {
  */
 export interface MirthClientExt extends MirthClient {
   putServerConfiguration(config: CanonicalConfig, options?: PutServerConfigurationOptions): Promise<void>;
+  /** GET /server/id: the installation's ID, which a configuration restore does not change (verified on 4.5.2). */
+  getServerId(): Promise<string>;
+  /** GET /server/configuration as the server's own XML (the Administrator's Backup Config document). */
+  getServerConfigurationXml(): Promise<string>;
+  /** PUT /server/configuration from backup XML, as the Administrator's Restore Config does. */
+  putServerConfigurationXml(xml: string, options?: PutServerConfigurationOptions): Promise<void>;
   /** GET /channels/{id}, unwrapped; includes the tag and dependency data the server configuration omits. */
   getChannel(id: string): Promise<Record<string, unknown> | null>;
   /** PUT /channels/{id}; creates the channel if the id is new. */
@@ -272,6 +278,25 @@ class MirthClientImpl implements MirthClientExt {
         Accept: 'application/json',
       },
       body: JSON.stringify(wrapped),
+    });
+  }
+
+  async getServerId(): Promise<string> {
+    // JSON is refused (406); the ID comes as plain text.
+    const response = await this.request('GET', '/server/id', { headers: { Accept: 'text/plain' } });
+    return (await response.text()).trim();
+  }
+
+  async getServerConfigurationXml(): Promise<string> {
+    const response = await this.request('GET', '/server/configuration', { headers: { Accept: 'application/xml' } });
+    return response.text();
+  }
+
+  async putServerConfigurationXml(xml: string, options: PutServerConfigurationOptions = {}): Promise<void> {
+    await this.request('PUT', '/server/configuration', {
+      query: { deploy: options.deploy, overwriteConfigMap: options.overwriteConfigMap },
+      headers: { 'Content-Type': 'application/xml', Accept: 'application/json' },
+      body: xml,
     });
   }
 

@@ -43,6 +43,7 @@ import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
 import { mapLeaves, redactKnownSecrets, render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
 import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
+import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_BACKUP_DIR, DEFAULT_KEEP, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
 import { readJson } from './json.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
 
@@ -137,6 +138,76 @@ async function withClient<T>(flags: ConnectionFlags, fn: (client: MirthClientExt
     await client.logout().catch(() => undefined);
     await client.close().catch(() => undefined);
   }
+}
+
+// --- backups ------------------------------------------------------------------
+
+interface BackupFlags {
+  backupDir?: string;
+  keep?: string;
+  /** false with --no-backup (push). */
+  backup?: boolean;
+}
+
+function addBackupDirFlags(cmd: Command): Command {
+  return cmd
+    .option('--backup-dir <dir>', `where backups are kept (default ./${DEFAULT_BACKUP_DIR})`)
+    .option('--keep <n>', `backups kept per server (default ${DEFAULT_KEEP})`);
+}
+
+function backupDirOf(flags: BackupFlags): string {
+  return path.resolve(flags.backupDir ?? DEFAULT_BACKUP_DIR);
+}
+
+function keepOf(flags: BackupFlags): number {
+  if (flags.keep === undefined) return DEFAULT_KEEP;
+  const n = Number(flags.keep);
+  if (!Number.isInteger(n) || n < 1) fail(`--keep must be a whole number of at least 1, not ${flags.keep}`);
+  return n;
+}
+
+/** The name a server's backups are filed under; the host and port when it has no configured name. */
+function serverNameOf(config: CanonicalConfig, flags: ConnectionFlags): string {
+  const cfg = resolveClientConfig(flags);
+  return backupName(config, `${cfg.host}-${cfg.port}`);
+}
+
+/** Parse backup XML, naming the file in the error. */
+function parseBackup(text: string, where: string): CanonicalConfig {
+  try {
+    return xml.parse(text);
+  } catch (err) {
+    fail(`${where}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Save the server's configuration `text` as its newest backup and say where. */
+async function saveServerBackup(
+  client: MirthClientExt,
+  text: string,
+  flags: ConnectionFlags & BackupFlags,
+  protect?: string,
+): Promise<string> {
+  const config = parseBackup(text, 'the server configuration');
+  const origin = { serverId: await client.getServerId(), host: hostOf(flags) };
+  const file = await saveBackup(backupDirOf(flags), serverNameOf(config, flags), text, { keep: keepOf(flags), origin, protect });
+  if (gitWouldCommit(file)) {
+    process.stderr.write(`warning: git does not ignore ${file}, which holds credentials in plain text; add it to .gitignore\n`);
+  }
+  return file;
+}
+
+/** Before a push changes anything: a backup to undo it with, unless --no-backup. */
+async function backupBeforePush(client: MirthClientExt, flags: ConnectionFlags & BackupFlags): Promise<void> {
+  if (flags.backup === false) return;
+  const file = await saveServerBackup(client, await client.getServerConfigurationXml(), flags);
+  process.stdout.write(`backed up the server to ${file} (undo with: channelvault restore "${file}")\n`);
+}
+
+/** `host:port`, for telling people which server a backup came from. */
+function hostOf(flags: ConnectionFlags): string {
+  const cfg = resolveClientConfig(flags);
+  return `${cfg.host}:${cfg.port}`;
 }
 
 async function confirm(question: string): Promise<boolean> {
@@ -531,6 +602,15 @@ async function writeKnown(root: string, known: Known): Promise<void> {
   await writeFile(metaPath, JSON.stringify(meta, null, 2) + '\n', 'utf8');
 }
 
+/**
+ * A whole replace carries the server and environment name along; say so, or
+ * the server silently starts calling itself by another's name.
+ */
+function printNameChange(incoming: CanonicalConfig, current: CanonicalConfig): void {
+  const [to, from] = [configuredName(incoming), configuredName(current)];
+  if (to !== from) process.stdout.write(`server name changes: ${from || '(none)'} -> ${to || '(none)'}\n`);
+}
+
 function printChanges(plan: Plan): void {
   const kindLabel: Record<Change['kind'], string> = { channel: 'channel', library: 'library', codeTemplate: 'code template', globalScripts: '' };
   for (const c of plan.changes) process.stdout.write(`  ${c.op.padEnd(6)}  ${`${kindLabel[c.kind]} ${c.label}`.trim()}\n`);
@@ -550,7 +630,7 @@ function checkPlan(plan: Plan, flags: { allowDeletes?: boolean; force?: boolean 
   }
 }
 
-interface PushFlags {
+interface PushFlags extends ConnectionFlags, BackupFlags {
   allowDeletes?: boolean;
   deploy?: boolean;
   force?: boolean;
@@ -615,6 +695,7 @@ async function scopedPush(
   }
   // Apply against the fresh snapshot, so whatever is sent for resources
   // outside the plan (the rest of the library list) is the server's latest.
+  await backupBeforePush(client, flags);
   const result = await applyPlan(client, plan, local, fresh, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
   // resources that did go through don't read as conflicts next time.
@@ -656,12 +737,13 @@ async function wholeServerPush(
 ): Promise<void> {
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
-  const plan = planPush(local, remote, {}, known);
+  const plan = planPush(local, remote, {}, known, { wholeReplace: true });
   const s = summarize(local);
   process.stdout.write(
     `Replace the ENTIRE server configuration at ${target} (${s.channels} channels, ${s.codeTemplates} code templates` +
       `${flags.deploy ? ', then redeploy all channels' : ''}).\n`,
   );
+  printNameChange(local, remote);
   if (plan.changes.length > 0) {
     process.stdout.write('Channel, library and template changes:\n');
     printChanges(plan);
@@ -694,16 +776,17 @@ async function wholeServerPush(
     fail('the server changed while this push was being confirmed; pull and try again, or pass --force');
   }
   // Force permits concurrent edits, but never grants deletion consent.
-  const freshPlan = planPush(local, fresh, {}, known);
+  const freshPlan = planPush(local, fresh, {}, known, { wholeReplace: true });
   if (!flags.allowDeletes && (freshPlan.serverOnly.length > 0 || freshPlan.changes.some(c => c.op === 'delete'))) {
     fail('the replace now deletes resources from the server; review the new plan and pass --allow-deletes');
   }
+  await backupBeforePush(client, flags);
   await client.putServerConfiguration(local, {
     deploy: flags.deploy === true,
     overwriteConfigMap: flags.overwriteConfigMap === true,
   });
   const after = await client.getServerConfiguration();
-  if (planPush(local, after).changes.length > 0) {
+  if (planPush(local, after, {}, undefined, { wholeReplace: true }).changes.length > 0) {
     fail('applied the whole-server replacement, but resources changed again after saving; pull and review before retrying');
   }
   const ids = resourceIds(local);
@@ -770,7 +853,7 @@ addExtractFlag(addEnvFlag(addConnectionFlags(
   process.stdout.write(`pulled ${s.channels} channels, ${s.codeTemplates} code templates -> ${root}\n`);
 });
 
-addEnvFlag(addConnectionFlags(
+addBackupDirFlags(addEnvFlag(addConnectionFlags(
   program
     .command('push')
     .description('Push changed channels, code templates and global scripts to the live server')
@@ -784,11 +867,12 @@ addEnvFlag(addConnectionFlags(
     .option('--ignore-origin', 'push a tree that was exploded from an XML backup (normally refused)', false)
     .option('--whole-server', 'replace the entire server configuration instead (settings, config map, groups too)', false)
     .option('--overwrite-config-map', 'with --whole-server: also overwrite the configuration map', false)
+    .option('--no-backup', 'skip the backup of the server taken before anything changes')
     .option('-y, --yes', 'skip the confirmation prompt', false),
-)).action(
+))).action(
   async (
     dir: string,
-    flags: ConnectionFlags & EnvFlags & {
+    flags: ConnectionFlags & EnvFlags & BackupFlags & {
       channel?: string[];
       library?: string[];
       globalScripts?: boolean;
@@ -821,6 +905,134 @@ addEnvFlag(addConnectionFlags(
     await withClient(flags, (client) => scopedPush(client, root, config, scope, target, flags));
   },
 );
+
+addBackupDirFlags(addConnectionFlags(
+  program
+    .command('backup')
+    .description(`Save the server configuration as <server>-<UTC time>.xml in ./${DEFAULT_BACKUP_DIR} (holds credentials in plain text)`)
+    .option('--out <file>', 'write to this file instead (no rotation)'),
+)).action(async (flags: ConnectionFlags & BackupFlags & { out?: string }) => {
+  const cfg = resolveClientConfig(flags);
+  const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
+  const file = await withClient(flags, async (client) => {
+    const text = await client.getServerConfigurationXml();
+    if (!flags.out) return saveServerBackup(client, text, flags);
+    const out = path.resolve(flags.out);
+    parseBackup(text, 'the server configuration');
+    if (existsSync(out)) fail(`${out} already exists; choose another name`);
+    await mkdir(path.dirname(out), { recursive: true });
+    await writePrivate(out, text);
+    if (gitWouldCommit(out)) {
+      process.stderr.write(`warning: git does not ignore ${out}, which holds credentials in plain text; add it to .gitignore\n`);
+    }
+    return out;
+  });
+  process.stdout.write(`backed up ${target} to ${file}\n`);
+});
+
+interface RestoreFlags extends ConnectionFlags, BackupFlags {
+  deploy?: boolean;
+  overwriteConfigMap?: boolean;
+  yes?: boolean;
+  force?: boolean;
+}
+
+addBackupDirFlags(addConnectionFlags(
+  program
+    .command('restore')
+    .description('Replace the entire server configuration with a backup (default: the newest backup of this server)')
+    .argument('[file]', 'backup XML to restore')
+    .option('--deploy', 'redeploy all channels afterwards', false)
+    .option('--overwrite-config-map', 'also replace the configuration map', false)
+    .option('--force', 'restore a backup taken from another server', false)
+    .option('-y, --yes', 'skip the confirmation prompt', false),
+)).action(async (file: string | undefined, flags: RestoreFlags) => {
+  const cfg = resolveClientConfig(flags);
+  const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
+  if (!flags.yes && !process.stdin.isTTY) fail('no terminal to confirm on; pass --yes');
+  const dir = backupDirOf(flags);
+  await withClient(flags, async (client) => {
+    const currentText = await client.getServerConfigurationXml();
+    const current = parseBackup(currentText, 'the server configuration');
+    const serverId = await client.getServerId();
+
+    // Which backup: the one named, else the newest taken from this server
+    // (by server ID: the name in the file name travels with the configuration).
+    let chosen: string;
+    if (file) {
+      chosen = path.resolve(file);
+      if (!existsSync(chosen)) fail(`${chosen} does not exist`);
+    } else {
+      const mine = await backupsOf(dir, serverId);
+      if (mine.length === 0) {
+        const others = (await originsIn(dir)).map((o) => o.host);
+        fail(`no backups of ${target} in ${dir}${others.length ? ` (it has backups of: ${others.join(', ')})` : ''}`);
+      }
+      chosen = mine[mine.length - 1]!.file;
+    }
+    const text = await readFile(chosen, 'utf8');
+    const backup = parseBackup(text, chosen);
+
+    // A backup of another server would replace this one's configuration with it.
+    const origin = await originOf(dir, chosen);
+    if (origin) {
+      if (origin.serverId !== serverId && !flags.force) {
+        fail(`${chosen} was taken from ${origin.host} (server ID ${origin.serverId}), not this server (${serverId}); pass --force to restore it here anyway`);
+      }
+    } else {
+      // Not one of this directory's backups: only the names can be compared.
+      const [fromContent, fromServer] = [configuredName(backup), configuredName(current)];
+      if (fromContent !== '' && fromServer !== '' && fromContent !== fromServer && !flags.force) {
+        fail(`${chosen} is a backup of ${fromContent}, not ${fromServer}; pass --force to restore it here anyway`);
+      }
+      process.stderr.write(`warning: ${chosen} is not in ${path.join(dir, MANIFEST)}, so which server it came from cannot be checked\n`);
+    }
+
+    // Older servers cannot read a newer configuration; Mirth converts older ones.
+    const [bv, sv] = [backup['@_version'], current['@_version']];
+    if (typeof bv === 'string' && typeof sv === 'string' && numericVersion(bv) && numericVersion(sv)) {
+      if (compareVersions(bv, sv) > 0) fail(`${chosen} is from Mirth ${bv}, newer than this server (${sv}); it cannot be restored here`);
+      if (compareVersions(bv, sv) < 0) process.stderr.write(`note: ${chosen} is from Mirth ${bv}; the server (${sv}) will convert it\n`);
+    } else {
+      process.stderr.write(`warning: cannot compare the backup's Mirth version (${String(bv ?? 'none')}) with the server's (${String(sv ?? 'none')})\n`);
+    }
+
+    const plan = planPush(backup, current, {}, undefined, { wholeReplace: true });
+    process.stdout.write(`Restore ${chosen}\nto ${target}, replacing its ENTIRE configuration${flags.deploy ? ', then redeploy all channels' : ''}.\n`);
+    printNameChange(backup, current);
+    if (plan.changes.length > 0) {
+      process.stdout.write('Channel, library and template changes:\n');
+      printChanges(plan);
+    }
+    const keptMap = plan.notPushed.includes('configurationMap') && !flags.overwriteConfigMap;
+    const replaced = plan.notPushed.filter((k) => !(keptMap && k === 'configurationMap'));
+    if (replaced.length > 0) process.stdout.write(`also replaced: ${replaced.join(', ')}\n`);
+    if (keptMap) process.stdout.write('configuration map differs but is kept (--overwrite-config-map replaces it)\n');
+    if (!flags.yes && !(await confirm('Continue?'))) {
+      process.stdout.write('aborted.\n');
+      return;
+    }
+
+    // What the preview showed must still be what gets replaced; --force does
+    // not cover this (it is about which server the backup is from).
+    const freshText = await client.getServerConfigurationXml();
+    if (!sameServerConfig(parseBackup(freshText, 'the server configuration'), current)) {
+      fail('the server changed while this restore was being confirmed; nothing was restored. Run it again to review the new state');
+    }
+    // The undo: the configuration about to be replaced. The backup being
+    // restored is protected from rotation.
+    const undo = await saveServerBackup(client, freshText, flags, chosen);
+    process.stdout.write(`saved the current configuration to ${undo} (undo with: channelvault restore "${undo}")\n`);
+
+    await client.putServerConfigurationXml(text, { deploy: flags.deploy === true, overwriteConfigMap: flags.overwriteConfigMap === true });
+    const after = parseBackup(await client.getServerConfigurationXml(), 'the server configuration');
+    const differ = planPush(backup, after, {}, undefined, { wholeReplace: true }).changes;
+    if (differ.length > 0) {
+      fail(`restored, but these differ from the backup afterwards: ${differ.map((c) => c.label).join(', ')}; inspect the server`);
+    }
+    process.stdout.write(`restored ${chosen} to ${target}\n`);
+  });
+});
 
 addEnvFlag(addConnectionFlags(
   program

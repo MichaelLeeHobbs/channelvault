@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -31,9 +31,50 @@ afterEach(async () => {
   if (dir) await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 const edit = async (name: string) => writeFile(path.join(tree, 'channels', name, 'scripts', 'deploy.js'), `// ${name} edited\nreturn;`);
-const pushArgs = (...flags: string[]) => ['push', tree, '--no-https', ...flags];
+const pushArgs = (...flags: string[]) => ['push', tree, '--no-https', '--backup-dir', path.join(dir, 'backups'), ...flags];
 const writes = () => mirth.writes.map(w => `${w.method} ${w.path}`);
 const meta = async () => JSON.parse(await readFile(path.join(tree, 'channelvault.json'), 'utf8')) as { resources: { channels: Record<string, number> } };
+
+describe('CLI push backup', () => {
+  const backupFiles = async () => (existsSync(path.join(dir, 'backups')) ? (await readdir(path.join(dir, 'backups'))).filter((f) => f.endsWith('.xml')) : []);
+
+  it('backs up the server before changing it, as it was before the push', async () => {
+    await edit('Alpha');
+    const pushed = await runCli(pushArgs('--yes'), env);
+    expect(pushed.status, pushed.stderr).toBe(0);
+    const [file] = await backupFiles();
+    expect(file).toMatch(new RegExp(`^127-0-0-1-${mirth.port}-\\d{8}T\\d{6}Z\\.xml$`));
+    expect(pushed.stdout).toContain('undo with: channelvault restore');
+    const saved = await readFile(path.join(dir, 'backups', file!), 'utf8');
+    expect(saved).toContain('<deployScript>return;</deployScript>');
+    expect(saved).not.toContain('Alpha edited');
+  });
+
+  it('backs up before a --whole-server replace too', async () => {
+    await edit('Alpha');
+    const pushed = await runCli(pushArgs('--yes', '--whole-server'), env);
+    expect(pushed.status, pushed.stderr).toBe(0);
+    expect(await backupFiles()).toHaveLength(1);
+  });
+
+  it('takes no backup when the push is declined at the prompt', async () => {
+    await edit('Alpha');
+    const running = startCli(pushArgs(), env, true);
+    try {
+      await running.waitFor('Continue?');
+      running.child.stdin.end('n\n');
+      expect((await running.finished).stdout).toContain('aborted.');
+      expect(await backupFiles()).toEqual([]);
+    } finally { running.child.kill(); }
+  });
+
+  it('takes no backup with --no-backup, or when nothing is pushed', async () => {
+    expect((await runCli(pushArgs('--yes'), env)).stdout).toContain('nothing to push');
+    await edit('Alpha');
+    expect((await runCli(pushArgs('--yes', '--no-backup'), env)).status).toBe(0);
+    expect(await backupFiles()).toEqual([]);
+  });
+});
 
 describe('CLI failure output', () => {
   /** Pull a DICOM credential into the env file, then make the next channel save fail with `respond(credential)`. */

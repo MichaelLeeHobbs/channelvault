@@ -8,6 +8,7 @@ import { createMirthClient, type MirthClientExt } from '../../src/client/index.j
 import { createExplodeEngine } from '../../src/explode/index.js';
 import { channelsOf } from '../../src/push/index.js';
 import { readEnvFile, updateEnvFile } from '../../src/secrets/envfile.js';
+import { XmlConfigAdapter } from '../../src/xml/index.js';
 import type { Json } from '../../src/types.js';
 import { runCli } from '../helpers/cli.js';
 
@@ -113,7 +114,7 @@ describe.skipIf(!enabled)('two disposable Mirth 4.5.2 servers', () => {
     const tagsBefore = (targetBefore!['exportData'] as Obj)['channelTags'];
     expect(JSON.stringify(tagsBefore)).toContain('Sample');
     expect(Number(targetBefore!['revision'])).toBeGreaterThan(Number(selected['revision']));
-    const args = ['push', targetTree, '--insecure', '--yes', '--channel', selectedName, '--dotenv', destinationEnv];
+    const args = ['push', targetTree, '--insecure', '--yes', '--channel', selectedName, '--dotenv', destinationEnv, '--backup-dir', path.join(work, 'backups')];
     const refused = await runCli(args, env(targetPort));
     expect(refused.status).toBe(1);
     expect(refused.stderr).toContain('server revision');
@@ -139,5 +140,36 @@ describe.skipIf(!enabled)('two disposable Mirth 4.5.2 servers', () => {
     const diff = await runCli(['diff', path.join(work, 'target-observed'), '--insecure'], env(targetPort));
     expect(diff.status, diff.stdout + diff.stderr).toBe(0);
     expect(diff.stdout).toContain('no differences');
+  }, 120_000);
+
+  it('backs up the server and restores it after a channel is deleted', async () => {
+    const backupDir = path.join(work, 'source-backups');
+    const backedUp = await runCli(['backup', '--insecure', '--backup-dir', backupDir], env(sourcePort));
+    expect(backedUp.status, backedUp.stderr).toBe(0);
+    const before = channelsOf(await source.getServerConfiguration()).map(c => String(c['id'])).sort();
+
+    await source.deleteChannel(selectedId);
+    expect(channelsOf(await source.getServerConfiguration()).map(c => String(c['id']))).not.toContain(selectedId);
+
+    // The newest backup of this server; restore checks the result matches it.
+    const restored = await runCli(['restore', '--insecure', '--yes', '--backup-dir', backupDir], env(sourcePort));
+    expect(restored.status, restored.stdout + restored.stderr).toBe(0);
+    expect(restored.stdout).toMatch(/create\s+channel Report Distributor\n/);
+    expect(channelsOf(await source.getServerConfiguration()).map(c => String(c['id'])).sort()).toEqual(before);
+
+    // The undo backup is the server as it was without the channel.
+    const undo = /saved the current configuration to (.+?) \(undo/.exec(restored.stdout)?.[1];
+    expect(undo).toBeDefined();
+    // (Its id still appears in tags and library settings, which outlive the channel.)
+    const undone = new XmlConfigAdapter().parse(await readFile(undo!, 'utf8'));
+    expect(channelsOf(undone).map(c => String(c['id']))).not.toContain(selectedId);
+    expect(channelsOf(undone)).toHaveLength(before.length - 1);
+
+    // Both servers were seeded from one fixture, so their backups carry the
+    // same name; the server ID still tells them apart.
+    const sourceBackup = /backed up .+? to (.+)\n/.exec(backedUp.stdout)?.[1];
+    const crossed = await runCli(['restore', sourceBackup!, '--insecure', '--yes', '--backup-dir', backupDir], env(targetPort));
+    expect(crossed.status).toBe(1);
+    expect(crossed.stderr).toContain(`was taken from 127.0.0.1:${sourcePort}`);
   }, 120_000);
 });

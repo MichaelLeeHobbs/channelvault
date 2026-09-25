@@ -59,6 +59,8 @@ channelvault pull <dir>                     # live server -> tree
 channelvault push <dir>                     # changed channels/templates -> live server
 channelvault diff <dir>                     # tree vs live server
 channelvault status <dir>                   # summary of a tree
+channelvault backup                         # live server -> .backup/<server>-<UTC time>.xml
+channelvault restore [file]                 # backup -> live server (default: newest of this server)
 ```
 
 `channelvault <command> --help` lists the flags. Server connection comes from flags or `MIRTH_HOST`, `MIRTH_PORT`, `MIRTH_USER`, `MIRTH_PASS`; prefer the env var over `--pass`, which shows up in process listings. Mirth's default certificate is self-signed; `--insecure` accepts it by turning verification off.
@@ -101,7 +103,32 @@ channelvault push ./mirth --library Formatting --deploy  # one library, then red
 - After a push the tree's revision numbers are updated from the server, so `diff` and the next `push` stay clean.
 - Server settings, the configuration map, channel groups and tags are **not** pushed; `push` names them if they differ. `--whole-server` replaces the entire server configuration instead. It shows the same change list and needs the same `--allow-deletes` / `--force`, and it can't be combined with `--channel` or `--library`.
 - A tree exploded from an XML backup is refused (its shape differs from the live API's); `--ignore-origin` overrides that.
+- Before it changes anything, `push` backs up the server (see below) and prints the `restore` command that undoes it. `--no-backup` skips that.
 - Without a terminal, `push` needs `--yes`.
+
+## Backups
+
+`backup` saves the server's configuration exactly as the Administrator's *Backup Config* does, so the Administrator can restore it too. `restore` puts one back. They are for recovery, outside the git workflow: the tree is what you review and promote.
+
+```
+channelvault backup                              # .backup/vns-gov-20260925T143012Z.xml
+channelvault backup --out before-upgrade.xml     # exactly this file
+channelvault restore                             # the newest backup of this server
+channelvault restore .backup/vns-gov-20260925T143012Z.xml --deploy
+```
+
+- **Names.** The file is named after the server name in Server Settings, else the environment name, else the host and port, followed by the time in UTC. `.backup` is relative to the current directory; `--backup-dir` picks another.
+- **Which server.** That name is part of the configuration, so a restore or `push --whole-server` carries it to another server. Which server a backup came from is therefore recorded by Mirth's server ID, which belongs to the installation, in the directory's `channelvault-backups.json`. Choosing, checking and rotating backups go by that ID.
+- **Plain-text credentials.** A backup holds every connector password and configuration-map value; channelvault's `{{env:…}}` placeholders don't apply. Files are readable by their owner only (on Windows they get the folder's permissions instead), and a backup directory channelvault creates contains a `.gitignore` that ignores everything in it. If git would still commit a backup, you get a warning. Keep backups off shared drives and out of CI artifacts.
+- **Rotation.** The newest 10 backups of each server are kept (`--keep` changes that); older ones are deleted. Files the manifest doesn't attribute to the server, such as ones copied in by hand, are never deleted.
+- **Restore replaces the entire server**, like `push --whole-server`:
+  - Without a file it takes the newest backup of the server it is connected to, never another server's. A backup taken from another server is refused unless you pass `--force`. For a file from outside the backup directory only the server names can be compared, and it says so.
+  - The preview says when the restore changes the server's name. `push --whole-server` does too.
+  - A backup from a newer Mirth version is refused; an older one is converted by the server.
+  - It previews the channels and templates it creates, changes and deletes, and asks before continuing (`--yes` without a terminal).
+  - It saves the server's current configuration first, as a new backup, and prints the command that undoes the restore. That backup is the newest, so a second plain `restore` reverts the first.
+  - If the server changes while you confirm, nothing is restored; run it again to review the new state.
+  - `--deploy` redeploys every channel afterwards; `--overwrite-config-map` also replaces the configuration map.
 
 ## Local test server
 
