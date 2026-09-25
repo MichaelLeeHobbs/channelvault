@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -33,6 +34,47 @@ const edit = async (name: string) => writeFile(path.join(tree, 'channels', name,
 const pushArgs = (...flags: string[]) => ['push', tree, '--no-https', ...flags];
 const writes = () => mirth.writes.map(w => `${w.method} ${w.path}`);
 const meta = async () => JSON.parse(await readFile(path.join(tree, 'channelvault.json'), 'utf8')) as { resources: { channels: Record<string, number> } };
+
+describe('CLI failure output', () => {
+  it('never prints an extracted credential that a failed save echoes back', async () => {
+    const passcode = 'fixture-passcode-924';
+    const channels = channelsOf(mirth.config);
+    channels[0]!['destinationConnectors'] = { connector: [{ metaDataId: 1, name: 'DICOM', properties: { passcode } }] };
+    mirth.config['channels'] = { channel: channels };
+    const pulled = await runCli(['pull', tree, '--no-https'], env);
+    expect(pulled.status, pulled.stderr).toBe(0);
+    expect(await readFile(path.join(tree, 'channels', 'Alpha', 'channel.json'), 'utf8')).not.toContain(passcode);
+    await edit('Alpha');
+    // Unstructured, so only the CLI's knowledge of the env values can catch it.
+    mirth.onRequest = req => req.method === 'PUT' && req.path === '/api/channels/c1' ? { status: 400, body: `rejected value ${passcode} for DICOM` } : undefined;
+    const pushed = await runCli(pushArgs('--yes'), env);
+    expect(pushed.status).toBe(1);
+    expect(pushed.stderr).toContain('rejected value <redacted> for DICOM');
+    expect(pushed.stdout + pushed.stderr).not.toContain(passcode);
+  });
+});
+
+describe('CLI pull preflight', () => {
+  it('refuses an env file inside a directory it replaces, writing nothing', async () => {
+    const fresh = path.join(dir, 'fresh');
+    const envFile = path.join(fresh, 'channels', 'runtime.env');
+    const r = await runCli(['pull', fresh, '--no-https', '--dotenv', envFile], env);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('is inside channels/');
+    expect(existsSync(fresh)).toBe(false);
+  });
+
+  it('refuses unreadable metadata before touching the tree', async () => {
+    await edit('Alpha');
+    await writeFile(path.join(tree, 'channelvault.json'), '{"tool": "channel');
+    const requestsBefore = mirth.requests.length;
+    const r = await runCli(['pull', tree, '--no-https'], env);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('channelvault.json is unreadable or not channelvault metadata');
+    expect(await readFile(path.join(tree, 'channels', 'Alpha', 'scripts', 'deploy.js'), 'utf8')).toBe('// Alpha edited\nreturn;');
+    expect(mirth.requests.length).toBe(requestsBefore); // refused before connecting
+  });
+});
 
 describe('CLI partial pushes', () => {
   it('compares secret-bearing global scripts against the actual pulled server content', async () => {

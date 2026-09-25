@@ -212,6 +212,20 @@ describe('createMirthClient', () => {
       await expect(client.deployChannel('c1')).rejects.toThrow(/^HTTP 500: Server Error$/);
     });
 
+    it.each([
+      ['JSON', '{"error":"invalid","passcode":"fixture-924","host":"pacs"}', '"passcode":"<redacted>"'],
+      ['XML', '<error><keyStorePW>fixture-924</keyStorePW><host>pacs</host></error>', '<keyStorePW><redacted></keyStorePW>'],
+    ])('redacts a credential field echoed in a %s error body', async (_format, body, expected) => {
+      fetchMock
+        .mockResolvedValueOnce(loginResponse())
+        .mockResolvedValueOnce(new Response(body, { status: 400, statusText: 'Bad Request' }));
+
+      const error = await createMirthClient(CONFIG).deployChannel('c1').then(() => undefined, (err: unknown) => err as Error);
+      expect(error?.message).toContain(expected);
+      expect(error?.message).toContain('pacs');
+      expect(JSON.stringify(error)).not.toContain('fixture-924');
+    });
+
     it('redacts a secret the error body echoes', async () => {
       fetchMock
         .mockResolvedValueOnce(loginResponse())

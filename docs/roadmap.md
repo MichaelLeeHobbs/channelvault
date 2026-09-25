@@ -129,3 +129,4 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - `diff` errors exit 2, so 1 always means differences.
 - The env file is replaced by rename, not rewritten in place, and a warning names it when git would commit it.
 - Connection failures name the address and cause (and suggest `--insecure` for an untrusted certificate); login errors omit the response body, and other error bodies are secret-redacted.
+- Third-party review follow-up: errors are printed with every env value behind the tree's placeholders replaced, and error bodies have credential fields redacted, because a server's error can echo the submitted payload. Connection-string passwords may contain parentheses; only call syntax is excluded. `pull`/`explode` validate `channelvault.json` and the env file's location before writing anything.

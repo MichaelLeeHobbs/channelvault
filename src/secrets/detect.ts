@@ -10,7 +10,7 @@
 import { createHash } from 'node:crypto';
 
 import type { CanonicalConfig } from '../types.js';
-import { derivedName, hasPlaceholder, mapLeaves, placeholder, type Env, type Leaf } from './index.js';
+import { derivedName, hasPlaceholder, isSecretKey, mapLeaves, placeholder, type Env, type Leaf } from './index.js';
 
 export type SecretKind =
   | 'private-key'
@@ -39,12 +39,12 @@ interface Rule {
 }
 
 /** Spans of capture group `group` (0 = whole match) of every match of `re`. */
-function regexSpans(re: RegExp, group: number): (value: string) => Span[] {
+function regexSpans(re: RegExp, group: number, keep: (secret: string) => boolean = () => true): (value: string) => Span[] {
   return (value) => {
     const out: Span[] = [];
     for (const m of value.matchAll(re)) {
       const secret = m[group];
-      if (secret === undefined) continue;
+      if (secret === undefined || !keep(secret)) continue;
       // The secret is the last occurrence of its text within the match.
       const start = m.index + m[0].lastIndexOf(secret);
       out.push({ start, end: start + secret.length });
@@ -101,6 +101,15 @@ function dbConnectionSpans(value: string): Span[] {
  */
 const ASSIGNED = String.raw`["']?\s*[:=]\s*(?:[\w$.[\]'"]+\s*(?:\|\||\?\?)\s*)?(["'])((?=\S)(?:[^"'{}\s]{4,}|(?=[^"'{}\n]*[0-9@#$%^&*+=~|\\/<>_])[^"'{}\n]{4,}))\1`;
 
+/**
+ * A script's `pwd = $('x')` or `password = getPass()` reads as `pwd=` followed by a call:
+ * the captured text ends at the call's quote (`$(`) or holds an empty
+ * argument list. Parentheses elsewhere are ordinary password characters.
+ */
+function notACall(secret: string): boolean {
+  return !secret.endsWith('(') && !secret.includes('()');
+}
+
 // Earlier rules win where spans overlap: a private key block may contain text
 // other rules match, and `token = 'ghp_…'` is one secret, not two.
 const RULES: Rule[] = [
@@ -116,11 +125,10 @@ const RULES: Rule[] = [
   // user:password@host. The user part stops at ';', '?' and '&' so a JDBC
   // parameter like `user=svc@srv` is not mistaken for credentials.
   { kind: 'url-credentials', suffix: 'PASSWORD', spans: regexSpans(/\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'";?&]+:([^\s@'"/;?&]+)@/gi, 1) },
-  // The value ends at a delimiter, so `; pwd = $('x')` in a script is a call, not a password.
-  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/[;?&]\s*(?:password|pwd)\s*=\s*([^;&'"\s()]+)(?=[;&'"\s]|$)/gi, 1) },
+  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/[;?&]\s*(?:password|pwd)\s*=\s*([^;&'"\s]+)/gi, 1, notACall) },
   // Leading the whole value (`Password=…;Server=…`): only when another key=value
   // follows, so a script starting `password = getPass();` is not one.
-  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/^\s*(?:password|pwd)\s*=\s*([^;&'"\s()]+)(?=\s*;\s*[\w ]+=)/gi, 1) },
+  { kind: 'connection-string', suffix: 'PASSWORD', spans: regexSpans(/^\s*(?:password|pwd)\s*=\s*([^;&'"\s]+)(?=\s*;\s*[\w ]+=)/gi, 1, notACall) },
   // Case-sensitive, and the credential must contain a digit or a base64/token
   // symbol, so prose like "Basic authentication" does not match.
   {
@@ -206,7 +214,12 @@ function hitsIn(value: string): Hit[] {
 }
 
 /** `value` with every secret a rule recognises replaced by a marker, for messages. */
-export function redactSecretsInText(value: string): string {
+export function redactSecretsInText(text: string): string {
+  // Credential fields echoed as JSON ("passcode": "…") or XML (<keyPW>…</keyPW>),
+  // by the field names `templatize` extracts, then the value rules.
+  const value = text
+    .replace(/("([\w.-]+)"\s*:\s*")((?:[^"\\]|\\.)+)"/g, (whole, head: string, key: string) => (isSecretKey(key) ? `${head}<redacted>"` : whole))
+    .replace(/<([\w.:-]+)>([^<]+)<\/\1>/g, (whole, key: string) => (isSecretKey(key) ? `<${key}><redacted></${key}>` : whole));
   let out = '';
   let at = 0;
   for (const h of hitsIn(value)) {

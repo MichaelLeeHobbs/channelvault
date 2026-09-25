@@ -41,6 +41,8 @@ describe('scanSecrets', () => {
     ['assignment', "var password = 'correct horse 42';", 'correct horse 42'],
     ['setter-call', "conn.setPassword('s3cretPw');", 's3cretPw'],
     ['connection-string', 'Password=s3cretPw;Server=db.internal;User Id=svc', 's3cretPw'],
+    ['connection-string', 'jdbc:sqlserver://localhost;password=fixture(s3cret);encrypt=true', 'fixture(s3cret)'],
+    ['connection-string', 'Password=fixture(s3cret);Server=db.internal', 'fixture(s3cret)'],
     ['db-connection-call', "var db = DatabaseConnectionFactory.createDatabaseConnection(driver, url, 'svc', 's3cretPw');", 's3cretPw'],
     ['aws-access-key', `var k = '${aws}';`, aws],
     ['jwt', `var t = "${jwt}";`, jwt],

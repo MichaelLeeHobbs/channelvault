@@ -64,7 +64,7 @@ channelvault status <dir>                   # summary of a tree
 
 `diff` exits 0 when the tree matches the server, 1 when they differ, and 2 on any error (including a bad flag), so a scheduled drift check can tell drift from an outage.
 
-`pull` and `explode` replace `server/`, `channels/`, `codeTemplates/` and `channelGroups/` in `<dir>`, so they refuse a directory that has any of those but no `channelvault.json`.
+`pull` and `explode` replace `server/`, `channels/`, `codeTemplates/` and `channelGroups/` in `<dir>`, so they refuse a directory that has any of those but no `channelvault.json`, an unreadable `channelvault.json`, or a `--dotenv` file inside one of those directories. All of this is checked before anything is written.
 
 ## Secrets and per-environment values
 
@@ -72,6 +72,7 @@ channelvault status <dir>                   # summary of a tree
 
 - You can add placeholders yourself anywhere, in JSON or in a `.js` file (for example `"host": "{{env:DB_HOST}}"`). A re-pull keeps them as long as they still resolve to what the server holds.
 - `--dotenv .env.prod` selects another environment. Variables already set in the process environment take precedence over the file, so CI can supply them directly.
+- Error messages never show a value from the env file, even when a server's error response echoes one back.
 - If git would commit the env file (for example `--dotenv` pointing outside the tree, into a repository that doesn't ignore it), `pull` and `explode` warn.
 - A password rotated on the server updates `.env` on the next `pull`, and `diff` reports it by name only. The previous env file is kept in the tree's `.secrets/` (git-ignored, newest 5 only) whenever a value in it changes. An extracted secret inside a script survives server-side edits to the rest of that script.
 

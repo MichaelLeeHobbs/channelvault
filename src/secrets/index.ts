@@ -132,6 +132,11 @@ export function mapLeaves(config: CanonicalConfig, visit: (value: string, leaf: 
   return walk(config, '', [], [], '') as CanonicalConfig;
 }
 
+/** A field name that holds a credential (see {@link SECRET_KEY}). */
+export function isSecretKey(key: string): boolean {
+  return SECRET_KEY.test(key);
+}
+
 function isSecret(leaf: Leaf): boolean {
   if (leaf.section === 'configurationMap') return leaf.configMapKey !== undefined && leaf.key === 'value';
   return SECRET_KEY.test(leaf.key);
