@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -22,7 +22,20 @@ import { Command } from 'commander';
 import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
 import { createMirthClient, type MirthClientExt } from './client/index.js';
-import { changedSince, channelsOf, normalizeEolDeep, planPush, resourceIds, type Change, type Known, type Plan, type Scope } from './push/index.js';
+import {
+  changedSince,
+  channelsOf,
+  knownAfterPush,
+  knownFrom,
+  normalizeEolDeep,
+  planPush,
+  resourceIds,
+  sameServerConfig,
+  type Change,
+  type Known,
+  type Plan,
+  type Scope,
+} from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
 import { redactKnownSecrets, render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
@@ -269,8 +282,7 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   if (backup || (envInTree && Object.keys(envUpdates).length > 0)) await ensureEnvIgnored(root, envInTree ? envFile : undefined);
   await updateEnvFile(envFile, envUpdates);
 
-  await clearManaged(root);
-  await engine.explode(config, { root });
+  await replaceTree(root, config);
   await writeMeta(root, source, config);
   if (scan.findings.length > 0) process.stdout.write(`extracted ${scan.findings.length} secret(s) found in values\n`);
   const updated = Object.keys(envUpdates).length;
@@ -282,9 +294,25 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   }
 }
 
-async function clearManaged(root: string): Promise<void> {
-  await Promise.all(MANAGED_DIRS.map((d) => rm(path.join(root, d), RM_OPTS)));
+/**
+ * Explode into a staging directory inside the tree, then swap it in one
+ * managed directory at a time. A failure while exploding leaves the old tree
+ * as it was; only the swap itself (a few renames) can be interrupted.
+ */
+async function replaceTree(root: string, config: CanonicalConfig): Promise<void> {
+  const staging = path.join(root, '.channelvault-staging');
+  await rm(staging, RM_OPTS);
+  try {
+    await engine.explode(config, { root: staging });
+    for (const d of MANAGED_DIRS) {
+      await rm(path.join(root, d), RM_OPTS);
+      if (existsSync(path.join(staging, d))) await rename(path.join(staging, d), path.join(root, d));
+    }
+  } finally {
+    await rm(staging, RM_OPTS);
+  }
 }
+
 
 function assertTree(root: string): void {
   if (!existsSync(path.join(root, 'server', 'configuration.json'))) {
@@ -364,7 +392,7 @@ function collect(value: string, previous: string[] | undefined): string[] {
 async function readKnown(root: string): Promise<Known | undefined> {
   const metaPath = path.join(root, 'channelvault.json');
   if (!existsSync(metaPath)) return undefined;
-  return (JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta).resources;
+  return knownFrom((JSON.parse(await readFile(metaPath, 'utf8')) as SyncMeta).resources);
 }
 
 async function writeKnown(root: string, known: Known): Promise<void> {
@@ -374,19 +402,6 @@ async function writeKnown(root: string, known: Known): Promise<void> {
   if (!meta.resources) return; // an older tree: leave it to the next pull
   meta.resources = known;
   await writeFile(metaPath, JSON.stringify(meta, null, 2) + '\n', 'utf8');
-}
-
-/** The tree now knows what it created and has forgotten what it deleted. */
-function afterChanges(known: Known, applied: Change[]): Known {
-  const key = { channel: 'channels', library: 'libraries', codeTemplate: 'codeTemplates' } as const;
-  const next: Known = { channels: [...known.channels], libraries: [...known.libraries], codeTemplates: [...known.codeTemplates] };
-  for (const c of applied) {
-    if (c.kind === 'globalScripts') continue;
-    const ids = next[key[c.kind]];
-    if (c.op === 'create' && !ids.includes(c.id)) ids.push(c.id);
-    if (c.op === 'delete') next[key[c.kind]] = ids.filter((id) => id !== c.id);
-  }
-  return next;
 }
 
 function printChanges(plan: Plan): void {
@@ -466,17 +481,19 @@ async function scopedPush(
   // plan changed on the server meanwhile. Each channel save re-checks its own
   // revision once more; the gap after that last check can't be closed from
   // here, because Mirth accepts a stale revision.
-  const moved = changedSince(plan, remote, await client.getServerConfiguration());
+  const fresh = await client.getServerConfiguration();
+  const moved = changedSince(plan, remote, fresh);
   if (moved.length > 0 && !flags.force) {
     fail(`changed on the server while this push was being confirmed:\n  ${moved.join('\n  ')}\npull and try again, or pass --force`);
   }
-  const result = await applyPlan(client, plan, local, remote, scope, { force: flags.force === true });
+  // Apply against the fresh snapshot, so whatever is sent for resources
+  // outside the plan (the rest of the library list) is the server's latest.
+  const result = await applyPlan(client, plan, local, fresh, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
   // resources that did go through don't read as conflicts next time.
-  if (result.touchedIds.size > 0) {
-    await refreshRevisions(root, await client.getServerConfiguration(), result.touchedIds);
-  }
-  if (known) await writeKnown(root, afterChanges(known, result.applied));
+  const after = await client.getServerConfiguration();
+  if (result.touchedIds.size > 0) await refreshRevisions(root, after, result.touchedIds);
+  if (known) await writeKnown(root, knownAfterPush(known, result.applied, result.touchedIds, after));
   if (result.failed) {
     const { change, error } = result.failed;
     fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}`);
@@ -511,27 +528,36 @@ async function wholeServerPush(
     process.stdout.write('Channel, library and template changes:\n');
     printChanges(plan);
   }
+  // A full replace also deletes what the server has and the tree never had
+  // (created since the pull). That is both a deletion and someone else's
+  // work: it needs --allow-deletes and --force, and the preview names it.
+  for (const r of plan.serverOnly) process.stdout.write(`  delete  ${r} (created on the server since the last pull)\n`);
   if (plan.notPushed.length > 0) process.stdout.write(`also replaced: ${plan.notPushed.join(', ')}\n`);
-  // A full replace deletes what the tree lacks, including work created on the
-  // server since the pull, which a scoped push would have left alone.
   if (plan.serverOnly.length > 0 && !flags.force) {
-    fail(
-      `these were created on the server since the last pull and would be deleted:\n  ${plan.serverOnly.join('\n  ')}\n` +
-        `pull first, or pass --force to delete them`,
-    );
+    fail('the replace would delete resources created on the server since the last pull; pull first, or pass --force (and --allow-deletes)');
+  }
+  const deletions = plan.changes.filter((c) => c.op === 'delete').length + plan.serverOnly.length;
+  if (deletions > 0 && !flags.allowDeletes) {
+    fail(`the replace deletes ${deletions} resource(s) from the server; pass --allow-deletes`);
   }
   checkPlan(plan, flags);
   if (!flags.yes && !(await confirm('Continue?'))) {
     process.stdout.write('aborted.\n');
     return;
   }
+  // The preview was made from `remote`; anything changed since would be
+  // overwritten without having been shown.
+  if (!sameServerConfig(remote, await client.getServerConfiguration()) && !flags.force) {
+    fail('the server changed while this push was being confirmed; pull and try again, or pass --force');
+  }
   await client.putServerConfiguration(local, {
     deploy: flags.deploy === true,
     overwriteConfigMap: flags.overwriteConfigMap === true,
   });
+  const after = await client.getServerConfiguration();
   const ids = resourceIds(local);
-  await refreshRevisions(root, await client.getServerConfiguration(), new Set([...ids.channels, ...ids.libraries, ...ids.codeTemplates]));
-  if (known) await writeKnown(root, ids);
+  await refreshRevisions(root, after, new Set([...Object.keys(ids.channels), ...Object.keys(ids.libraries), ...Object.keys(ids.codeTemplates)]));
+  if (known) await writeKnown(root, resourceIds(after));
   process.stdout.write(`pushed ${root} -> ${target}\n`);
 }
 

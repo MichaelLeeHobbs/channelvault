@@ -14,6 +14,7 @@
  * Invariant: `implode(explode(config))` deep-equals `config`.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
@@ -105,13 +106,36 @@ function relPosix(fromDir: string, toFile: string): string {
   return path.relative(fromDir, toFile).split(path.sep).join('/');
 }
 
+/** The real path of the tree being exploded, for the write check below. */
+const explodeRoot = new AsyncLocalStorage<string>();
+
+/**
+ * Refuse a write whose real directory is outside the tree: the names are
+ * sanitised, but a symlink or junction already inside the tree could still
+ * redirect it.
+ */
+async function assertInsideTree(filePath: string): Promise<void> {
+  const root = explodeRoot.getStore();
+  if (root === undefined) return;
+  // Check the nearest directory that already exists, before creating any:
+  // mkdir through a link would already have created directories outside.
+  let dir = path.dirname(filePath);
+  while (!existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+  const real = await realpath(dir);
+  if (real !== root && !real.startsWith(root + path.sep)) {
+    throw new Error(`refusing to write outside the working tree: ${filePath}`);
+  }
+}
+
 async function writeFileMkdir(filePath: string, data: string): Promise<void> {
+  await assertInsideTree(filePath);
   await mkdir(path.dirname(filePath), { recursive: true });
   // NO added trailing newline — code strings must round-trip byte-identical.
   await writeFile(filePath, data);
 }
 
 async function writeJson(filePath: string, value: Json): Promise<void> {
+  await assertInsideTree(filePath);
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, JSON.stringify(value, null, 2));
 }
@@ -179,7 +203,8 @@ async function extractFromObject(
       const friendlyBase =
         key in CHANNEL_SCRIPT_FRIENDLY
           ? `scripts/${CHANNEL_SCRIPT_FRIENDLY[key]}`
-          : ctx.friendly ?? `_code/${[...ctx.prefixParts, key].join('.')}`;
+          : // One filename segment: config keys are untrusted and may hold '/' or '..'.
+            ctx.friendly ?? `_code/${slug([...ctx.prefixParts, key].join('.'))}`;
       const filePath = resolveUnique(ctx.codeDir, `${friendlyBase}.js`, ctx.usedPaths);
       await writeFileMkdir(filePath, raw);
       out[key] = { '@file': relPosix(ctx.jsonDir, filePath) };
@@ -209,7 +234,9 @@ function resolveUnique(baseDir: string, relName: string, used: Set<string>): str
   let rel = [...segs, `${stem}${ext}`].join('/');
   for (let n = 2; used.has(rel.toLowerCase()); n += 1) rel = [...segs, `${stem}-${n}${ext}`].join('/');
   used.add(rel.toLowerCase());
-  return path.join(baseDir, ...rel.split('/'));
+  const full = path.resolve(baseDir, ...rel.split('/'));
+  if (!full.startsWith(path.resolve(baseDir) + path.sep)) throw new Error(`script path escapes its directory: ${relName}`);
+  return full;
 }
 
 /**
@@ -613,6 +640,11 @@ async function splitCollection(
 }
 
 async function explode(config: CanonicalConfig, opts: ExplodeOptions): Promise<void> {
+  await mkdir(opts.root, { recursive: true });
+  await explodeRoot.run(await realpath(opts.root), () => explodeInto(config, opts));
+}
+
+async function explodeInto(config: CanonicalConfig, opts: ExplodeOptions): Promise<void> {
   const root = opts.root;
   const serverDir = path.join(root, 'server');
   const skeleton = deepClone(config) as Record<string, Json>;

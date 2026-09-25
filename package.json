@@ -12,6 +12,7 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
+    "docs",
     "README.md",
     "LICENSE"
   ],
@@ -30,9 +31,9 @@
   "dependencies": {
     "commander": "^12.1.0",
     "dotenv": "^18.0.3",
-    "fast-xml-parser": "^4.5.0",
+    "fast-xml-parser": "^5.11.1",
     "tough-cookie": "^5.0.0",
-    "undici": "^7.0.0"
+    "undici": "^7.29.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",

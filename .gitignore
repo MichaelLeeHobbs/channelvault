@@ -6,6 +6,7 @@ coverage/
 .idea/
 # local scratch / real configs pulled from servers
 /scratch/
+/tmp/
 /tmp-out/
 *.local.json
 /out/

@@ -109,3 +109,10 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 **2026-09-24: Findings from the first real-config trial (40 channels, 112 code templates, Mirth 4.5.2, isolated server).**
 - Round trip exact, 39 secrets moved to `.env`, scoped push and `diff` converge.
 - Fixed from the trial: a configuration-map value (JSON with CRLF) that no dotenv quoting can carry is stored as `cv-base64:`; `.env` is written before the tree, so a failed write never leaves placeholders without values; the default-value idiom `apiKey = apiKey || '…'` is detected, and a known secret repeated in plain text is warned about; a lone CR is treated like other line endings (Mirth rewrites it as LF on save, which made push re-send forever); `--env-file` became `--dotenv` because Node scans the whole command line for `--env-file`; unused arguments are an error (a script runner's literal `--` had silently dropped `--extract-secrets`); `channelvault.json` is not rewritten for a timestamp alone.
+
+**2026-09-24: Third review (stale snapshots, baselines, write safety).**
+- `channelvault.json` now records each resource's revision at the last sync, plus a hash of the global scripts. A local delete of something the server changed since then is a conflict, and so is a global-scripts push over a server-side change. Older trees (ids only) keep working and upgrade on the next pull.
+- After confirmation, pushes re-read the server and apply against that fresh copy; the library list (saved as a whole) must be unchanged. `--whole-server` treats resources created since the pull as deletions (needs `--allow-deletes` and `--force`, named in the preview) and re-checks the whole config before replacing it.
+- Explode checks every write's real directory before creating it; XML is validated before conversion; the tree is written to a staging directory and swapped in.
+- Library saves do not change template contents (verified on 4.5.2), so the library list only has to be current at the library level.
+- Dependencies: undici 7.29, fast-xml-parser 5 (no audit findings).

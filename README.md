@@ -64,7 +64,7 @@ channelvault status <dir>                   # summary of a tree
 
 ## Secrets and per-environment values
 
-`explode` and `pull` never write credentials into the tree. Connector passwords, tokens and secrets, and every configuration-map value, become `{{env:NAME}}` placeholders, and their values go to `<dir>/.env`, which is added to the tree's `.gitignore`. `push` and `implode` fill the placeholders back in and refuse to run if any are missing, naming each one.
+`explode` and `pull` keep the credentials they detect out of the tree. Detection is heuristic (see below), so review a first pull of a real server before committing it. Connector passwords, tokens and secrets, and every configuration-map value, become `{{env:NAME}}` placeholders, and their values go to `<dir>/.env`, which is added to the tree's `.gitignore`. `push` and `implode` fill the placeholders back in and refuse to run if any are missing, naming each one.
 
 - You can add placeholders yourself anywhere, in JSON or in a `.js` file (for example `"host": "{{env:DB_HOST}}"`). A re-pull keeps them as long as they still resolve to what the server holds.
 - `--dotenv .env.prod` selects another environment. Variables already set in the process environment take precedence over the file, so CI can supply them directly.
@@ -75,7 +75,7 @@ Secrets inside values are caught too: credentials in URLs and connection strings
 - rerun with `--extract-secrets`, which replaces just the secret part with a placeholder, or
 - list a false positive in `channelvault.allow.json` (committed): `{ "ignore": [{ "location": "<as printed>", "kind": "assignment", "context": "<as printed>", "note": "why" }] }`. `context` identifies the surrounding text, so the entry stops applying if that text changes.
 
-`diff` redacts any such secret the server holds that the tree hasn't extracted.
+`diff` redacts any such secret the server holds that the tree hasn't extracted. After extraction, a known secret value (8+ characters) that still appears in plain text elsewhere, where no rule matched, is reported as a warning naming the variable and location.
 
 ## Pushing
 

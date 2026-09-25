@@ -8,6 +8,8 @@
  * Both configs are in the live (Jackson JSON) shape, and the local one has its
  * `{{env:…}}` placeholders already rendered.
  */
+import { createHash } from 'node:crypto';
+
 import type { CanonicalConfig, Json } from '../types.js';
 
 type Obj = Record<string, Json>;
@@ -132,18 +134,69 @@ export interface Scope {
  * someone else's work.
  */
 export interface Known {
-  channels: string[];
-  libraries: string[];
-  codeTemplates: string[];
+  /** id -> revision when last synced (null: unknown, from an older tree). */
+  channels: Record<string, number | null>;
+  libraries: Record<string, number | null>;
+  codeTemplates: Record<string, number | null>;
+  /** Hash of the global scripts when last synced; they carry no revision. */
+  globalScripts?: string;
 }
 
+export function hashGlobalScripts(c: CanonicalConfig): string {
+  return createHash('sha256').update(JSON.stringify(normalizeEolDeep((c['globalScripts'] ?? null) as Json))).digest('hex');
+}
+
+/** The sync baseline for a config: every resource's revision, plus the global scripts' hash. */
 export function resourceIds(c: CanonicalConfig): Known {
   const libs = librariesOf(c);
+  const revs = (items: Obj[]) => Object.fromEntries(items.map((o) => [idOf(o), revisionOf(o)]));
   return {
-    channels: channelsOf(c).map(idOf),
-    libraries: libs.map(idOf),
-    codeTemplates: libs.flatMap((l) => templatesOf(l).map(idOf)),
+    channels: revs(channelsOf(c)),
+    libraries: revs(libs),
+    codeTemplates: revs(libs.flatMap(templatesOf)),
+    globalScripts: hashGlobalScripts(c),
   };
+}
+
+/** Accept the older id-list form of the baseline (no revisions). */
+export function knownFrom(raw: unknown): Known | undefined {
+  if (!isObj(raw as Json)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const map = (v: unknown): Record<string, number | null> =>
+    Array.isArray(v) ? Object.fromEntries(v.map((id) => [String(id), null])) : ((v ?? {}) as Record<string, number | null>);
+  return {
+    channels: map(r['channels']),
+    libraries: map(r['libraries']),
+    codeTemplates: map(r['codeTemplates']),
+    globalScripts: typeof r['globalScripts'] === 'string' ? r['globalScripts'] : undefined,
+  };
+}
+
+/**
+ * The baseline after a push: resources the push wrote take the server's new
+ * revision, created ones join, deleted ones leave; everything else keeps its
+ * old baseline, so a colleague's unpulled change still reads as a conflict.
+ */
+export function knownAfterPush(known: Known, applied: Change[], touched: Set<string>, fresh: CanonicalConfig): Known {
+  const now = resourceIds(fresh);
+  const next: Known = {
+    channels: { ...known.channels },
+    libraries: { ...known.libraries },
+    codeTemplates: { ...known.codeTemplates },
+    globalScripts: known.globalScripts,
+  };
+  const key = { channel: 'channels', library: 'libraries', codeTemplate: 'codeTemplates' } as const;
+  for (const c of applied) {
+    if (c.kind === 'globalScripts') {
+      next.globalScripts = now.globalScripts;
+    } else if (c.op === 'delete') {
+      delete next[key[c.kind]][c.id];
+    }
+  }
+  for (const k of ['channels', 'libraries', 'codeTemplates'] as const) {
+    for (const id of touched) if (id in now[k]) next[k][id] = now[k][id]!;
+  }
+  return next;
 }
 
 /** The server-configuration sections scoped push handles. */
@@ -212,12 +265,24 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
   const deploy = new Set<string>();
   const serverOnly: string[] = [];
   /** A server resource missing from the tree: a planned delete, unless the tree never had it. */
-  const missingLocally = (kind: 'channel' | 'library' | 'codeTemplate', r: Obj, label: string, knownIds?: string[]): void => {
-    if (knownIds && !knownIds.includes(idOf(r))) {
-      serverOnly.push(`${kind === 'codeTemplate' ? 'code template' : kind} "${label}"`);
-    } else {
-      changes.push({ kind, op: 'delete', id: idOf(r), label });
+  const missingLocally = (
+    kind: 'channel' | 'library' | 'codeTemplate',
+    r: Obj,
+    label: string,
+    baseline?: Record<string, number | null>,
+  ): void => {
+    const what = `${kind === 'codeTemplate' ? 'code template' : kind} "${label}"`;
+    if (baseline && !(idOf(r) in baseline)) {
+      serverOnly.push(what);
+      return;
     }
+    // Deleted locally, but edited on the server since the last pull: the
+    // delete would discard someone else's work, so it is a conflict too.
+    const pulled = baseline?.[idOf(r)];
+    if (pulled != null && revisionOf(r) > pulled) {
+      conflicts.push(`${what} changed on the server since the last pull (revision ${revisionOf(r)}, pulled ${pulled}); deleting it would discard that`);
+    }
+    changes.push({ kind, op: 'delete', id: idOf(r), label });
   };
 
   // Channels
@@ -244,6 +309,16 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
     }
   }
 
+  // The channels as they will be after this push: the server's, minus planned
+  // deletes, with the tree's copy where the push writes one. Redeploys are
+  // computed from these, so a channel created on the server since the pull,
+  // or outside --channel, still gets a changed library's new code.
+  const deletedChannels = new Set(changes.filter((c) => c.kind === 'channel' && c.op === 'delete').map((c) => c.id));
+  const writtenChannels = new Set(changes.filter((c) => c.kind === 'channel' && c.op !== 'delete').map((c) => c.id));
+  const effective = new Map<string, Obj>();
+  for (const r of channelsOf(remote)) if (!deletedChannels.has(idOf(r))) effective.set(idOf(r), r);
+  for (const l of channelsOf(local)) if (writtenChannels.has(idOf(l))) effective.set(idOf(l), l);
+
   // Code templates and libraries
   if (libraryScope) {
     const ll = librariesOf(local);
@@ -253,7 +328,7 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
     const remoteLibById = new Map(rl.map((l) => [idOf(l), l]));
     const remoteTemplates = new Map(rl.flatMap((l) => templatesOf(l).map((t) => [idOf(t), t] as const)));
     const localTemplateIds = new Set(ll.flatMap((l) => templatesOf(l).map(idOf)));
-    const allChannelIds = channelsOf(local).map(idOf);
+    const allChannelIds = [...effective.keys()];
 
     for (const lib of ll.filter(inScope)) {
       const r = remoteLibById.get(idOf(lib));
@@ -298,6 +373,10 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
   // Global scripts
   if ((everything || scope.globalScripts === true) && !same(local['globalScripts'], remote['globalScripts'])) {
     changes.push({ kind: 'globalScripts', op: 'update', id: 'globalScripts', label: 'global scripts' });
+    // No revision to compare, so compare against the hash taken at the last sync.
+    if (known?.globalScripts && hashGlobalScripts(remote) !== known.globalScripts) {
+      conflicts.push('global scripts changed on the server since the last pull');
+    }
   }
 
   const notPushed = everything
@@ -308,7 +387,7 @@ export function planPush(local: CanonicalConfig, remote: CanonicalConfig, scope:
 
   // Only enabled channels that will exist after the push can be deployed.
   const enabled = new Set(
-    channelsOf(local)
+    [...effective.values()]
       .filter((c) => {
         const md = isObj(c['exportData']) ? c['exportData']['metadata'] : undefined;
         return !(isObj(md) && md['enabled'] === false);
@@ -370,7 +449,20 @@ export function changedSince(plan: Plan, before: CanonicalConfig, after: Canonic
     const exists = a !== undefined;
     if (existed !== exists || (a && b && revisionOf(a) !== revisionOf(b))) out.push(`${c.kind} "${c.label}"`);
   }
-  return out;
+  // The library-list save replaces every library, not just the planned ones:
+  // any library added, removed or changed meanwhile would be reverted.
+  if (plan.changes.some((c) => c.kind === 'library')) {
+    const shape = (m: Map<string, Obj>) => [...m].map(([id, l]) => `${id}@${revisionOf(l)}`).sort().join(',');
+    if (shape(lb) !== shape(la)) out.push('code template libraries (the library list is saved as a whole)');
+  }
+  return [...new Set(out)];
+}
+
+/** Two server configurations hold the same data (ignoring the export `date`, which every GET changes). */
+export function sameServerConfig(a: CanonicalConfig, b: CanonicalConfig): boolean {
+  const { date: _a, ...ra } = a;
+  const { date: _b, ...rb } = b;
+  return same(ra as Json, rb as Json);
 }
 
 /** Find a code template by id in a config. */

@@ -53,30 +53,44 @@ export async function updateEnvFile(file: string, updates: Record<string, string
   if (names.length === 0) return;
   const existing = existsSync(file) ? await readFile(file, 'utf8') : '';
   const lines = existing === '' ? [] : existing.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n');
-  const pending = new Set(names);
-  // A multi-line quoted value spans several lines; we only rewrite the line
-  // that starts the assignment and drop its continuation lines.
+  const written = new Set<string>();
   const out: string[] = [];
-  let skipUntilQuote: string | null = null;
+  // Inside a multi-line quoted value (of any variable), lines are value text,
+  // never assignments. `dropping` marks the continuation lines of a value
+  // being replaced.
+  let inQuote: string | null = null;
+  let dropping = false;
   for (const line of lines) {
-    if (skipUntilQuote !== null) {
-      if (line.includes(skipUntilQuote)) skipUntilQuote = null;
+    if (inQuote !== null) {
+      if (!dropping) out.push(line);
+      if (line.includes(inQuote)) [inQuote, dropping] = [null, false];
       continue;
     }
     const m = /^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)$/.exec(line);
-    if (m && pending.has(m[1]!)) {
-      out.push(`${m[1]}=${formatValue(updates[m[1]!]!)}`);
-      pending.delete(m[1]!);
-      const q = m[2]![0];
-      if ((q === '"' || q === "'" || q === '`') && m[2]!.lastIndexOf(q) === 0) skipUntilQuote = q;
+    const q = m?.[2]![0];
+    const opens = (q === '"' || q === "'" || q === '`') && m![2]!.lastIndexOf(q) === 0 ? q : null;
+    if (m && Object.prototype.hasOwnProperty.call(updates, m[1]!)) {
+      // Replace the first assignment and drop later duplicates: dotenv uses the
+      // last one, so a stale duplicate would stay in effect.
+      if (!written.has(m[1]!)) {
+        out.push(`${m[1]}=${formatValue(updates[m[1]!]!)}`);
+        written.add(m[1]!);
+      }
+      if (opens) [inQuote, dropping] = [opens, true];
       continue;
     }
     out.push(line);
+    if (opens) inQuote = opens;
   }
   for (const name of names) {
-    if (pending.has(name)) out.push(`${name}=${formatValue(updates[name]!)}`);
+    if (!written.has(name)) out.push(`${name}=${formatValue(updates[name]!)}`);
   }
-  await writeFile(file, `${out.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
+  const text = `${out.join('\n')}\n`;
+  // Prove the file says what we mean before replacing it.
+  const readBack = parseEnv(text);
+  const wrong = names.filter((n) => readBack[n] !== updates[n]);
+  if (wrong.length > 0) throw new Error(`env file update would not read back correctly for ${wrong.join(', ')}; nothing written`);
+  await writeFile(file, text, { encoding: 'utf8', mode: 0o600 });
 }
 
 /** How many superseded env files to keep; old secrets should not pile up on disk. */

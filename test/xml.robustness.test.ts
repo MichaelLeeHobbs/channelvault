@@ -188,7 +188,8 @@ describe('XmlConfigAdapter: unexpected XML', () => {
   it.each([
     ['an out-of-range character reference', '<s>&#x110000;</s>', /invalid character reference &#x110000;/],
     ['a DOCTYPE', '', /DOCTYPE declarations are not supported/],
-    ['a __proto__ element', '<__proto__>x</__proto__>', /unsupported element name <__proto__>/],
+    // fast-xml-parser 5 rejects it itself; our own guard backs that up.
+    ['a __proto__ element', '<__proto__>x</__proto__>', /__proto__/],
   ])('rejects %s with a clear error', (_label, body, message) => {
     const doctype = body === '' ? '<!DOCTYPE serverConfiguration>' : '';
     const xml = `${doctype}<serverConfiguration version="4.5.0">${body}</serverConfiguration>`;
