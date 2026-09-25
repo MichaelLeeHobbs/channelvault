@@ -4,7 +4,16 @@
 
 `channelvault` explodes a Mirth server configuration into a git-friendly directory tree (channel config as JSON, each transformer, filter, connector and code-template script as its own `.js` file) and reassembles it losslessly, so Mirth changes can be edited in an IDE, reviewed as diffs and moved between servers.
 
-Where it is going: [docs/roadmap.md](docs/roadmap.md).
+Where it is going: [docs/roadmap.md](docs/roadmap.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+
+## Install
+
+Node 20.18.1 or later.
+
+```
+npm install -g @ubercode/channelvault     # then: channelvault --help
+npx @ubercode/channelvault --help         # or run it without installing
+```
 
 ## How it works
 

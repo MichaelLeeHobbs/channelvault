@@ -1,23 +1,53 @@
 {
-  "name": "channelvault",
+  "name": "@ubercode/channelvault",
   "version": "0.1.0",
   "description": "Git-style pull/push/diff for Mirth Connect (NextGen Connect / OIE / BridgeLink). Explodes a server config into a git-friendly directory tree and back.",
-  "author": "Michael L. Hobbs",
+  "keywords": [
+    "mirth",
+    "mirth-connect",
+    "nextgen-connect",
+    "open-integration-engine",
+    "bridgelink",
+    "hl7",
+    "healthcare",
+    "cli",
+    "gitops"
+  ],
   "license": "MIT",
+  "author": "Michael Hobbs <michael.lee.hobbs@gmail.com>",
+  "homepage": "https://github.com/MichaelLeeHobbs/channelvault#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MichaelLeeHobbs/channelvault.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MichaelLeeHobbs/channelvault/issues"
+  },
   "type": "module",
   "bin": {
     "channelvault": "./dist/cli.js"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist",
     "docs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
     "node": ">=20.18.1"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsup",
@@ -27,7 +57,8 @@
     "test:integration": "node scripts/test-integration.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "lint:fix": "eslint --fix ."
+    "lint:fix": "eslint --fix .",
+    "prepublishOnly": "pnpm run typecheck && pnpm run build"
   },
   "dependencies": {
     "commander": "^12.1.0",
@@ -45,16 +76,5 @@
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.62.0",
     "vitest": "^2.1.8"
-  },
-  "keywords": [
-    "mirth",
-    "mirth-connect",
-    "nextgen-connect",
-    "open-integration-engine",
-    "bridgelink",
-    "hl7",
-    "healthcare",
-    "cli",
-    "gitops"
-  ]
+  }
 }
