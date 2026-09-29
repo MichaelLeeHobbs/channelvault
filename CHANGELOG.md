@@ -2,6 +2,14 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `--json` for `status`, `diff` and `push --plan-only`: one JSON document on stdout for scripts, CI and AI agents.
+- `push --plan-only`: the plan and what would stop it, without a prompt, a backup or any change.
+- README: a copy-paste guide for using channelvault with an AI agent.
+
 ## [0.1.0] — 2026-09-25
 
 First release. Tested against Mirth Connect 4.5.2; the offline round trip is also tested on Mirth 3.8 and 4.0.1 exports.
