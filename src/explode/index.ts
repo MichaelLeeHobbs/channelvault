@@ -629,13 +629,22 @@ async function splitCollection(
   const elements = asArray<Json>(raw);
   const refs: Json[] = [];
 
+  // Suffixes for colliding names ("Lab Feed", "LAB FEED") are handed out by
+  // name then id, not list order: the server's order can change (a restore
+  // reorders it), which would move a resource to another directory.
+  const byName = (el: Record<string, Json>) => `${slug(el['name']).toLowerCase()}\u0000${String(el['id'] ?? '')}`;
+  const slugs = new Map<Json, string>();
+  for (const el of elements.filter(isPlainObject).sort((a, b) => (byName(a) < byName(b) ? -1 : byName(a) > byName(b) ? 1 : 0))) {
+    slugs.set(el, uniqueSlug(slug(el['name']), usedSlugs));
+  }
+
   for (const el of elements) {
     if (!isPlainObject(el)) {
       // Non-object element: keep inline (cannot meaningfully split).
       refs.push(el);
       continue;
     }
-    const slugName = uniqueSlug(slug(el['name']), usedSlugs);
+    const slugName = slugs.get(el)!;
     const { jsonFile, resourceDir } = targetFor(el['name'], slugName);
     const transformed = await explodeResource(el, resourceDir);
     await writeJson(jsonFile, transformed);

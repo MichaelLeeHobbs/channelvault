@@ -88,6 +88,54 @@ function stripVolatile(o: Obj): Obj {
   return out;
 }
 
+const groupsOf = (c: CanonicalConfig): Obj[] => (isObj(c['channelGroups']) ? list(c['channelGroups']['channelGroup']) : []);
+
+/**
+ * `c` without the fields Mirth changes on every save (revisions, timestamps),
+ * so a comparison sees content only. Mirth bumps them on a restore, and on a
+ * save in the Administrator even when nothing changed.
+ */
+export function withoutVolatile(c: CanonicalConfig): CanonicalConfig {
+  const out = structuredClone(c);
+  const strip = (o: Obj): void => {
+    delete o['revision'];
+    delete o['lastModified'];
+    const md = isObj(o['exportData']) ? o['exportData']['metadata'] : undefined;
+    if (isObj(md)) {
+      delete md['lastModified'];
+      delete md['userId'];
+    }
+  };
+  for (const ch of channelsOf(out)) strip(ch);
+  for (const lib of librariesOf(out)) {
+    strip(lib);
+    for (const t of templatesOf(lib)) strip(t);
+  }
+  for (const g of groupsOf(out)) {
+    strip(g);
+    // A group lists its channels with their revisions too.
+    for (const member of isObj(g['channels']) ? list(g['channels']['channel']) : []) delete member['revision'];
+  }
+  return out;
+}
+
+/** Resources the server holds at a newer revision than `tree` (a pull would update their baseline). */
+export function newerOnServer(tree: CanonicalConfig, server: CanonicalConfig): string[] {
+  const out: string[] = [];
+  const compare = (kind: string, local: Obj[], remote: Obj[]) => {
+    const mine = new Map(local.map((o) => [idOf(o), revisionOf(o)]));
+    for (const r of remote) {
+      const rev = mine.get(idOf(r));
+      if (rev !== undefined && revisionOf(r) > rev) out.push(`${kind} "${nameOf(r)}"`);
+    }
+  };
+  compare('channel', channelsOf(tree), channelsOf(server));
+  compare('library', librariesOf(tree), librariesOf(server));
+  compare('code template', librariesOf(tree).flatMap(templatesOf), librariesOf(server).flatMap(templatesOf));
+  compare('channel group', groupsOf(tree), groupsOf(server));
+  return out;
+}
+
 /** A library's own settings and membership, without its templates' contents. */
 function libraryShape(lib: Obj): Obj {
   const out = stripVolatile(lib);
@@ -358,10 +406,15 @@ export function planPush(
   // deletes and one at a time, so a name freed by a delete or rename in the
   // same push is still taken when the save runs. Case-insensitive, to be safe.
   // A whole replace lands at once, so only the result must be free of clashes.
+  // Only a save that introduces a name (a new channel or a rename) is checked:
+  // two channels that already share a name on the server (Mirth allows
+  // "Lab Feed" beside "LAB FEED") can still each be updated.
   const nameKey = (c: Obj) => nameOf(c).toLowerCase();
+  const remoteNames = new Map(channelsOf(remote).map((c) => [idOf(c), nameKey(c)]));
+  const introducesName = (c: Obj) => writtenChannels.has(idOf(c)) && remoteNames.get(idOf(c)) !== nameKey(c);
   const during = opts.wholeReplace ? [] : channelsOf(remote);
   const holders = [...new Map([...during, ...effective.values()].map((c) => [`${idOf(c)}\n${nameKey(c)}`, c])).values()];
-  const clashes = duplicates(holders, nameKey).filter(([, g]) => g.some((c) => writtenChannels.has(idOf(c))));
+  const clashes = duplicates(holders, nameKey).filter(([, g]) => g.some(introducesName));
   if (clashes.length > 0) {
     throw new Error(
       `the push would save a channel under a name another channel holds:\n  ` +

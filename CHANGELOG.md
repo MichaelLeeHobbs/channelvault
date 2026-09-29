@@ -2,6 +2,18 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `diff` compares content: revision numbers and timestamps, which Mirth bumps on any save or restore, no longer count as differences; `diff --json` lists them as `staleRevisions`.
+- Channels whose names collide once made into directory names (`Lab Feed`, `LAB FEED`) keep their directories when the server lists them in another order, as it does after a restore.
+- `push` no longer refuses to update one of two channels that already share a name on the server (Mirth allows `Lab Feed` beside `LAB FEED`); only a new name or a rename is checked.
+
+### Added
+
+- Tests on a production-shaped synthetic mesh (on real Mirth 4.5.2 too) and on 36 public exports from Mirth 3.0 to OIE 4.6.
+
 ## [0.2.0] — 2026-09-29
 
 ### Added

@@ -80,6 +80,19 @@ describe('diff --json', () => {
     expect(r.stderr).toBe('');
   });
 
+  // Mirth bumps revisions on a restore, and on a save in the Administrator that changed nothing.
+  it('ignores a revision bump with no content change, and names it', async () => {
+    const channels = (mirth.config['channels'] as { channel: Array<Record<string, unknown>> }).channel;
+    channels[0]!['revision'] = 5;
+    const r = await run('diff', tree, '--json');
+    expect(r.status, r.stdout).toBe(0);
+    expect(json(r.stdout)).toMatchObject({ clean: true, files: [], staleRevisions: ['channel "Alpha"'] });
+
+    const text = await run('diff', tree);
+    expect(text.stdout).toContain('no differences');
+    expect(text.stderr).toContain("1 resource(s) have a newer revision on the server; pull to update the tree's baseline");
+  });
+
   it('still exits 2 on an error, with the error on stderr', async () => {
     const r = await run('diff', path.join(dir, 'not-a-tree'), '--json');
     expect(r.status).toBe(2);

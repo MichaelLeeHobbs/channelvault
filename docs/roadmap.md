@@ -141,3 +141,10 @@ Dated and not edited afterwards. A later decision replaces an earlier one with a
 - A backup's server is recorded by Mirth's server ID (`GET /server/id`), in a manifest beside the backups, not taken from the name in the file name. The name lives in Server Settings, which a restore or whole-server push copies to another server (verified on 4.5.2: the ID survives a configuration restore). Rotation only deletes files the manifest attributes to the server.
 - `push` backs up first unless `--no-backup`, so every push can be undone.
 - The sequential-save name rule for scoped pushes no longer applies to a whole replace (`--whole-server`, `restore`), which lands in one request; only its result must be free of name clashes.
+
+**2026-09-29: A production-shaped mesh and a public corpus as test data.**
+- The mesh (`scripts/fixtures/generate-mesh.ts`) copies the structure of a real 40-channel configuration (read as counts only, nothing copied): Channel Reader/Writer chains, an 18-destination hub, TCP/MLLP and SMTP senders, JavaScript readers and writers, a 10,000-line template, attachment handlers, mixed storage modes. Its fixture is Mirth's own export after every channel deployed; a channel Mirth cannot deploy is not realistic.
+- Building it found: Rhino rejects shorthand object properties (`{ status }`); an attachment handler needs its provider `className` and a string-map `properties`, and a malformed one makes a whole-configuration restore spin until Mirth runs out of memory; the image's default heap cannot import a large configuration (the test servers now get `-Xmx2g`); the original synthetic fixture's listeners bind to an unresolvable host.
+- Running it on Mirth found two things fixed here: directory names for colliding channel names depended on the server's list order, which a restore changes; and `diff` counted the revision bumps of a restore or an unchanged save as drift, which would make a scheduled drift check fire until the next pull.
+- The corpus: 36 exports from nine permissively licensed projects (Mirth 3.0 to OIE 4.6), pinned by commit and hash. All round-trip exactly, and the value-based secret rules report nothing on them.
+

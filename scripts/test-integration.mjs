@@ -42,7 +42,8 @@ try {
   const [source, target] = [port('source'), port('target')];
   console.log(`Waiting for disposable Mirth servers on localhost:${source} and localhost:${target}`);
   await Promise.all([ready(source), ready(target)]);
-  child = spawn(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', 'test/integration/promotion.test.ts'], {
+  // One file at a time: both suites load their own configuration onto the same servers.
+  child = spawn(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', '--no-file-parallelism', 'test/integration/promotion.test.ts', 'test/integration/mesh.test.ts'], {
     cwd, stdio: 'inherit', env: { ...process.env, CHANNELVAULT_INTEGRATION: '1', CHANNELVAULT_SOURCE_PORT: source, CHANNELVAULT_TARGET_PORT: target },
   });
   const status = await new Promise((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });

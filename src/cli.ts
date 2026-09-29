@@ -30,7 +30,9 @@ import {
   librariesOf,
   savedChangeMatches,
   knownFrom,
+  newerOnServer,
   normalizeEolDeep,
+  withoutVolatile,
   planPush,
   resourceIds,
   sameServerConfig,
@@ -1135,8 +1137,14 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
   // secret held on both sides doesn't read as a difference.
   const allow = await readAllow(root);
   // Line endings are normalised too: push ignores them because Mirth rewrites them on save.
-  const treeView = scanSecrets(redactKnownSecrets(normalizeEolDeep(tree)), { mode: 'redact', allow });
-  const serverView = scanSecrets(redactKnownSecrets(normalizeEolDeep(templatedRemote)), { mode: 'redact', allow });
+  // So are revisions and timestamps, which Mirth bumps on any save or restore:
+  // compare content, and report newer revisions separately.
+  const staleRevisions = newerOnServer(tree, templatedRemote);
+  if (staleRevisions.length > 0) {
+    messages.push(`${staleRevisions.length} resource(s) have a newer revision on the server; pull to update the tree's baseline`);
+  }
+  const treeView = scanSecrets(redactKnownSecrets(normalizeEolDeep(withoutVolatile(tree))), { mode: 'redact', allow });
+  const serverView = scanSecrets(redactKnownSecrets(normalizeEolDeep(withoutVolatile(templatedRemote))), { mode: 'redact', allow });
   if (treeView.findings.length > 0) {
     messages.push(`the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets`);
   }
@@ -1187,7 +1195,7 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
     if (!clean) process.exitCode = 1;
     if (flags.json) {
       const files = await changedFiles(path.join(tmp, 'tree'), path.join(tmp, 'server'));
-      writeJson({ clean, files, secretDrift, notes: messages, patch: out });
+      writeJson({ clean, files, secretDrift, staleRevisions, notes: messages, patch: out });
     } else if (clean) {
       process.stdout.write('no differences — working tree matches the server.\n');
     } else {
