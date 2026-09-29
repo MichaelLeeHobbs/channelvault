@@ -2,7 +2,7 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] — 2026-09-29
 
 ### Added
 
@@ -23,4 +23,5 @@ First release. Tested against Mirth Connect 4.5.2; the offline round trip is als
 - `backup` / `restore`: the server's own configuration XML saved as `.backup/<server>-<UTC time>.xml`, identified by Mirth's server ID, restored with a preview, an undo backup and a version check. `push` backs up first unless `--no-backup`.
 - `diff` exits 0 when the tree matches the server, 1 when it differs, 2 on error.
 
+[0.2.0]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.2.0
 [0.1.0]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.1.0
