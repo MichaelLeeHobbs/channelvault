@@ -76,6 +76,12 @@ channelvault restore [file]                 # backup -> live server (default: ne
 
 `diff` exits 0 when the tree matches the server, 1 when they differ, and 2 on any error (including a bad flag), so a scheduled drift check can tell drift from an outage.
 
+For scripts, CI and AI agents, `status`, `diff` and `push --plan-only` take `--json` and print one JSON document on stdout; errors still go to stderr with the usual exit code.
+
+- `status --json`: `{ root, source, pulledAt, engineVersion, counts }`.
+- `diff --json`: `{ clean, files: [{ path, change }], secretDrift, notes, patch }`, where `change` is `modified`, `only-in-tree` or `only-on-server` and `patch` is the redacted unified diff.
+- `push --plan-only --json`: `{ target, mode, changes: [{ kind, op, id, label }], conflicts, serverOnly, notPushed, wouldStop }` (plus `redeploy` and `notRedeployed` with `--deploy`). `wouldStop` lists what would refuse a real push with the same flags, such as unconfirmed deletions or conflicts.
+
 `pull` and `explode` replace `server/`, `channels/`, `codeTemplates/` and `channelGroups/` in `<dir>`, so they refuse a directory that has any of those but no `channelvault.json`, an unreadable `channelvault.json`, or a `--dotenv` file inside one of those directories. All of this is checked before anything is written.
 
 ## Secrets and per-environment values
@@ -114,6 +120,7 @@ channelvault push ./mirth --library Formatting --deploy  # one library, then red
 - A tree exploded from an XML backup is refused (its shape differs from the live API's); `--ignore-origin` overrides that.
 - Before it changes anything, `push` backs up the server (see below) and prints the `restore` command that undoes it. `--no-backup` skips that.
 - Without a terminal, `push` needs `--yes`.
+- `--plan-only` shows the plan and what would stop it, and changes nothing: no prompt, no backup, no writes. It works without a terminal.
 
 ## Backups
 
@@ -138,6 +145,22 @@ channelvault restore .backup/vns-gov-20260925T143012Z.xml --deploy
   - It saves the server's current configuration first, as a new backup, and prints the command that undoes the restore. That backup is the newest, so a second plain `restore` reverts the first.
   - If the server changes while you confirm, nothing is restored; run it again to review the new state.
   - `--deploy` redeploys every channel afterwards; `--overwrite-config-map` also replaces the configuration map.
+
+## Using channelvault with an AI agent
+
+An agent can safely edit a tree and check its work. Pushing, restoring and anything that needs `--force` should stay with a person, who reads the plan first. Paste this into the agent instructions of your configuration repository (`AGENTS.md`, `CLAUDE.md` or similar) and adjust the paths:
+
+```markdown
+## Mirth configuration (channelvault)
+
+`mirth/` is a channelvault tree of our Mirth Connect server. Channel scripts are the `.js` files under `mirth/channels/<channel>/`, settings are in `channel.json`, and code templates are under `mirth/codeTemplates/<library>/`.
+
+- Edit the `.js` and `.json` files; leave `id`, `revision`, `channelvault.json` and the `{"@file": …}` / `{"@ref": …}` markers alone. A new channel or template needs its own new UUID for `id`; a copied directory keeps the old one.
+- Mirth runs these scripts in Rhino, not Node: no template literals, `async`/`await`, optional chaining (`?.`), classes, `require` or `import`.
+- `{{env:NAME}}` is a placeholder for a secret kept outside git. Never replace one with a real value, and never read, print or copy `.env`, `.secrets/` or `.backup/`.
+- Check your work with `channelvault diff mirth --json` (exit 0: matches the server, 1: differs) and `channelvault push mirth --plan-only --json`, which shows what a push would change and `wouldStop` reasons.
+- Do not run `channelvault push` (other than with `--plan-only`), `restore` or `pull`, and never pass `--force`, `--allow-deletes` or `--yes`. Summarise the plan and let a person push.
+```
 
 ## Local test server
 

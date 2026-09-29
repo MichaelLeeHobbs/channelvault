@@ -34,6 +34,7 @@ A team running Mirth can keep every channel, code template and script in git, re
 4. **Safe to script.**
    - Done: `push` without a terminal fails straight away unless `--yes` is passed.
    - Done: `diff` exits 0 = clean, 1 = differences, 2 = error (documented in the README).
+   - Done: `--json` for `status`, `diff` and `push --plan-only`, and `push --plan-only` itself (the plan and `wouldStop` reasons, changing nothing).
 5. **Secret coverage.**
    - Done (2026-09-24): key names (`*password`, `*secret`, `*token`, `*passphrase`), every configuration-map value, and secrets inside values (URL and connection-string credentials, auth headers, `createDatabaseConnection` calls, script assignments, private keys, known token formats). `pull`/`explode` refuse until each finding is extracted or allowed. On the private 2.7 MB export: 29 by key name, 6 in values, no false positives.
    - Done: DICOM (`passcode`, `keyPW`, `keyStorePW`, `trustStorePW`), `*Key` names, `pass`-style script variables and `set…Password('…')` calls.

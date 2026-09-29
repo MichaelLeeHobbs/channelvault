@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -138,6 +138,24 @@ async function withClient<T>(flags: ConnectionFlags, fn: (client: MirthClientExt
     await client.logout().catch(() => undefined);
     await client.close().catch(() => undefined);
   }
+}
+
+// --- JSON output --------------------------------------------------------------
+
+interface JsonFlags {
+  json?: boolean;
+}
+
+/**
+ * `--json`: one JSON document on stdout, for scripts and agents. Errors still
+ * go to stderr with the command's exit code; notes move into the document.
+ */
+function addJsonFlag(cmd: Command): Command {
+  return cmd.option('--json', 'print the result as one JSON document on stdout', false);
+}
+
+function writeJson(value: unknown): void {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
 // --- backups ------------------------------------------------------------------
@@ -617,20 +635,60 @@ function printChanges(plan: Plan): void {
 }
 
 /** Refuse conflicts and deletions unless the user opted in. */
-function checkPlan(plan: Plan, flags: { allowDeletes?: boolean; force?: boolean }): void {
+function planProblems(plan: Plan, flags: { allowDeletes?: boolean; force?: boolean }): string[] {
+  const problems: string[] = [];
   if (plan.conflicts.length > 0 && !flags.force) {
-    fail(
+    problems.push(
       `changed on the server since the last pull:\n  ${plan.conflicts.join('\n  ')}\n` +
         `pull (and merge) first, or pass --force to overwrite the server's version`,
     );
   }
   const deletes = plan.changes.filter((c) => c.op === 'delete').length;
   if (deletes > 0 && !flags.allowDeletes) {
-    fail(`the plan deletes ${deletes} resource(s) from the server; pass --allow-deletes, or narrow with --channel/--library`);
+    problems.push(`the plan deletes ${deletes} resource(s) from the server; pass --allow-deletes, or narrow with --channel/--library`);
   }
+  return problems;
 }
 
-interface PushFlags extends ConnectionFlags, BackupFlags {
+/** What stops a whole-server replace: the scoped checks, plus resources the tree never had (deleted by a replace). */
+function wholeServerProblems(plan: Plan, flags: { allowDeletes?: boolean; force?: boolean }): string[] {
+  const problems: string[] = [];
+  if (plan.serverOnly.length > 0 && !flags.force) {
+    problems.push('the replace would delete resources created on the server since the last pull; pull first, or pass --force (and --allow-deletes)');
+  }
+  const deletions = plan.changes.filter((c) => c.op === 'delete').length + plan.serverOnly.length;
+  if (deletions > 0 && !flags.allowDeletes) problems.push(`the replace deletes ${deletions} resource(s) from the server; pass --allow-deletes`);
+  if (plan.conflicts.length > 0 && !flags.force) problems.push(...planProblems({ ...plan, changes: [] }, flags));
+  return problems;
+}
+
+/** `push --plan-only`: report the plan and what would stop it, change nothing. */
+function reportPlanOnly(
+  flags: PushFlags,
+  plan: Plan,
+  problems: string[],
+  extra: { target: string; mode: 'scoped' | 'whole-server'; redeploy?: string[]; notRedeployed?: string[] },
+): void {
+  if (flags.json) {
+    writeJson({
+      target: extra.target,
+      mode: extra.mode,
+      changes: plan.changes,
+      conflicts: plan.conflicts,
+      serverOnly: plan.serverOnly,
+      notPushed: plan.notPushed,
+      ...(extra.redeploy ? { redeploy: extra.redeploy, notRedeployed: extra.notRedeployed ?? [] } : {}),
+      wouldStop: problems,
+    });
+    return;
+  }
+  for (const p of problems) process.stdout.write(`a push would stop: ${p}\n`);
+  process.stdout.write('plan only: nothing was changed\n');
+}
+
+interface PushFlags extends ConnectionFlags, BackupFlags, JsonFlags {
+  /** --plan-only: report the plan and what would stop it; change nothing. */
+  planOnly?: boolean;
   allowDeletes?: boolean;
   deploy?: boolean;
   force?: boolean;
@@ -660,6 +718,11 @@ async function scopedPush(
   const toDeploy = plan.deployIds.filter((id) => deployed.has(id));
   const notDeployed = flags.deploy ? plan.deployIds.filter((id) => !deployed.has(id)) : [];
 
+  if (flags.planOnly && flags.json) {
+    const redeploy = flags.deploy ? { redeploy: toDeploy.map(nameOf), notRedeployed: notDeployed.map(nameOf) } : {};
+    reportPlanOnly(flags, plan, planProblems(plan, flags), { target, mode: 'scoped', ...redeploy });
+    return;
+  }
   if (plan.changes.length === 0) {
     process.stdout.write(`nothing to push: ${target} already matches the tree\n`);
   } else {
@@ -676,9 +739,14 @@ async function scopedPush(
   if (plan.serverOnly.length > 0) {
     process.stdout.write(`left alone (created on the server since the last pull; pull to get them): ${plan.serverOnly.join(', ')}\n`);
   }
+  if (flags.planOnly) {
+    reportPlanOnly(flags, plan, planProblems(plan, flags), { target, mode: 'scoped' });
+    return;
+  }
   if (plan.changes.length === 0) return;
 
-  checkPlan(plan, flags);
+  const problems = planProblems(plan, flags);
+  if (problems.length > 0) fail(problems.join('\n'));
   if (!flags.yes && !(await confirm('Continue?'))) {
     process.stdout.write('aborted.\n');
     return;
@@ -738,6 +806,10 @@ async function wholeServerPush(
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
   const plan = planPush(local, remote, {}, known, { wholeReplace: true });
+  if (flags.planOnly && flags.json) {
+    reportPlanOnly(flags, plan, wholeServerProblems(plan, flags), { target, mode: 'whole-server' });
+    return;
+  }
   const s = summarize(local);
   process.stdout.write(
     `Replace the ENTIRE server configuration at ${target} (${s.channels} channels, ${s.codeTemplates} code templates` +
@@ -757,14 +829,12 @@ async function wholeServerPush(
   const replaced = plan.notPushed.filter((k) => !(keptMap && k === 'configurationMap'));
   if (replaced.length > 0) process.stdout.write(`also replaced: ${replaced.join(', ')}\n`);
   if (keptMap) process.stdout.write('configuration map differs but is kept (--overwrite-config-map replaces it)\n');
-  if (plan.serverOnly.length > 0 && !flags.force) {
-    fail('the replace would delete resources created on the server since the last pull; pull first, or pass --force (and --allow-deletes)');
+  const problems = wholeServerProblems(plan, flags);
+  if (flags.planOnly) {
+    reportPlanOnly(flags, plan, problems, { target, mode: 'whole-server' });
+    return;
   }
-  const deletions = plan.changes.filter((c) => c.op === 'delete').length + plan.serverOnly.length;
-  if (deletions > 0 && !flags.allowDeletes) {
-    fail(`the replace deletes ${deletions} resource(s) from the server; pass --allow-deletes`);
-  }
-  checkPlan(plan, flags);
+  if (problems.length > 0) fail(problems.join('\n'));
   if (!flags.yes && !(await confirm('Continue?'))) {
     process.stdout.write('aborted.\n');
     return;
@@ -868,11 +938,13 @@ addBackupDirFlags(addEnvFlag(addConnectionFlags(
     .option('--whole-server', 'replace the entire server configuration instead (settings, config map, groups too)', false)
     .option('--overwrite-config-map', 'with --whole-server: also overwrite the configuration map', false)
     .option('--no-backup', 'skip the backup of the server taken before anything changes')
+    .option('--plan-only', 'show what would be pushed and what would stop it; change nothing (no prompt)', false)
+    .option('--json', 'with --plan-only: print the plan as one JSON document', false)
     .option('-y, --yes', 'skip the confirmation prompt', false),
 ))).action(
   async (
     dir: string,
-    flags: ConnectionFlags & EnvFlags & BackupFlags & {
+    flags: PushFlags & EnvFlags & {
       channel?: string[];
       library?: string[];
       globalScripts?: boolean;
@@ -894,8 +966,9 @@ addBackupDirFlags(addEnvFlag(addConnectionFlags(
     await assertCompatibleOrigin(root, config, 'live', flags.ignoreOrigin === true);
     const cfg = resolveClientConfig(flags);
     const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
-    if (!flags.yes && !process.stdin.isTTY) {
-      fail('no terminal to confirm on; review with `diff` and pass --yes');
+    if (flags.json && !flags.planOnly) fail('--json needs --plan-only');
+    if (!flags.yes && !flags.planOnly && !process.stdin.isTTY) {
+      fail('no terminal to confirm on; review with `push --plan-only` or `diff`, and pass --yes');
     }
     if (flags.wholeServer) {
       await withClient(flags, (client) => wholeServerPush(client, root, config, target, flags));
@@ -1034,7 +1107,7 @@ addBackupDirFlags(addConnectionFlags(
   });
 });
 
-addEnvFlag(addConnectionFlags(
+addJsonFlag(addEnvFlag(addConnectionFlags(
   program
     .command('diff')
     .description('Diff a working tree against the live server configuration (exit 0 = same, 1 = differences, 2 = error)')
@@ -1044,7 +1117,7 @@ addEnvFlag(addConnectionFlags(
       process.exitCode = err.exitCode === 0 ? 0 : 2;
       throw err;
     }),
-)).action(async (dir: string, flags: ConnectionFlags & EnvFlags) => {
+))).action(async (dir: string, flags: ConnectionFlags & EnvFlags & JsonFlags) => {
   errorExitCode = 2;
   const root = path.resolve(dir);
   assertTree(root);
@@ -1054,10 +1127,10 @@ addEnvFlag(addConnectionFlags(
   // Compare like with like: the server's credentials become the placeholders
   // the tree holds. Values that differ from the env file are named, never shown.
   const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, await loadEnv(envFilePath(root, flags)));
-  for (const name of Object.keys(envUpdates)) {
-    process.stderr.write(`note: ${name} differs between the server and the env file\n`);
-  }
-  for (const note of notes) process.stderr.write(`note: ${note}\n`);
+  const messages: string[] = [
+    ...Object.keys(envUpdates).map((name) => `${name} differs between the server and the env file`),
+    ...notes,
+  ];
   // Redact both sides the same way, so neither can print a secret and a raw
   // secret held on both sides doesn't read as a difference.
   const allow = await readAllow(root);
@@ -1065,11 +1138,11 @@ addEnvFlag(addConnectionFlags(
   const treeView = scanSecrets(redactKnownSecrets(normalizeEolDeep(tree)), { mode: 'redact', allow });
   const serverView = scanSecrets(redactKnownSecrets(normalizeEolDeep(templatedRemote)), { mode: 'redact', allow });
   if (treeView.findings.length > 0) {
-    process.stderr.write(`note: the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets\n`);
+    messages.push(`the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets`);
   }
-  if (serverView.findings.length > 0) {
-    process.stderr.write(`note: ${serverView.findings.length} possible secret(s) on the server are redacted below\n`);
-  }
+  if (serverView.findings.length > 0) messages.push(`${serverView.findings.length} possible secret(s) on the server are redacted below`);
+  if (!flags.json) for (const m of messages) process.stderr.write(`note: ${m}\n`);
+
   const tmp = await mkdtemp(path.join(tmpdir(), 'channelvault-diff-'));
   try {
     // Both sides are exploded fresh from their configs, into tmp/tree and
@@ -1110,43 +1183,80 @@ addEnvFlag(addConnectionFlags(
     // A secret changed on the server is drift too, even though both sides show
     // the same placeholder; name it, never its value.
     const secretDrift = Object.keys(envUpdates);
-    if (out === '' && secretDrift.length === 0) {
+    const clean = out === '' && secretDrift.length === 0;
+    if (!clean) process.exitCode = 1;
+    if (flags.json) {
+      const files = await changedFiles(path.join(tmp, 'tree'), path.join(tmp, 'server'));
+      writeJson({ clean, files, secretDrift, notes: messages, patch: out });
+    } else if (clean) {
       process.stdout.write('no differences — working tree matches the server.\n');
     } else {
       if (out !== '') process.stdout.write(out + '\n');
       if (secretDrift.length > 0) {
         process.stdout.write(`secret values differ between the server and the env file: ${secretDrift.join(', ')}\n`);
       }
-      process.exitCode = 1;
     }
   } finally {
     await rm(tmp, RM_OPTS);
   }
 });
 
-program
-  .command('status')
-  .description('Summarize a working tree')
-  .argument('<dir>', 'working-tree directory')
-  .action(async (dir: string) => {
-    const root = path.resolve(dir);
-    assertTree(root);
-    const config = await engine.implode({ root });
-    const s = summarize(config);
-    const metaPath = path.join(root, 'channelvault.json');
-    if (existsSync(metaPath)) {
-      const meta = await readJson<SyncMeta>(metaPath);
-      process.stdout.write(`source:  ${meta.source}\n`);
-      process.stdout.write(`pulled:  ${meta.pulledAt}\n`);
-      process.stdout.write(`engine:  ${meta.engineVersion ?? 'unknown'}\n`);
+/**
+ * Files that differ between two exploded trees, by path relative to the
+ * working tree. Both sides were normalised to LF before exploding, so a byte
+ * comparison agrees with the patch.
+ */
+async function changedFiles(treeDir: string, serverDir: string): Promise<Array<{ path: string; change: 'modified' | 'only-in-tree' | 'only-on-server' }>> {
+  const list = async (base: string): Promise<string[]> => {
+    const out: string[] = [];
+    for (const d of MANAGED_DIRS) {
+      if (!existsSync(path.join(base, d))) continue;
+      for (const entry of await readdir(path.join(base, d), { recursive: true, withFileTypes: true })) {
+        if (entry.isFile()) out.push(path.relative(base, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'));
+      }
     }
-    process.stdout.write(
-      `channels:               ${s.channels}\n` +
-        `channel groups:         ${s.channelGroups}\n` +
-        `code template libs:     ${s.codeTemplateLibraries}\n` +
-        `code templates:         ${s.codeTemplates}\n`,
-    );
-  });
+    return out;
+  };
+  const [local, remote] = await Promise.all([list(treeDir), list(serverDir)]);
+  const remoteSet = new Set(remote);
+  const files: Array<{ path: string; change: 'modified' | 'only-in-tree' | 'only-on-server' }> = [];
+  for (const p of local) {
+    if (!remoteSet.has(p)) files.push({ path: p, change: 'only-in-tree' });
+    else if ((await readFile(path.join(treeDir, p), 'utf8')) !== (await readFile(path.join(serverDir, p), 'utf8'))) files.push({ path: p, change: 'modified' });
+  }
+  const localSet = new Set(local);
+  for (const p of remote) if (!localSet.has(p)) files.push({ path: p, change: 'only-on-server' });
+  return files.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+addJsonFlag(
+  program
+    .command('status')
+    .description('Summarize a working tree')
+    .argument('<dir>', 'working-tree directory'),
+).action(async (dir: string, flags: JsonFlags) => {
+  const root = path.resolve(dir);
+  assertTree(root);
+  const config = await engine.implode({ root });
+  const s = summarize(config);
+  const metaPath = path.join(root, 'channelvault.json');
+  const meta = existsSync(metaPath) ? await readJson<SyncMeta>(metaPath) : null;
+  if (flags.json) {
+    writeJson({ root, source: meta?.source ?? null, pulledAt: meta?.pulledAt ?? null, engineVersion: meta?.engineVersion ?? null, counts: s });
+    return;
+  }
+  if (meta) {
+    process.stdout.write(`source:  ${meta.source}\n`);
+    process.stdout.write(`pulled:  ${meta.pulledAt}\n`);
+    process.stdout.write(`engine:  ${meta.engineVersion ?? 'unknown'}\n`);
+  }
+  process.stdout.write(
+    `channels:               ${s.channels}\n` +
+      `channel groups:         ${s.channelGroups}\n` +
+      `code template libs:     ${s.codeTemplateLibraries}\n` +
+      `code templates:         ${s.codeTemplates}\n`,
+  );
+});
 
 program.parseAsync().catch((err: unknown) => {
   // Commander has already printed it and set the exit code.
