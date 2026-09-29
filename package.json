@@ -1,6 +1,6 @@
 {
   "name": "@ubercode/channelvault",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Git-style pull/push/diff for Mirth Connect (NextGen Connect / OIE / BridgeLink). Explodes a server config into a git-friendly directory tree and back.",
   "keywords": [
     "mirth",
