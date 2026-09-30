@@ -133,7 +133,7 @@ describe('createMirthClient', () => {
       headers.append('set-cookie', 'ROUTEID=node2; Path=/');
       fetchMock
         .mockResolvedValueOnce(new Response(JSON.stringify(LOGIN_SUCCESS), { headers }))
-        .mockResolvedValueOnce(jsonResponse({ serverConfiguration: {} }));
+        .mockResolvedValueOnce(jsonResponse({ serverConfiguration: { '@version': '4.4.0', channels: null } }));
 
       await createMirthClient(CONFIG).getServerConfiguration();
       expect(call(1)[1].headers.Cookie).toBe('JSESSIONID=abc123; ROUTEID=node2');
@@ -151,6 +151,39 @@ describe('createMirthClient', () => {
   });
 
   describe('getServerConfiguration()', () => {
+    it.each([
+      null, [], {}, { error: 'unavailable' }, { serverConfiguration: {} },
+      { other: { '@version': '4.5.2', channels: null } },
+      { serverConfiguration: { '@version': '4.5.2' } },
+      { serverConfiguration: { '@version': 'invalid', channels: null } },
+      { serverConfiguration: { '@version': '4.5.2', channels: [] } },
+      { serverConfiguration: { '@version': '4.5.2', channels: { error: 'truncated' } } },
+      { serverConfiguration: { '@version': '4.5.2', channels: { channel: [{}] } } },
+      { serverConfiguration: { '@version': '4.5.2', channels: { channel: { id: 'c1', name: 'Alpha', revision: -1 } } } },
+      { serverConfiguration: { '@version': '4.5.2', channels: null, codeTemplateLibraries: { codeTemplateLibrary: [null] } } },
+      { serverConfiguration: { '@version': '4.5.2', channels: null, codeTemplateLibraries: { codeTemplateLibrary: { id: 'L1', name: 'Helpers', codeTemplates: 'bad' } } } },
+    ])('refuses malformed snapshot %j', async payload => {
+      fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(jsonResponse(payload));
+      const client = createMirthClient(CONFIG);
+      try { await expect(client.getServerConfiguration()).rejects.toThrow('invalid server configuration response'); }
+      finally { await client.close(); }
+    });
+
+    it.each([null, '', {}, { channel: [] }, { channel: { id: 'c1', name: 'Alpha', revision: 1 } }])('preserves valid empty/single/list collections and plugin data (%j)', async channels => {
+      const config = { '@version': '4.5.2', channels, customPlugin: { nested: { enabled: true } } };
+      fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(jsonResponse({ serverConfiguration: config }));
+      const client = createMirthClient(CONFIG);
+      try { expect(await client.getServerConfiguration()).toEqual(config); }
+      finally { await client.close(); }
+    });
+
+    it('refuses a non-JSON success response without echoing its body', async () => {
+      fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(new Response('<html>credential-fixture</html>'));
+      const client = createMirthClient(CONFIG);
+      try { await expect(client.getServerConfiguration()).rejects.toThrow('invalid server configuration response: expected JSON'); }
+      finally { await client.close(); }
+    });
+
     it('auto-logs in then GETs /api/server/configuration and unwraps the wrapper', async () => {
       const inner = { date: '123', channels: { channel: [] }, '@version': '4.4.0' };
       fetchMock
@@ -174,15 +207,14 @@ describe('createMirthClient', () => {
       expect(getInit.headers.Cookie).toContain('JSESSIONID=abc123');
     });
 
-    it('returns the object as-is when there is no single-key wrapper', async () => {
+    it('refuses arbitrary objects without the configuration wrapper', async () => {
       const multi = { a: '1', b: '2' };
       fetchMock
         .mockResolvedValueOnce(loginResponse())
         .mockResolvedValueOnce(jsonResponse(multi));
 
       const client = createMirthClient(CONFIG);
-      const cfg = await client.getServerConfiguration();
-      expect(cfg).toEqual(multi);
+      await expect(client.getServerConfiguration()).rejects.toThrow('expected the serverConfiguration wrapper');
     });
   });
 
@@ -279,7 +311,7 @@ describe('createMirthClient', () => {
 
   describe('401 re-auth', () => {
     it('triggers exactly one re-login + retry on a 401 after auth', async () => {
-      const inner = { ok: 'yes' };
+      const inner = { '@version': '4.4.0', channels: null };
       fetchMock
         .mockResolvedValueOnce(loginResponse()) // initial login
         .mockResolvedValueOnce(new Response(null, { status: 401 })) // GET -> 401
