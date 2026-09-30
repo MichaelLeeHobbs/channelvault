@@ -85,6 +85,8 @@ For scripts, CI and AI agents, `status`, `diff` and `push --plan-only` take `--j
 
 `pull` and `explode` replace `server/`, `channels/`, `codeTemplates/` and `channelGroups/` in `<dir>`, so they refuse a directory that has any of those but no `channelvault.json`, an unreadable `channelvault.json`, or a `--dotenv` file inside one of those directories. All of this is checked before anything is written.
 
+Replacement is staged with its metadata, ignore rules, secret history and env updates. The previous generation is retained until every swap completes; a failed swap rolls back the whole generation. After an interrupted process, the next tree command recovers the journal before reading the tree (use the same `--dotenv` selection; `status` accepts it too). Commands hold a working-tree lock, including readers. A live lock refuses another command; abandoned locks belonging to a dead process on this host are recovered. An unreadable lock or a lock from another host requires inspection before removal. The env file may be on another volume and is replaced through files beside it.
+
 ## Secrets and per-environment values
 
 `explode` and `pull` keep the credentials they detect out of the tree. Detection is heuristic (see below), so review a first pull of a real server before committing it. Fields named like credentials (passwords, passphrases, passcodes, tokens, secrets, API/access/private keys, and DICOM's `keyPW`, `keyStorePW` and `trustStorePW`), and every configuration-map value, become `{{env:NAME}}` placeholders, and their values go to `<dir>/.env`, which is added to the tree's `.gitignore`. `push` and `implode` fill the placeholders back in and refuse to run if any are missing, naming each one.
