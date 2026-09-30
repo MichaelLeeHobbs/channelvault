@@ -549,17 +549,23 @@ export function changedSince(plan: Plan, before: CanonicalConfig, after: Canonic
     else if (c.kind === 'library') [b, a] = [lb.get(c.id), la.get(c.id)];
     else if (!same(before['globalScripts'], after['globalScripts'])) out.push('global scripts');
     if (c.kind === 'globalScripts') continue;
-    const existed = b !== undefined;
-    const exists = a !== undefined;
-    if (existed !== exists || (a && b && revisionOf(a) !== revisionOf(b))) out.push(`${c.kind} "${c.label}"`);
+    if (resourceChanged(c.kind, b, a)) out.push(`${c.kind} "${c.label}"`);
   }
   // The library-list save replaces every library, not just the planned ones:
   // any library added, removed or changed meanwhile would be reverted.
   if (plan.changes.some((c) => c.kind === 'library')) {
-    const shape = (m: Map<string, Obj>) => [...m].map(([id, l]) => `${id}@${revisionOf(l)}`).sort().join(',');
-    if (shape(lb) !== shape(la)) out.push('code template libraries (the library list is saved as a whole)');
+    if (lb.size !== la.size || [...lb].some(([id, l]) => resourceChanged('library', l, la.get(id)))) {
+      out.push('code template libraries (the library list is saved as a whole)');
+    }
   }
   return [...new Set(out)];
+}
+
+/** A revision can reset or stay unchanged, so compare the content too. */
+export function resourceChanged(kind: Change['kind'], before: Obj | undefined, after: Obj | undefined): boolean {
+  if (!before || !after) return before !== after;
+  const shape = kind === 'library' ? libraryShape : stripVolatile;
+  return revisionOf(before) !== revisionOf(after) || !same(shape(before), shape(after));
 }
 
 /** Two server configurations hold the same data (ignoring the export `date`, which every GET changes). */

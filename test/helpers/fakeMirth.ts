@@ -8,6 +8,7 @@ import type { AddressInfo } from 'node:net';
 
 import type { CanonicalConfig, Json } from '../../src/types.js';
 import { XmlConfigAdapter } from '../../src/xml/index.js';
+import { librariesOf, templatesOf } from '../../src/push/index.js';
 
 const xml = new XmlConfigAdapter();
 
@@ -39,6 +40,11 @@ export interface FakeMirth {
 
 export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth> {
   const state: FakeMirth = { port: 0, config: structuredClone(config), writes: [], requests: [], deployed: new Set(), serverId: randomUUID(), close: async () => undefined };
+  const standaloneTemplates = new Map<string, Obj>();
+  const rememberTemplates = () => {
+    for (const t of librariesOf(state.config).flatMap(templatesOf)) standaloneTemplates.set(String(t.id), t);
+  };
+  rememberTemplates();
   const server: Server = createServer((req, res) => {
     let body = '';
     req.on('data', (c: Buffer) => (body += c.toString('utf8')));
@@ -70,6 +76,7 @@ export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth
         return res.end(state.serverId);
       }
       if (req.method === 'GET' && url.pathname === '/api/server/configuration') {
+        rememberTemplates();
         if (wantsXml) {
           res.writeHead(200, { 'Content-Type': 'application/xml' });
           return res.end(xml.build(asXmlShape(state.config) as CanonicalConfig));
@@ -86,6 +93,38 @@ export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth
       }
       if (req.method === 'GET' && url.pathname === '/api/channels/statuses') {
         return json(200, { list: { dashboardStatus: [...state.deployed].map(channelId => ({ channelId })) } });
+      }
+      const templateMatch = /^\/api\/codeTemplates\/([^/]+)$/.exec(url.pathname);
+      if (templateMatch) {
+        rememberTemplates();
+        const id = decodeURIComponent(templateMatch[1]!);
+        if (req.method === 'GET') return json(200, { codeTemplate: standaloneTemplates.get(id) ?? null });
+        if (req.method === 'PUT') {
+          const t = (JSON.parse(body) as { codeTemplate: Obj }).codeTemplate;
+          t.revision = Number(standaloneTemplates.get(id)?.revision ?? 0) + 1;
+          standaloneTemplates.set(id, t);
+          for (const lib of librariesOf(state.config)) {
+            const members = templatesOf(lib);
+            if (members.some(m => m.id === id)) lib.codeTemplates = { codeTemplate: members.map(m => m.id === id ? t : m) };
+          }
+          return json(200, { boolean: true });
+        }
+        if (req.method === 'DELETE') {
+          standaloneTemplates.delete(id);
+          for (const lib of librariesOf(state.config)) lib.codeTemplates = { codeTemplate: templatesOf(lib).filter(t => t.id !== id) };
+          return json(200, {});
+        }
+      }
+      if (req.method === 'PUT' && url.pathname === '/api/codeTemplateLibraries') {
+        rememberTemplates();
+        const before = new Map(librariesOf(state.config).map(l => [String(l.id), l]));
+        const libs = (JSON.parse(body) as { list: { codeTemplateLibrary: Obj[] } }).list.codeTemplateLibrary;
+        for (const lib of libs) {
+          lib.revision = Number(before.get(String(lib.id))?.revision ?? 0) + 1;
+          lib.codeTemplates = { codeTemplate: templatesOf(lib).map(t => standaloneTemplates.get(String(t.id)) ?? t) };
+        }
+        state.config.codeTemplateLibraries = { codeTemplateLibrary: libs };
+        return json(200, { boolean: true });
       }
       const match = /^\/api\/channels\/([^/]+)(\/_deploy)?$/.exec(url.pathname);
       if (match) {

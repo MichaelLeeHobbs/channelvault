@@ -752,7 +752,12 @@ async function scopedPush(
   // Apply against the fresh snapshot, so whatever is sent for resources
   // outside the plan (the rest of the library list) is the server's latest.
   await backupBeforePush(client, flags);
-  const result = await applyPlan(client, plan, local, fresh, scope, { force: flags.force === true });
+  const afterBackup = await client.getServerConfiguration();
+  const changedDuringBackup = changedSince(plan, fresh, afterBackup);
+  if (!flags.force && changedDuringBackup.length) {
+    fail(`changed on the server during backup: ${changedDuringBackup.join(', ')}; pull and try again`);
+  }
+  const result = await applyPlan(client, plan, local, afterBackup, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
   // resources that did go through don't read as conflicts next time.
   try {
@@ -839,6 +844,12 @@ async function wholeServerPush(
     fail('the replace now deletes resources from the server; review the new plan and pass --allow-deletes');
   }
   await backupBeforePush(client, flags);
+  const afterBackup = await client.getServerConfiguration();
+  if (!sameServerConfig(fresh, afterBackup) && !flags.force) fail('the server changed during backup; pull and try again');
+  const finalPlan = planPush(local, afterBackup, {}, known, { wholeReplace: true });
+  if (!flags.allowDeletes && (finalPlan.serverOnly.length || finalPlan.changes.some(c => c.op === 'delete'))) {
+    fail('the replace now deletes resources from the server; review the new plan and pass --allow-deletes');
+  }
   await client.putServerConfiguration(local, {
     deploy: flags.deploy === true,
     overwriteConfigMap: flags.overwriteConfigMap === true,
@@ -1084,6 +1095,11 @@ addBackupDirFlags(addConnectionFlags(
     // restored is protected from rotation.
     const undo = await saveServerBackup(client, freshText, flags, chosen);
     process.stdout.write(`saved the current configuration to ${undo} (undo with: channelvault restore "${undo}")\n`);
+
+    const afterBackup = parseBackup(await client.getServerConfigurationXml(), 'the server configuration');
+    if (!sameServerConfig(parseBackup(freshText, 'the server configuration'), afterBackup)) {
+      fail('the server changed during the undo backup; nothing was restored. Run it again to review the new state');
+    }
 
     await client.putServerConfigurationXml(text, { deploy: flags.deploy === true, overwriteConfigMap: flags.overwriteConfigMap === true });
     const after = parseBackup(await client.getServerConfigurationXml(), 'the server configuration');
