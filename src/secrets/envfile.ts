@@ -139,7 +139,7 @@ export async function backupEnvFile(file: string, updates: Record<string, string
 const IGNORE_LINES = ['.env', '.env.*', '!.env.example', '.secrets/'];
 
 /** Make sure `dir/.gitignore` keeps env files out of git. Returns true if it changed. */
-export async function ensureEnvIgnored(dir: string, envFile?: string): Promise<boolean> {
+export async function ensureEnvIgnored(dir: string, envFile?: string, treeRoot = dir): Promise<boolean> {
   const file = path.join(dir, '.gitignore');
   const text = existsSync(file) ? await readFile(file, 'utf8') : '';
   const present = new Set(text.split(/\r?\n/).map((l) => l.trim()));
@@ -147,7 +147,7 @@ export async function ensureEnvIgnored(dir: string, envFile?: string): Promise<b
   // The chosen env file itself, when the standard patterns miss its name
   // (e.g. `--dotenv secrets.prod`).
   if (envFile) {
-    const rel = path.relative(dir, envFile).split(path.sep).join('/');
+    const rel = path.relative(treeRoot, envFile).split(path.sep).join('/');
     const base = path.basename(envFile);
     const covered = !rel.includes('/') && (base === '.env' || (base.startsWith('.env.') && base !== '.env.example'));
     if (!covered && !rel.startsWith('..') && !path.isAbsolute(rel)) wanted.push(`/${rel}`);

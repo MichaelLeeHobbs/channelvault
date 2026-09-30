@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -48,6 +48,7 @@ import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secr
 import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_BACKUP_DIR, DEFAULT_KEEP, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
 import { readJson } from './json.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
+import { JOURNAL, lockTree, MANAGED_DIRS, recoverTree, replaceTree, STAGING_DIR } from './tree/transaction.js';
 
 const engine = createExplodeEngine();
 const xml = new XmlConfigAdapter();
@@ -71,12 +72,6 @@ function fail(message: string): never {
 
 /** Exit status for an error. `diff` uses 2, because its 1 means "differences found". */
 let errorExitCode = 1;
-
-/** Directories under a working tree that `explode` owns (cleared before a pull). */
-const MANAGED_DIRS = ['server', 'channels', 'codeTemplates', 'channelGroups'];
-
-/** Where `replaceTree` explodes before swapping in; removed before and after. */
-const STAGING_DIR = '.channelvault-staging';
 
 /**
  * Recursive-remove options. `maxRetries` is essential on Windows, where a
@@ -299,7 +294,7 @@ async function writeMeta(root: string, source: string, config: CanonicalConfig, 
   // A pull that changed nothing else must not leave a timestamp-only change
   // for git to show.
   const file = path.join(root, 'channelvault.json');
-  if (previous && JSON.stringify({ ...previous, pulledAt: '' }) === JSON.stringify({ ...meta, pulledAt: '' })) return;
+  if (previous && JSON.stringify({ ...previous, pulledAt: '' }) === JSON.stringify({ ...meta, pulledAt: '' })) meta.pulledAt = previous.pulledAt;
   await writeFile(file, JSON.stringify(meta, null, 2) + '\n', 'utf8');
 }
 
@@ -417,19 +412,30 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   // text; say where (the env file's own values only, not all of process.env).
   const echoes = findEchoes(config, { ...(await readEnvFile(envFile)), ...envUpdates });
 
-  // Secrets first: a tree whose placeholders have no values behind them is
-  // the one state a pull must never leave. If the env file can't be written,
-  // the tree is untouched.
-  await mkdir(root, { recursive: true });
-  await mkdir(path.dirname(envFile), { recursive: true });
   const rel = path.relative(root, envFile);
   const envInTree = !rel.startsWith('..') && !path.isAbsolute(rel);
-  const backup = await backupEnvFile(envFile, envUpdates, path.join(root, '.secrets'));
-  if (backup || (envInTree && Object.keys(envUpdates).length > 0)) await ensureEnvIgnored(root, envInTree ? envFile : undefined);
-  await updateEnvFile(envFile, envUpdates);
-
-  await replaceTree(root, config);
-  await writeMeta(root, source, fetched, previousMeta);
+  let backup: string | null = null;
+  await replaceTree(root, envFile, async next => {
+    await engine.explode(config, { root: next });
+    await writeMeta(next, source, fetched, previousMeta);
+    if (Object.keys(envUpdates).length > 0) {
+      const history = path.join(root, '.secrets');
+      if (existsSync(history)) {
+        if ((await lstat(history)).isSymbolicLink()) fail(`refusing a linked secret history directory: ${history}`);
+        await cp(history, path.join(next, '.secrets'), { recursive: true });
+      }
+      const stagedBackup = await backupEnvFile(envFile, envUpdates, path.join(next, '.secrets'));
+      if (stagedBackup) backup = path.join(root, '.secrets', path.basename(stagedBackup));
+      if (backup || envInTree) {
+        const ignore = path.join(root, '.gitignore');
+        if (existsSync(ignore)) await writeFile(path.join(next, '.gitignore'), await readFile(ignore));
+        await ensureEnvIgnored(next, envInTree ? envFile : undefined, root);
+      }
+      const stagedEnv = path.join(next, '.env');
+      if (existsSync(envFile)) await writeFile(stagedEnv, await readFile(envFile), { mode: 0o600 });
+      await updateEnvFile(stagedEnv, envUpdates);
+    }
+  });
   if (scan.findings.length > 0) process.stdout.write(`extracted ${scan.findings.length} secret(s) found in values\n`);
   const updated = Object.keys(envUpdates).length;
   if (updated > 0) process.stdout.write(`stored ${updated} secret value(s) in ${envFile}\n`);
@@ -479,7 +485,7 @@ async function preflightTree(root: string, envFile: string): Promise<SyncMeta | 
   // the path given (a link inside one is removed with it) nor by where links
   // lead.
   const [realRoot, realEnv] = await Promise.all([resolvedPath(root), resolvedPath(envFile)]);
-  const doomed = [...MANAGED_DIRS, STAGING_DIR].find(
+  const doomed = [...MANAGED_DIRS, STAGING_DIR, JOURNAL, 'channelvault.json', '.gitignore', '.secrets'].find(
     (d) => isWithin(path.resolve(envFile), path.resolve(root, d)) || isWithin(realEnv, path.join(realRoot, d)),
   );
   if (doomed) fail(`the env file ${envFile} is inside ${doomed}/, which this command replaces; keep it elsewhere`);
@@ -511,26 +517,6 @@ async function preflightTree(root: string, envFile: string): Promise<SyncMeta | 
   }
   return null;
 }
-
-/**
- * Explode into a staging directory inside the tree, then swap it in one
- * managed directory at a time. A failure while exploding leaves the old tree
- * as it was; only the swap itself (a few renames) can be interrupted.
- */
-async function replaceTree(root: string, config: CanonicalConfig): Promise<void> {
-  const staging = path.join(root, STAGING_DIR);
-  await rm(staging, RM_OPTS);
-  try {
-    await engine.explode(config, { root: staging });
-    for (const d of MANAGED_DIRS) {
-      await rm(path.join(root, d), RM_OPTS);
-      if (existsSync(path.join(staging, d))) await rename(path.join(staging, d), path.join(root, d));
-    }
-  } finally {
-    await rm(staging, RM_OPTS);
-  }
-}
-
 
 function assertTree(root: string): void {
   if (!existsSync(path.join(root, 'server', 'configuration.json'))) {
@@ -1237,12 +1223,12 @@ async function changedFiles(treeDir: string, serverDir: string): Promise<Array<{
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
 
-addJsonFlag(
+addJsonFlag(addEnvFlag(
   program
     .command('status')
     .description('Summarize a working tree')
     .argument('<dir>', 'working-tree directory'),
-).action(async (dir: string, flags: JsonFlags) => {
+)).action(async (dir: string, flags: JsonFlags & EnvFlags) => {
   const root = path.resolve(dir);
   assertTree(root);
   const config = await engine.implode({ root });
@@ -1266,6 +1252,16 @@ addJsonFlag(
   );
 });
 
+let unlock: (() => Promise<void>) | undefined;
+program.hook('preAction', async (_program, command) => {
+  const name = command.name();
+  if (!['explode', 'pull', 'push', 'implode', 'diff', 'status'].includes(name)) return;
+  if (name === 'diff') errorExitCode = 2;
+  const root = path.resolve(String(command.processedArgs[name === 'explode' ? 1 : 0]));
+  unlock = await lockTree(root);
+  await recoverTree(root, envFilePath(root, command.opts<EnvFlags>()));
+});
+
 program.parseAsync().catch((err: unknown) => {
   // Commander has already printed it and set the exit code.
   if (err instanceof CommanderError) return;
@@ -1281,4 +1277,12 @@ program.parseAsync().catch((err: unknown) => {
     process.stderr.write(`${scrub(err.stack ?? '')}\n`);
   }
   process.exitCode = errorExitCode;
+}).finally(async () => {
+  if (unlock) {
+    try { await unlock(); }
+    catch (err) {
+      process.stderr.write(`error: could not release working-tree lock: ${scrub(err instanceof Error ? err.message : String(err))}\n`);
+      process.exitCode = errorExitCode;
+    }
+  }
 });

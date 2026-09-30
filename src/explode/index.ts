@@ -945,6 +945,9 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
 
 async function implode(opts: ExplodeOptions): Promise<CanonicalConfig> {
   const root = path.resolve(opts.root);
+  if (existsSync(path.join(root, '.channelvault-transaction.json'))) {
+    throw new Error('working tree has a pending replacement; run a channelvault CLI command with the original --dotenv selection to recover it before reading');
+  }
   const serverDir = path.join(root, 'server');
   const configPath = path.join(serverDir, 'configuration.json');
   const parsed = await readJson<Json>(configPath);
