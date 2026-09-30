@@ -117,9 +117,12 @@ describe.skipIf(!enabled)('two disposable Mirth 4.5.2 servers', () => {
     const args = ['push', targetTree, '--insecure', '--yes', '--channel', selectedName, '--dotenv', destinationEnv, '--backup-dir', path.join(work, 'backups')];
     const refused = await runCli(args, env(targetPort));
     expect(refused.status).toBe(1);
-    expect(refused.stderr).toContain('server revision');
+    expect(refused.stderr).toContain('installation binding');
     expect(await target.getChannel(id)).toEqual(targetBefore);
-    const pushed = await runCli([...args, '--force'], env(targetPort));
+    const adopted = await runCli(['adopt', targetTree, '--insecure', '--yes', '--dotenv', destinationEnv], env(targetPort));
+    expect(adopted.status, adopted.stderr).toBe(0);
+    expect(await target.getChannel(id)).toEqual(targetBefore);
+    const pushed = await runCli(args, env(targetPort));
     expect(pushed.status, pushed.stderr).toBe(0);
     const promoted = (await target.getChannel(id))!;
     expect(promoted['deployScript']).toBe(promotedCode.replace(/\r\n?/g, '\n'));

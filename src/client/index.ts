@@ -286,7 +286,9 @@ class MirthClientImpl implements MirthClientExt {
   async getServerId(): Promise<string> {
     // JSON is refused (406); the ID comes as plain text.
     const response = await this.request('GET', '/server/id', { headers: { Accept: 'text/plain' } });
-    return (await response.text()).trim();
+    const id = (await response.text()).trim();
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id)) throw new Error('the server returned an invalid installation ID');
+    return id;
   }
 
   async getServerConfigurationXml(): Promise<string> {

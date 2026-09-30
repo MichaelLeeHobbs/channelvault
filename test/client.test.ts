@@ -52,6 +52,12 @@ afterEach(() => {
 });
 
 describe('createMirthClient', () => {
+  it.each(['', '{}', 'not-an-installation-id'])('refuses an invalid installation ID %j', async id => {
+    fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(new Response(id));
+    const client = createMirthClient(CONFIG);
+    try { await expect(client.getServerId()).rejects.toThrow('invalid installation ID'); }
+    finally { await client.close(); }
+  });
   it('reads a standalone template with its revision', async () => {
     fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(jsonResponse({ codeTemplate: { id: 't1', revision: 2, properties: { code: 'return;' } } }));
     const client = createMirthClient(CONFIG);

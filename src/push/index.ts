@@ -216,6 +216,26 @@ export function resourceIds(c: CanonicalConfig): Known {
   };
 }
 
+/** A reviewed destination baseline: use its revisions, without claiming unfamiliar resources. */
+export function adoptTarget(local: CanonicalConfig, target: CanonicalConfig): { config: CanonicalConfig; known: Known } {
+  const config = structuredClone(local);
+  const mine = resourceIds(local);
+  const theirs = resourceIds(target);
+  const intersect = (key: 'channels' | 'libraries' | 'codeTemplates') =>
+    Object.fromEntries(Object.entries(theirs[key]).filter(([id]) => id in mine[key]));
+  const known: Known = {
+    channels: intersect('channels'), libraries: intersect('libraries'), codeTemplates: intersect('codeTemplates'),
+    globalScripts: theirs.globalScripts,
+  };
+  const rebase = (items: Obj[], revisions: Known['channels']) => {
+    for (const item of items) item['revision'] = revisions[idOf(item)] ?? 0;
+  };
+  rebase(channelsOf(config), theirs.channels);
+  rebase(librariesOf(config), theirs.libraries);
+  rebase(librariesOf(config).flatMap(templatesOf), theirs.codeTemplates);
+  return { config, known };
+}
+
 /** Accept the older id-list form of the baseline (no revisions). */
 export function knownFrom(raw: unknown): Known | undefined {
   if (!isObj(raw as Json)) return undefined;

@@ -176,8 +176,9 @@ describe('CLI partial pushes', () => {
       json.globalScripts = { entry: [{ string: ['Deploy', 'local();'] }] };
       await writeFile(file, JSON.stringify(json));
     } else await edit('Alpha');
+    let idReads = 0;
     mirth.onRequest = req => {
-      if (req.path === '/api/server/id') {
+      if (req.path === '/api/server/id' && ++idReads === 2) {
         if (kind === 'global') mirth.config.globalScripts = { entry: [{ string: ['Deploy', 'colleague();'] }] };
         else { channelsOf(mirth.config)[0]!.revision = 2; channelsOf(mirth.config)[0]!.deployScript = 'colleague();'; }
       }
@@ -207,8 +208,9 @@ describe('CLI partial pushes', () => {
 
   it('requires deletion consent for a resource appearing during a forced whole-server backup', async () => {
     await edit('Alpha');
+    let idReads = 0;
     mirth.onRequest = req => {
-      if (req.path === '/api/server/id') mirth.config.channels = { channel: [...channelsOf(mirth.config), { id: 'c4', name: 'Created During Backup', revision: 1 }] };
+      if (req.path === '/api/server/id' && ++idReads === 2) mirth.config.channels = { channel: [...channelsOf(mirth.config), { id: 'c4', name: 'Created During Backup', revision: 1 }] };
     };
     const result = await runCli(pushArgs('--yes', '--whole-server', '--force'), env);
     expect(result.status).toBe(1);
@@ -324,8 +326,9 @@ describe('CLI partial pushes', () => {
   it.each(['backup', 'save', 'previous redeploy'])('skips an operator undeploy during %s', async when => {
     await Promise.all(['Alpha', 'Beta'].map(edit));
     mirth.deployed = new Set(['c1', 'c2']);
+    let idReads = 0;
     mirth.onRequest = req => {
-      if ((when === 'backup' && req.path === '/api/server/id') ||
+      if ((when === 'backup' && req.path === '/api/server/id' && ++idReads === 2) ||
           (when === 'save' && req.method === 'PUT' && req.path === '/api/channels/c2') ||
           (when === 'previous redeploy' && req.path === '/api/channels/c1/_deploy')) {
         mirth.deployed.delete('c2');
