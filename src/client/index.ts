@@ -25,6 +25,7 @@ import { Agent } from 'undici';
 import { redactSecretsInText } from '../secrets/detect.js';
 import { isSecretKey } from '../secrets/index.js';
 import type { ApiError, CanonicalConfig, ClientConfig, MirthClient } from '../types.js';
+import { liveConfiguration } from './validate.js';
 
 /** TLS verification failures, typically a self-signed or privately issued server certificate. */
 export const UNTRUSTED_CERT_CODES: ReadonlySet<string> = new Set([
@@ -243,17 +244,18 @@ class MirthClientImpl implements MirthClientExt {
   /**
    * GET /server/configuration -> canonical config.
    *
-   * Requests JSON, parses it, and unwraps the single top-level
-   * `serverConfiguration` key (defensively: any single-key wrapper is unwrapped;
-   * a multi-key object is returned as-is).
+   * Requests JSON and validates the envelope and core resource collections
+   * before this snapshot can be used to replace a tree or plan server writes.
    */
   async getServerConfiguration(): Promise<CanonicalConfig> {
     const response = await this.request('GET', '/server/configuration', {
       headers: { Accept: 'application/json' },
     });
 
-    const json = (await response.json()) as Record<string, unknown>;
-    return unwrapSingleKey(json) as CanonicalConfig;
+    let json: unknown;
+    try { json = await response.json(); }
+    catch { throw new Error('invalid server configuration response: expected JSON'); }
+    return liveConfiguration(json);
   }
 
   /**
