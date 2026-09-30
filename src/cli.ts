@@ -765,7 +765,10 @@ async function scopedPush(
     const refreshedLibraries: Change[] = librariesOf(local)
       .filter(l => result.touchedIds.has(String(l['id'])))
       .map(l => ({ kind: 'library', op: 'update', id: String(l['id']), label: String(l['name']) }));
-    const changedAgain = [...result.applied, ...refreshedLibraries].filter(c => !savedChangeMatches(c, local, after));
+    const membershipSent = result.sentLibraries
+      ? { ...local, codeTemplateLibraries: { codeTemplateLibrary: result.sentLibraries } }
+      : local;
+    const changedAgain = [...result.applied, ...refreshedLibraries].filter(c => !savedChangeMatches(c, c.kind === 'library' ? membershipSent : local, after));
     if (changedAgain.length > 0) fail(`changed again after saving: ${[...new Set(changedAgain.map(c => c.label))].join(', ')}; pull and review before retrying`);
     if (result.touchedIds.size > 0) await refreshRevisions(root, after, result.touchedIds);
     if (known) await writeKnown(root, knownAfterPush(known, result.applied, result.touchedIds, after));

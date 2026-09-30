@@ -32,6 +32,8 @@ export interface ApplyResult {
   failed?: { change: Change; error: string };
   /** Ids whose revision the server now holds (for refreshing the tree). */
   touchedIds: Set<string>;
+  /** Actual membership payload, including retained server-only templates. */
+  sentLibraries?: Obj[];
 }
 
 /** Order matters: templates exist before a library lists them, and leave a library before deletion. */
@@ -55,6 +57,7 @@ export async function applyPlan(
   const applied: Change[] = [];
   const touchedIds = new Set<string>();
   let librariesSent = false;
+  let sentLibraries: Obj[] | undefined;
 
   for (const [kind, ops] of ORDER) {
     for (const change of plan.changes.filter((c) => c.kind === kind && ops.includes(c.op))) {
@@ -66,7 +69,9 @@ export async function applyPlan(
             const moved = changedSince({ ...plan, changes: plan.changes.filter(c => c.kind === 'library') }, remote, current);
             if (!opts.force && moved.length) throw new Error(`changed on the server during the push: ${moved.join(', ')}; pull and try again`);
             const inSync = librariesInSync(local, current);
-            await client.putCodeTemplateLibraries(librariesToSend(local, current, scope, plan));
+            const payload = librariesToSend(local, current, scope, plan);
+            await client.putCodeTemplateLibraries(payload);
+            sentLibraries = payload;
             librariesSent = true;
             // Take the server's new revision only where the tree now holds what
             // was sent; a stale out-of-scope library must keep its old revision
@@ -105,13 +110,13 @@ export async function applyPlan(
           await client.putGlobalScripts(local['globalScripts']);
         }
       } catch (err) {
-        return { applied, failed: { change, error: err instanceof Error ? err.message : String(err) }, touchedIds };
+        return { applied, failed: { change, error: err instanceof Error ? err.message : String(err) }, touchedIds, sentLibraries };
       }
       applied.push(change);
       touchedIds.add(change.id);
     }
   }
-  return { applied, touchedIds };
+  return { applied, touchedIds, sentLibraries };
 }
 
 function checkResource(change: Change, before: Obj | undefined, current: Record<string, unknown> | null, force: boolean): void {
