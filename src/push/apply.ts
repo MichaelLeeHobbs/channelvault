@@ -155,16 +155,25 @@ export async function deployChannels(
   client: MirthClientExt,
   ids: string[],
   nameOf: (id: string) => string,
-): Promise<Array<{ name: string; error: string }>> {
+): Promise<{ deployed: string[]; skipped: string[]; failures: Array<{ name: string; error: string }> }> {
+  const deployed: string[] = [];
+  const skipped: string[] = [];
   const failures: Array<{ name: string; error: string }> = [];
   for (const id of ids) {
     try {
+      // The preview is only a candidate list. An operator may have taken a
+      // channel down while saving, or while a previous channel was deploying.
+      if (!(await client.getDeployedChannelIds()).has(id)) {
+        skipped.push(nameOf(id));
+        continue;
+      }
       await client.deployChannel(id);
+      deployed.push(nameOf(id));
     } catch (err) {
       failures.push({ name: nameOf(id), error: err instanceof Error ? err.message : String(err) });
     }
   }
-  return failures;
+  return { deployed, skipped, failures };
 }
 
 // --- refresh revisions in the tree ------------------------------------------

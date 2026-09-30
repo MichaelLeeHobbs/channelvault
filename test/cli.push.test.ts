@@ -320,6 +320,39 @@ describe('CLI partial pushes', () => {
     expect(mirth.deployed.has('c3')).toBe(false);
     expect((await meta()).resources.channels).toEqual({ c1: 2, c2: 2, c3: 2 });
   });
+
+  it.each(['backup', 'save', 'previous redeploy'])('skips an operator undeploy during %s', async when => {
+    await Promise.all(['Alpha', 'Beta'].map(edit));
+    mirth.deployed = new Set(['c1', 'c2']);
+    mirth.onRequest = req => {
+      if ((when === 'backup' && req.path === '/api/server/id') ||
+          (when === 'save' && req.method === 'PUT' && req.path === '/api/channels/c2') ||
+          (when === 'previous redeploy' && req.path === '/api/channels/c1/_deploy')) {
+        mirth.deployed.delete('c2');
+      }
+    };
+    const result = await runCli(pushArgs('--yes', '--deploy'), env);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('deployed 1 of 2');
+    expect(result.stdout).toContain('redeploy skipped (no longer deployed): Beta');
+    expect(writes().filter(w => w.startsWith('POST'))).toEqual(['POST /api/channels/c1/_deploy']);
+    expect(mirth.deployed.has('c2')).toBe(false);
+    expect((await meta()).resources.channels).toEqual({ c1: 2, c2: 2, c3: 1 });
+  });
+
+  it('refuses redeployment when its current status cannot be read', async () => {
+    await edit('Alpha');
+    mirth.deployed.add('c1');
+    let reads = 0;
+    mirth.onRequest = req => {
+      if (req.path === '/api/channels/statuses' && ++reads > 1) return { status: 503, body: 'status unavailable' };
+    };
+    const result = await runCli(pushArgs('--yes', '--deploy'), env);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('pushed 1 change(s)');
+    expect(result.stderr).toContain('deploy failed: Alpha');
+    expect(writes()).toEqual(['PUT /api/channels/c1']);
+  });
 });
 
 describe('template and library checks immediately before saving', () => {
