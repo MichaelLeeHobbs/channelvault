@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -36,6 +36,25 @@ const writes = () => mirth.writes.map(w => `${w.method} ${w.path}`);
 const meta = async () => JSON.parse(await readFile(path.join(tree, 'channelvault.json'), 'utf8')) as { resources: { channels: Record<string, number> } };
 
 describe('CLI push backup', () => {
+  it('plans and creates a copied channel with a new ID without a manual skeleton reference', async () => {
+    const folder = path.join(tree, 'channels', 'Delta');
+    await cp(path.join(tree, 'channels', 'Alpha'), folder, { recursive: true });
+    const file = path.join(folder, 'channel.json');
+    const channel = JSON.parse(await readFile(file, 'utf8'));
+    channel.id = 'c4'; channel.name = 'Delta'; channel.revision = 0;
+    await writeFile(file, JSON.stringify(channel));
+    const preview = await runCli(pushArgs('--plan-only', '--json'), env);
+    expect(preview.status, preview.stderr).toBe(0);
+    expect(JSON.parse(preview.stdout).changes).toEqual([{ kind: 'channel', op: 'create', id: 'c4', label: 'Delta' }]);
+    expect(mirth.writes).toEqual([]);
+    const result = await runCli(pushArgs('--yes'), env);
+    expect(result.status, result.stderr).toBe(0);
+    expect(channelsOf(mirth.config).map(c => c.id)).toEqual(['c1', 'c2', 'c3', 'c4']);
+    mirth.writes.length = 0;
+    expect((await runCli(pushArgs('--yes'), env)).stdout).toContain('nothing to push');
+    expect(mirth.writes).toEqual([]);
+  });
+
   const backupFiles = async () => (existsSync(path.join(dir, 'backups')) ? (await readdir(path.join(dir, 'backups'))).filter((f) => f.endsWith('.xml')) : []);
 
   it('backs up the server before changing it, as it was before the push', async () => {
