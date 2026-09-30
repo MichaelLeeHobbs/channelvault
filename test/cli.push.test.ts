@@ -365,6 +365,39 @@ describe('template and library checks immediately before saving', () => {
     }] };
     expect((await runCli(['pull', tree, '--no-https'], env)).status).toBe(0);
   }
+  it.each([false, true])('retains server-only members during a library save and converges (force=%s)', async force => {
+    await setupLibrary();
+    const lib = librariesOf(mirth.config)[0]!;
+    lib.codeTemplates = { codeTemplate: [...templatesOf(lib), { id: 't9', name: 'theirs', revision: 1, properties: { code: 'function theirs() {}' } }] };
+    if (force) lib.revision = 5;
+    const file = path.join(tree, 'codeTemplates', 'Helpers', 'library.json');
+    const local = JSON.parse(await readFile(file, 'utf8'));
+    local.description = 'my settings edit';
+    local.codeTemplates.codeTemplate.push({ id: 't3', name: 'three', revision: 0, properties: { code: 'function three() {}' } });
+    await writeFile(file, JSON.stringify(local));
+    const result = await runCli(pushArgs('--yes', '--library', 'Helpers', ...(force ? ['--force'] : [])), env);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('left alone');
+    expect(templatesOf(librariesOf(mirth.config)[0]!).map(t => t.id)).toEqual(['t1', 't2', 't3', 't9']);
+    expect(templatesOf(librariesOf(mirth.config)[0]!).find(t => t.id === 't9')!.properties).toEqual({ code: 'function theirs() {}' });
+    expect((JSON.parse(await readFile(path.join(tree, 'channelvault.json'), 'utf8'))).resources.codeTemplates).not.toHaveProperty('t9');
+    mirth.writes.length = 0;
+    const repeat = await runCli(pushArgs('--yes', '--library', 'Helpers'), env);
+    expect(repeat.status, repeat.stderr).toBe(0);
+    expect(repeat.stdout).toContain('nothing to push');
+    expect(mirth.writes).toEqual([]);
+  });
+
+  it('refuses a library deletion that would detach a newly added server template', async () => {
+    await setupLibrary();
+    const lib = librariesOf(mirth.config)[0]!;
+    lib.codeTemplates = { codeTemplate: [...templatesOf(lib), { id: 't9', name: 'theirs', revision: 1, properties: { code: 'return;' } }] };
+    await rm(path.join(tree, 'codeTemplates', 'Helpers'), { recursive: true });
+    const result = await runCli(pushArgs('--yes', '--force', '--allow-deletes'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('contains server-only code templates');
+    expect(mirth.writes).toEqual([]);
+  });
   it('refuses a template edit with an unchanged revision after the last snapshot', async () => {
     await setupLibrary();
     await writeFile(path.join(tree, 'codeTemplates', 'Helpers', 'one.js'), 'function one() { return 1; }');

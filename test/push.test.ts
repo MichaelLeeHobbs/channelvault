@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { MirthClientExt } from '../src/client/index.js';
 import { createExplodeEngine } from '../src/explode/index.js';
-import { changedSince, findChannel, findTemplate, librariesInSync, librariesToSend, planPush, resourceIds, type Plan } from '../src/push/index.js';
+import { changedSince, findChannel, findTemplate, librariesInSync, librariesToSend, planPush, resourceIds, templatesOf, type Plan } from '../src/push/index.js';
 import { applyPlan, refreshRevisions } from '../src/push/apply.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
 
@@ -448,6 +448,48 @@ it('treats a lone CR like any other line ending (Mirth rewrites both as LF on sa
 });
 
 describe('second review regressions', () => {
+  it('keeps unfamiliar template memberships without planning a library save just to remove them', () => {
+    const remote = server();
+    (lib(remote, 0)['codeTemplates'] as Obj)['codeTemplate'] = [...templatesOf(lib(remote, 0)), template('t9', 'theirs')];
+    const known = resourceIds(server());
+    const plan = planPush(server(), remote, {}, known);
+    expect(plan.changes).toEqual([]);
+    expect(plan.serverOnly).toEqual(['code template "Formatting/theirs"']);
+    const local = server();
+    lib(local, 0)['description'] = 'changed';
+    const changed = planPush(local, remote, {}, known);
+    const sent = librariesToSend(local, remote, {}, changed);
+    expect(templatesOf(sent[0]!).map(t => t.id)).toEqual(['t1', 't2', 't9']);
+    expect(sent[0]!['description']).toBe('changed');
+  });
+
+  it('refuses deleting a library that would detach unfamiliar templates', () => {
+    const remote = server();
+    (lib(remote, 0)['codeTemplates'] as Obj)['codeTemplate'] = [...templatesOf(lib(remote, 0)), template('t9', 'theirs')];
+    const local = server();
+    (local['codeTemplateLibraries'] as Obj)['codeTemplateLibrary'] = [lib(local, 1)];
+    expect(() => planPush(local, remote, {}, resourceIds(server()))).toThrow('contains server-only code templates');
+    // Whole-server replacement explicitly previews and gates these removals.
+    expect(planPush(local, remote, {}, resourceIds(server()), { wholeReplace: true }).serverOnly).toContain('code template "Formatting/theirs"');
+    // Also catches a template appearing after preview, including a forced push.
+    const plan = planPush(local, server(), {}, resourceIds(server()));
+    expect(() => librariesToSend(local, remote, {}, plan)).toThrow('contains server-only code templates');
+  });
+
+  it('removes known deletions and moved memberships while retaining unfamiliar members', () => {
+    const local = server();
+    const moved = tpl(local, 0, 0);
+    (lib(local, 0)['codeTemplates'] as Obj)['codeTemplate'] = [];
+    (lib(local, 1)['codeTemplates'] as Obj)['codeTemplate'] = [...templatesOf(lib(local, 1)), moved];
+    const remote = server();
+    (lib(remote, 0)['codeTemplates'] as Obj)['codeTemplate'] = [...templatesOf(lib(remote, 0)), template('t9', 'theirs')];
+    const plan = planPush(local, remote, {}, resourceIds(server()));
+    const sent = librariesToSend(local, remote, {}, plan);
+    expect(templatesOf(sent[0]!).map(t => t.id)).toEqual(['t9']);
+    expect(templatesOf(sent[1]!).map(t => t.id)).toEqual(['t3', 't1']);
+    expect(plan.changes.filter(c => c.kind === 'codeTemplate' && c.op === 'delete').map(c => c.id)).toEqual(['t2']);
+  });
+
   it('keeps a library created on the server since the pull when another library changes', () => {
     const remote = server();
     ((remote['codeTemplateLibraries'] as Obj)['codeTemplateLibrary'] as Obj[]).push(library('L9', 'Theirs', []));

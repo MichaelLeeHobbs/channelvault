@@ -143,6 +143,16 @@ function libraryShape(lib: Obj): Obj {
   return out;
 }
 
+/** Missing unfamiliar templates retain their server membership, including on a forced push. */
+function withRetainedMembers(local: Obj, remote: Obj, localIds: Set<string>, deletedIds: Set<string>): Obj {
+  const retained = templatesOf(remote).filter(t => !localIds.has(idOf(t)) && !deletedIds.has(idOf(t)));
+  if (!retained.length) return local;
+  return { ...local, codeTemplates: {
+    ...(isObj(local['codeTemplates']) ? local['codeTemplates'] : {}),
+    codeTemplate: [...templatesOf(local), ...retained],
+  } };
+}
+
 // --- plan -------------------------------------------------------------------
 
 export type Op = 'create' | 'update' | 'delete';
@@ -432,12 +442,15 @@ export function planPush(
     const remoteLibById = new Map(rl.map((l) => [idOf(l), l]));
     const remoteTemplates = new Map(rl.flatMap((l) => templatesOf(l).map((t) => [idOf(t), t] as const)));
     const localTemplateIds = new Set(ll.flatMap((l) => templatesOf(l).map(idOf)));
+    const deletedTemplateIds = new Set([...remoteTemplates.keys()].filter(id =>
+      !localTemplateIds.has(id) && (!known || id in known.codeTemplates)));
     const allChannelIds = [...effective.keys()];
 
     for (const lib of ll.filter(inScope)) {
       const r = remoteLibById.get(idOf(lib));
       let touched = false;
-      if (!r || !same(libraryShape(lib), libraryShape(r))) {
+      const effectiveLib = r && !opts.wholeReplace ? withRetainedMembers(lib, r, localTemplateIds, deletedTemplateIds) : lib;
+      if (!r || !same(libraryShape(effectiveLib), libraryShape(r))) {
         changes.push({ kind: 'library', op: r ? 'update' : 'create', id: idOf(lib), label: nameOf(lib) });
         touched = true;
         if (r && revisionOf(r) > revisionOf(lib)) conflicts.push(`library "${nameOf(lib)}" (server revision ${revisionOf(r)}, tree ${revisionOf(lib)})`);
@@ -464,6 +477,9 @@ export function planPush(
     }
     for (const r of rl.filter(inScope)) {
       if (!ll.some((l) => idOf(l) === idOf(r))) {
+        if (!opts.wholeReplace && known && idOf(r) in known.libraries && templatesOf(r).some(t => !localTemplateIds.has(idOf(t)) && !(idOf(t) in known.codeTemplates))) {
+          throw new Error(`cannot delete library "${nameOf(r)}": it contains server-only code templates; pull and review their membership first`);
+        }
         const before = changes.length;
         missingLocally('library', r, nameOf(r), known?.libraries);
         if (changes.length > before) for (const id of channelsUsing(r, allChannelIds)) deploy.add(id);
@@ -521,12 +537,19 @@ export function librariesToSend(local: CanonicalConfig, remote: CanonicalConfig,
   // Start from the server's list: a library leaves it only through a planned
   // (and approved) delete, so one created on the server since the pull survives.
   const deleted = new Set(plan.changes.filter((c) => c.kind === 'library' && c.op === 'delete').map((c) => c.id));
+  const deletedTemplates = new Set(plan.changes.filter(c => c.kind === 'codeTemplate' && c.op === 'delete').map(c => c.id));
+  const localTemplateIds = new Set(ll.flatMap(templatesOf).map(idOf));
   const localById = new Map(ll.map((l) => [idOf(l), l]));
   const out: Obj[] = [];
   for (const r of rl) {
-    if (deleted.has(idOf(r))) continue;
+    if (deleted.has(idOf(r))) {
+      if (templatesOf(r).some(t => !localTemplateIds.has(idOf(t)) && !deletedTemplates.has(idOf(t)))) {
+        throw new Error(`cannot delete library "${nameOf(r)}": it contains server-only code templates; pull and review their membership first`);
+      }
+      continue;
+    }
     const l = localById.get(idOf(r));
-    out.push(l && inScope(l) ? l : r);
+    out.push(l && inScope(l) ? withRetainedMembers(l, r, localTemplateIds, deletedTemplates) : r);
   }
   for (const l of ll) if (inScope(l) && !rl.some((r) => idOf(r) === idOf(l))) out.push(l);
   return out;
