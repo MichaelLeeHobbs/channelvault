@@ -173,6 +173,21 @@ describe('restore', () => {
     expect(existsSync(only)).toBe(true);
   });
 
+  it('refuses changes made while saving the undo backup, even with force', async () => {
+    const file = await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);
+    let idReads = 0;
+    mirth.onRequest = req => {
+      if (req.path === '/api/server/id' && ++idReads === 2) {
+        mirth.config = config({ name: 'VNS Gov', channels: ['Alpha', 'Beta', 'Added During Backup'] });
+      }
+    };
+    const result = await cli('restore', file, '--yes', '--force');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('changed during the undo backup');
+    expect(mirth.writes).toEqual([]);
+    expect(channelNames(mirth.config)).toContain('Added During Backup');
+  });
+
   // The undo backup is the newest, so a second plain restore reverts the first.
   it('reverts with a second plain restore', async () => {
     await backupFile('vns-gov', '20260920T100000Z', ['Alpha']);

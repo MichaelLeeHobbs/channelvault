@@ -79,6 +79,8 @@ export interface MirthClientExt extends MirthClient {
   putServerConfigurationXml(xml: string, options?: PutServerConfigurationOptions): Promise<void>;
   /** GET /channels/{id}, unwrapped; includes the tag and dependency data the server configuration omits. */
   getChannel(id: string): Promise<Record<string, unknown> | null>;
+  /** Standalone templates remain readable after being removed from a library. */
+  getCodeTemplate(id: string): Promise<Record<string, unknown> | null>;
   /** PUT /channels/{id}; creates the channel if the id is new. */
   putChannel(channel: Record<string, unknown>): Promise<void>;
   /** Release pooled connections so the process can exit promptly. */
@@ -305,12 +307,25 @@ class MirthClientImpl implements MirthClientExt {
   // 4.5.2), so conflict detection happens in the push planner instead.
 
   async getChannel(id: string): Promise<Record<string, unknown> | null> {
-    const response = await this.request('GET', `/channels/${encodeURIComponent(id)}`, {
+    return this.getResource(`/channels/${encodeURIComponent(id)}`);
+  }
+
+  async getCodeTemplate(id: string): Promise<Record<string, unknown> | null> {
+    return this.getResource(`/codeTemplates/${encodeURIComponent(id)}`);
+  }
+
+  private async getResource(resourcePath: string): Promise<Record<string, unknown> | null> {
+    const response = await this.request('GET', resourcePath, {
       headers: { Accept: 'application/json' },
+    }).catch((err: Error & ApiError) => {
+      if (err.status === 404) return null;
+      throw err;
     });
+    if (!response) return null;
     const text = await response.text();
     if (text.trim() === '') return null;
-    return unwrapSingleKey(JSON.parse(text) as Record<string, unknown>) as Record<string, unknown>;
+    const parsed = JSON.parse(text) as Record<string, unknown> | null;
+    return parsed === null ? null : unwrapSingleKey(parsed) as Record<string, unknown> | null;
   }
 
   async close(): Promise<void> {

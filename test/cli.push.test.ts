@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { channelsOf } from '../src/push/index.js';
+import { channelsOf, librariesOf, templatesOf } from '../src/push/index.js';
 import type { CanonicalConfig } from '../src/types.js';
 import { startFakeMirth, type FakeMirth, type FakeResponse } from './helpers/fakeMirth.js';
 import { runCli, startCli } from './helpers/cli.js';
@@ -168,6 +168,64 @@ describe('CLI pull preflight', () => {
 });
 
 describe('CLI partial pushes', () => {
+  it.each(['delete', 'update', 'global', 'whole-server'])('refuses %s changes made during backup before any mutation', async kind => {
+    if (kind === 'delete') await rm(path.join(tree, 'channels', 'Alpha'), { recursive: true });
+    else if (kind === 'global') {
+      const file = path.join(tree, 'server', 'configuration.json');
+      const json = JSON.parse(await readFile(file, 'utf8'));
+      json.globalScripts = { entry: [{ string: ['Deploy', 'local();'] }] };
+      await writeFile(file, JSON.stringify(json));
+    } else await edit('Alpha');
+    mirth.onRequest = req => {
+      if (req.path === '/api/server/id') {
+        if (kind === 'global') mirth.config.globalScripts = { entry: [{ string: ['Deploy', 'colleague();'] }] };
+        else { channelsOf(mirth.config)[0]!.revision = 2; channelsOf(mirth.config)[0]!.deployScript = 'colleague();'; }
+      }
+    };
+    const flags = kind === 'delete' ? ['--allow-deletes'] : kind === 'whole-server' ? ['--whole-server'] : kind === 'global' ? ['--global-scripts'] : [];
+    const result = await runCli(pushArgs('--yes', ...flags), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('during backup');
+    expect(mirth.writes).toEqual([]);
+  });
+
+  it('checks a deletion again after an earlier save in the same push', async () => {
+    await edit('Alpha');
+    await rm(path.join(tree, 'channels', 'Beta'), { recursive: true });
+    mirth.onRequest = req => {
+      if (req.method === 'PUT' && req.path === '/api/channels/c1') {
+        channelsOf(mirth.config)[1]!.revision = 2;
+        channelsOf(mirth.config)[1]!.deployScript = 'colleague();';
+      }
+    };
+    const result = await runCli(pushArgs('--yes', '--allow-deletes'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Beta changed on the server during the push');
+    expect(writes()).toEqual(['PUT /api/channels/c1']);
+    expect(channelsOf(mirth.config)[1]!.deployScript).toBe('colleague();');
+  });
+
+  it('requires deletion consent for a resource appearing during a forced whole-server backup', async () => {
+    await edit('Alpha');
+    mirth.onRequest = req => {
+      if (req.path === '/api/server/id') mirth.config.channels = { channel: [...channelsOf(mirth.config), { id: 'c4', name: 'Created During Backup', revision: 1 }] };
+    };
+    const result = await runCli(pushArgs('--yes', '--whole-server', '--force'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--allow-deletes');
+    expect(mirth.writes).toEqual([]);
+  });
+
+  it('refuses a channel removed after backup instead of recreating it', async () => {
+    await edit('Alpha');
+    mirth.onRequest = req => {
+      if (req.method === 'GET' && req.path === '/api/channels/c1') mirth.config.channels = { channel: channelsOf(mirth.config).slice(1) };
+    };
+    const result = await runCli(pushArgs('--yes'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('changed on the server during the push');
+    expect(mirth.writes).toEqual([]);
+  });
   it('compares secret-bearing global scripts against the actual pulled server content', async () => {
     mirth.config['globalScripts'] = { entry: [{ string: ['Deploy', "var password = 'fixture-password';"] }] };
     const pulled = await runCli(['pull', tree, '--no-https', '--extract-secrets'], env);
@@ -261,6 +319,67 @@ describe('CLI partial pushes', () => {
     expect(writes()).toEqual(['PUT /api/channels/c1', 'PUT /api/channels/c2', 'PUT /api/channels/c3', 'POST /api/channels/c1/_deploy', 'POST /api/channels/c2/_deploy']);
     expect(mirth.deployed.has('c3')).toBe(false);
     expect((await meta()).resources.channels).toEqual({ c1: 2, c2: 2, c3: 2 });
+  });
+});
+
+describe('template and library checks immediately before saving', () => {
+  async function setupLibrary() {
+    mirth.config.codeTemplateLibraries = { codeTemplateLibrary: [{
+      id: 'L1', name: 'Helpers', revision: 1, codeTemplates: { codeTemplate: [
+        { id: 't1', name: 'one', revision: 1, properties: { code: 'function one() {}' } },
+        { id: 't2', name: 'two', revision: 1, properties: { code: 'function two() {}' } },
+      ] },
+    }] };
+    expect((await runCli(['pull', tree, '--no-https'], env)).status).toBe(0);
+  }
+  it('refuses a template edit with an unchanged revision after the last snapshot', async () => {
+    await setupLibrary();
+    await writeFile(path.join(tree, 'codeTemplates', 'Helpers', 'one.js'), 'function one() { return 1; }');
+    mirth.onRequest = req => {
+      if (req.method === 'GET' && req.path === '/api/codeTemplates/t1') {
+        templatesOf(librariesOf(mirth.config)[0]!)[0]!.properties = { code: 'function one() { return 2; }' };
+      }
+    };
+    const result = await runCli(pushArgs('--yes', '--library', 'Helpers'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('changed on the server during the push');
+    expect(mirth.writes).toEqual([]);
+  });
+  it('refuses deleting a template edited while its library was saved', async () => {
+    await setupLibrary();
+    const file = path.join(tree, 'codeTemplates', 'Helpers', 'library.json');
+    const lib = JSON.parse(await readFile(file, 'utf8'));
+    lib.codeTemplates.codeTemplate.pop();
+    await writeFile(file, JSON.stringify(lib));
+    mirth.onRequest = req => {
+      if (req.method === 'PUT' && req.path === '/api/codeTemplateLibraries') {
+        const t = templatesOf(librariesOf(mirth.config)[0]!)[1]!;
+        t.revision = 2; t.properties = { code: 'colleague();' };
+      }
+    };
+    const result = await runCli(pushArgs('--yes', '--library', 'Helpers', '--allow-deletes'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('changed on the server during the push');
+    expect(writes()).toEqual(['PUT /api/codeTemplateLibraries']);
+  });
+  it('rechecks the whole library list after creating a template', async () => {
+    await setupLibrary();
+    const file = path.join(tree, 'codeTemplates', 'Helpers', 'library.json');
+    const lib = JSON.parse(await readFile(file, 'utf8'));
+    lib.codeTemplates.codeTemplate.push({ id: 't3', name: 'three', revision: 0, properties: { code: 'function three() {}' } });
+    await writeFile(file, JSON.stringify(lib));
+    let added = false;
+    mirth.onRequest = req => {
+      if (!added && req.method === 'GET' && req.path === '/api/server/configuration' && mirth.writes.length) {
+        added = true;
+        mirth.config.codeTemplateLibraries = { codeTemplateLibrary: [...librariesOf(mirth.config), { id: 'L2', name: 'Added Meanwhile', revision: 1 }] };
+      }
+    };
+    const result = await runCli(pushArgs('--yes', '--library', 'Helpers'), env);
+    expect(result.status).toBe(1);
+    expect(added).toBe(true);
+    expect(result.stderr).toContain('library list is saved as a whole');
+    expect(writes()).toEqual(['PUT /api/codeTemplates/t3']);
   });
 });
 

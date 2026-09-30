@@ -52,6 +52,28 @@ afterEach(() => {
 });
 
 describe('createMirthClient', () => {
+  it('reads a standalone template with its revision', async () => {
+    fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(jsonResponse({ codeTemplate: { id: 't1', revision: 2, properties: { code: 'return;' } } }));
+    const client = createMirthClient(CONFIG);
+    try {
+      expect(await client.getCodeTemplate('t1')).toEqual({ id: 't1', revision: 2, properties: { code: 'return;' } });
+      expect(call(1)[0]).toBe(`${BASE}/codeTemplates/t1`);
+    } finally { await client.close(); }
+  });
+  it.each([null, { codeTemplate: null }])('treats an absent template response %j as missing', async body => {
+    fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(jsonResponse(body));
+    const client = createMirthClient(CONFIG);
+    try { expect(await client.getCodeTemplate('missing')).toBeNull(); }
+    finally { await client.close(); }
+  });
+  it('treats a resource 404 as missing and preserves other HTTP errors', async () => {
+    fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(jsonResponse({}, { status: 404 })).mockResolvedValueOnce(jsonResponse({}, { status: 503 }));
+    const client = createMirthClient(CONFIG);
+    try {
+      expect(await client.getCodeTemplate('missing')).toBeNull();
+      await expect(client.getChannel('c1')).rejects.toMatchObject({ status: 503 });
+    } finally { await client.close(); }
+  });
   it('constructs with disableTlsCheck without throwing', () => {
     expect(() => createMirthClient({ ...CONFIG, disableTlsCheck: true })).not.toThrow();
   });

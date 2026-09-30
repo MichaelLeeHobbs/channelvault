@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { MirthClientExt } from '../src/client/index.js';
 import { createExplodeEngine } from '../src/explode/index.js';
-import { changedSince, librariesInSync, librariesToSend, planPush, resourceIds, type Plan } from '../src/push/index.js';
+import { changedSince, findChannel, findTemplate, librariesInSync, librariesToSend, planPush, resourceIds, type Plan } from '../src/push/index.js';
 import { applyPlan, refreshRevisions } from '../src/push/apply.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
 
@@ -228,7 +228,7 @@ describe('planPush', () => {
 });
 
 /** Records calls; `failOn` makes one call throw. */
-function fakeClient(serverChannel: Obj | null = null, failOn?: string) {
+function fakeClient(serverChannel: Obj | null = null, failOn?: string, currentConfig = server()) {
   const calls: string[] = [];
   const bodies: Record<string, unknown> = {};
   const record = (name: string, body?: unknown) => {
@@ -237,7 +237,15 @@ function fakeClient(serverChannel: Obj | null = null, failOn?: string) {
     if (name === failOn) throw new Error('boom');
   };
   const client = {
-    getChannel: async () => serverChannel,
+    getServerConfiguration: async () => currentConfig,
+    getCodeTemplate: async (id: string) => findTemplate(currentConfig, id) ?? null,
+    getChannel: async (id: string) => {
+      const base = findChannel(currentConfig, id);
+      if (!base || !serverChannel || serverChannel['id'] !== id) return base ?? null;
+      const baseExport = base['exportData'] as Obj;
+      const extraExport = serverChannel['exportData'] as Obj | undefined;
+      return { ...base, ...serverChannel, exportData: { ...baseExport, ...extraExport, metadata: { ...(baseExport['metadata'] as Obj), ...(extraExport?.['metadata'] as Obj | undefined) } } };
+    },
     putChannel: async (c: Obj) => record(`putChannel ${c['id']}`, c),
     deleteChannel: async (id: string) => record(`deleteChannel ${id}`),
     putCodeTemplate: async (t: Obj) => record(`putCodeTemplate ${t['id']}`, t),
@@ -391,7 +399,7 @@ describe('code review regressions', () => {
     lib(remote, 1)['description'] = 'a colleague edited Routing';
     lib(remote, 1)['revision'] = 5;
     const scope = { libraries: ['Formatting'] };
-    const { client } = fakeClient();
+    const { client } = fakeClient(null, undefined, remote);
     const result = await applyPlan(client, planPush(local, remote, scope), local, remote, scope);
     expect(result.touchedIds.has('L1')).toBe(true);
     expect(result.touchedIds.has('L2')).toBe(false); // stale: keeps its conflict for next time

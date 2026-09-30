@@ -10,12 +10,15 @@ import type { MirthClientExt } from '../client/index.js';
 import { readJson } from '../json.js';
 import type { CanonicalConfig, Json } from '../types.js';
 import {
+  changedSince,
   findChannel,
   findTemplate,
   librariesInSync,
   librariesOf,
   librariesToSend,
   list,
+  planPush,
+  resourceChanged,
   type Change,
   type Plan,
   type Scope,
@@ -59,8 +62,11 @@ export async function applyPlan(
         if (kind === 'library') {
           // One PUT replaces the whole list and bumps every library's revision.
           if (!librariesSent) {
-            const inSync = librariesInSync(local, remote);
-            await client.putCodeTemplateLibraries(librariesToSend(local, remote, scope, plan));
+            const current = await client.getServerConfiguration();
+            const moved = changedSince({ ...plan, changes: plan.changes.filter(c => c.kind === 'library') }, remote, current);
+            if (!opts.force && moved.length) throw new Error(`changed on the server during the push: ${moved.join(', ')}; pull and try again`);
+            const inSync = librariesInSync(local, current);
+            await client.putCodeTemplateLibraries(librariesToSend(local, current, scope, plan));
             librariesSent = true;
             // Take the server's new revision only where the tree now holds what
             // was sent; a stale out-of-scope library must keep its old revision
@@ -72,16 +78,30 @@ export async function applyPlan(
             for (const id of inSync) touchedIds.add(id);
           }
         } else if (kind === 'codeTemplate' && change.op === 'delete') {
+          await checkTemplate(client, change, remote, opts.force === true);
           await client.deleteCodeTemplate(change.id);
         } else if (kind === 'codeTemplate') {
+          await checkTemplate(client, change, remote, opts.force === true);
           await client.putCodeTemplate(findTemplate(local, change.id)!);
         } else if (kind === 'channel' && change.op === 'delete') {
+          const current = await client.getChannel(change.id);
+          checkResource(change, findChannel(remote, change.id), current, opts.force === true);
           await client.deleteChannel(change.id);
         } else if (kind === 'channel') {
+          const before = findChannel(remote, change.id);
+          const channel = findChannel(local, change.id)!;
+          if (!before || before['name'] !== channel['name']) {
+            // Names introduced since planning must not be overwritten either.
+            planPush(local, await client.getServerConfiguration(), scope);
+          }
           await client.putChannel(
-            await withServerAssociations(client, findChannel(local, change.id)!, change.op, findChannel(remote, change.id), opts.force === true),
+            await withServerAssociations(client, channel, change, before, opts.force === true),
           );
         } else {
+          const current = await client.getServerConfiguration();
+          if (!opts.force && changedSince({ ...plan, changes: [change] }, remote, current).length) {
+            throw new Error('global scripts changed on the server during the push; pull and try again');
+          }
           await client.putGlobalScripts(local['globalScripts']);
         }
       } catch (err) {
@@ -92,6 +112,16 @@ export async function applyPlan(
     }
   }
   return { applied, touchedIds };
+}
+
+function checkResource(change: Change, before: Obj | undefined, current: Record<string, unknown> | null, force: boolean): void {
+  if (!force && resourceChanged(change.kind, before, (current ?? undefined) as Obj | undefined)) {
+    throw new Error(`${change.label} changed on the server during the push (revision ${String(current?.['revision'] ?? 'absent')}, planned against ${String(before?.['revision'] ?? 'absent')}); pull and try again`);
+  }
+}
+
+async function checkTemplate(client: MirthClientExt, change: Change, remote: CanonicalConfig, force: boolean): Promise<void> {
+  checkResource(change, findTemplate(remote, change.id), await client.getCodeTemplate(change.id), force);
 }
 
 /**
@@ -105,18 +135,15 @@ const ASSOCIATIONS = ['channelTags', 'dependentIds', 'dependencyIds'];
 async function withServerAssociations(
   client: MirthClientExt,
   channel: Obj,
-  op: Change['op'],
+  change: Change,
   planned: Obj | undefined,
   force: boolean,
 ): Promise<Obj> {
-  if (op !== 'update') return channel;
   const server = await client.getChannel(String(channel['id']));
   // Last check before the save (Mirth itself does not reject a stale
   // revision): someone saved this channel after the plan was made.
-  const [now, then] = [Number(server?.['revision'] ?? 0), Number(planned?.['revision'] ?? 0)];
-  if (!force && now > then) {
-    throw new Error(`changed on the server during the push (revision ${now}, planned against ${then}); pull and try again`);
-  }
+  checkResource(change, planned, server, force);
+  if (change.op !== 'update') return channel;
   const serverExport = server?.['exportData'] as Obj | undefined;
   if (!serverExport) return channel;
   const exportData: Obj = { ...((channel['exportData'] as Obj | undefined) ?? {}) };
