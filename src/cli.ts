@@ -24,6 +24,7 @@ import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
 import { createMirthClient, UNTRUSTED_CERT_CODES, type MirthClientExt } from './client/index.js';
 import {
+  adoptTarget,
   changedSince,
   channelsOf,
   knownAfterPush,
@@ -274,9 +275,11 @@ interface SyncMeta {
   engineVersion: string | null;
   /** Resource ids the tree held at pull time (see Known in src/push). Absent in older trees. */
   resources?: Known;
+  /** Revision histories belong to this installation, independently of its URL or name. */
+  serverId?: string;
 }
 
-async function writeMeta(root: string, source: string, config: CanonicalConfig, previous: SyncMeta | null): Promise<void> {
+async function writeMeta(root: string, source: string, config: CanonicalConfig, previous: SyncMeta | null, serverId?: string, resources = resourceIds(config)): Promise<void> {
   const meta: SyncMeta = {
     tool: 'channelvault',
     version: VERSION,
@@ -289,7 +292,8 @@ async function writeMeta(root: string, source: string, config: CanonicalConfig, 
         : typeof config['@version'] === 'string'
           ? (config['@version'] as string)
           : null,
-    resources: resourceIds(config),
+    resources,
+    serverId,
   };
   // A pull that changed nothing else must not leave a timestamp-only change
   // for git to show.
@@ -388,7 +392,7 @@ async function readAllow(root: string): Promise<AllowEntry[]> {
  * placeholders; their values go to the env file, never to the tree. Anything
  * that still looks like a secret stops the write unless --extract-secrets.
  */
-async function writeTree(root: string, fetched: CanonicalConfig, source: string, flags: EnvFlags): Promise<void> {
+async function writeTree(root: string, fetched: CanonicalConfig, source: string, flags: EnvFlags, serverId?: string): Promise<void> {
   const envFile = envFilePath(root, flags);
   const previousMeta = await preflightTree(root, envFile);
   const env = await loadEnv(envFile);
@@ -417,7 +421,7 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
   let backup: string | null = null;
   await replaceTree(root, envFile, async next => {
     await engine.explode(config, { root: next });
-    await writeMeta(next, source, fetched, previousMeta);
+    await writeMeta(next, source, fetched, previousMeta, serverId);
     if (Object.keys(envUpdates).length > 0) {
       const history = path.join(root, '.secrets');
       if (existsSync(history)) {
@@ -592,6 +596,18 @@ function collect(value: string, previous: string[] | undefined): string[] {
 
 // --- push ---------------------------------------------------------------------
 
+async function bindingProblems(root: string, serverId: string): Promise<string[]> {
+  const file = path.join(root, 'channelvault.json');
+  const meta = existsSync(file) ? await readJson<SyncMeta>(file) : null;
+  if (meta?.serverId === serverId) return [];
+  return [`this tree's baseline belongs to ${meta?.serverId ? `installation ${meta.serverId}` : 'an unknown installation'}, not the target (${serverId}); pull the target and merge your edits, or review with 'adopt <dir> --plan-only' and run 'adopt <dir>' to establish its baseline; --force does not bypass installation binding`];
+}
+
+async function assertBinding(client: MirthClientExt, root: string): Promise<void> {
+  const problems = await bindingProblems(root, await client.getServerId());
+  if (problems.length) fail(problems.join('\n'));
+}
+
 /** Resource ids recorded at the last pull, if this tree has them. */
 async function readKnown(root: string): Promise<Known | undefined> {
   const metaPath = path.join(root, 'channelvault.json');
@@ -655,12 +671,13 @@ function reportPlanOnly(
   flags: PushFlags,
   plan: Plan,
   problems: string[],
-  extra: { target: string; mode: 'scoped' | 'whole-server'; redeploy?: string[]; notRedeployed?: string[] },
+  extra: { target: string; mode: 'scoped' | 'whole-server' | 'adopt'; serverId?: string; redeploy?: string[]; notRedeployed?: string[] },
 ): void {
   if (flags.json) {
     writeJson({
       target: extra.target,
       mode: extra.mode,
+      ...(extra.serverId ? { serverId: extra.serverId } : {}),
       changes: plan.changes,
       conflicts: plan.conflicts,
       serverOnly: plan.serverOnly,
@@ -695,6 +712,7 @@ async function scopedPush(
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
   const plan = planPush(local, remote, scope, known);
+  const problems = [...await bindingProblems(root, await client.getServerId()), ...planProblems(plan, flags)];
   const names = new Map(
     [...channelsOf(remote), ...channelsOf(local)].map((c) => [String(c['id']), String(c['name'])] as const),
   );
@@ -708,7 +726,7 @@ async function scopedPush(
 
   if (flags.planOnly && flags.json) {
     const redeploy = flags.deploy ? { redeploy: toDeploy.map(nameOf), notRedeployed: notDeployed.map(nameOf) } : {};
-    reportPlanOnly(flags, plan, planProblems(plan, flags), { target, mode: 'scoped', ...redeploy });
+    reportPlanOnly(flags, plan, problems, { target, mode: 'scoped', ...redeploy });
     return;
   }
   if (plan.changes.length === 0) {
@@ -728,13 +746,11 @@ async function scopedPush(
     process.stdout.write(`left alone (created on the server since the last pull; pull to get them): ${plan.serverOnly.join(', ')}\n`);
   }
   if (flags.planOnly) {
-    reportPlanOnly(flags, plan, planProblems(plan, flags), { target, mode: 'scoped' });
+    reportPlanOnly(flags, plan, problems, { target, mode: 'scoped' });
     return;
   }
-  if (plan.changes.length === 0) return;
-
-  const problems = planProblems(plan, flags);
   if (problems.length > 0) fail(problems.join('\n'));
+  if (plan.changes.length === 0) return;
   if (!flags.yes && !(await confirm('Continue?'))) {
     process.stdout.write('aborted.\n');
     return;
@@ -757,6 +773,7 @@ async function scopedPush(
   if (!flags.force && changedDuringBackup.length) {
     fail(`changed on the server during backup: ${changedDuringBackup.join(', ')}; pull and try again`);
   }
+  await assertBinding(client, root);
   const result = await applyPlan(client, plan, local, afterBackup, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
   // resources that did go through don't read as conflicts next time.
@@ -803,8 +820,9 @@ async function wholeServerPush(
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
   const plan = planPush(local, remote, {}, known, { wholeReplace: true });
+  const problems = [...await bindingProblems(root, await client.getServerId()), ...wholeServerProblems(plan, flags)];
   if (flags.planOnly && flags.json) {
-    reportPlanOnly(flags, plan, wholeServerProblems(plan, flags), { target, mode: 'whole-server' });
+    reportPlanOnly(flags, plan, problems, { target, mode: 'whole-server' });
     return;
   }
   const s = summarize(local);
@@ -826,7 +844,6 @@ async function wholeServerPush(
   const replaced = plan.notPushed.filter((k) => !(keptMap && k === 'configurationMap'));
   if (replaced.length > 0) process.stdout.write(`also replaced: ${replaced.join(', ')}\n`);
   if (keptMap) process.stdout.write('configuration map differs but is kept (--overwrite-config-map replaces it)\n');
-  const problems = wholeServerProblems(plan, flags);
   if (flags.planOnly) {
     reportPlanOnly(flags, plan, problems, { target, mode: 'whole-server' });
     return;
@@ -854,6 +871,7 @@ async function wholeServerPush(
   if (!flags.allowDeletes && (finalPlan.serverOnly.length || finalPlan.changes.some(c => c.op === 'delete'))) {
     fail('the replace now deletes resources from the server; review the new plan and pass --allow-deletes');
   }
+  await assertBinding(client, root);
   await client.putServerConfiguration(local, {
     deploy: flags.deploy === true,
     overwriteConfigMap: flags.overwriteConfigMap === true,
@@ -919,11 +937,65 @@ addExtractFlag(addEnvFlag(addConnectionFlags(
 ))).action(async (dir: string, flags: ConnectionFlags & EnvFlags) => {
   const root = path.resolve(dir);
   await preflightTree(root, envFilePath(root, flags)); // before fetching a whole server for nothing
-  const config = await withClient(flags, (client) => client.getServerConfiguration());
+  const { config, serverId } = await withClient(flags, async client => {
+    const serverId = await client.getServerId();
+    const config = await client.getServerConfiguration();
+    if (await client.getServerId() !== serverId) fail('the installation changed while pulling; nothing was written');
+    return { config, serverId };
+  });
   const cfg = resolveClientConfig(flags);
-  await writeTree(root, config, `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`, flags);
+  await writeTree(root, config, `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`, flags, serverId);
   const s = summarize(config);
   process.stdout.write(`pulled ${s.channels} channels, ${s.codeTemplates} code templates -> ${root}\n`);
+});
+
+addJsonFlag(addEnvFlag(addConnectionFlags(
+  program.command('adopt')
+    .description('Review and capture this installation as the tree baseline, preserving local content; writes no server resources')
+    .argument('<dir>', 'working-tree directory')
+    .option('--plan-only', 'preview the resulting push plan without changing the tree', false)
+    .option('-y, --yes', 'accept the reviewed destination baseline without a prompt', false),
+))).action(async (dir: string, flags: ConnectionFlags & EnvFlags & JsonFlags & { planOnly?: boolean; yes?: boolean }) => {
+  const root = path.resolve(dir);
+  assertTree(root);
+  const previous = await preflightTree(root, envFilePath(root, flags));
+  const stored = await engine.implode({ root });
+  const local = await renderedTree(root, flags);
+  await assertCompatibleOrigin(root, local, 'live', false);
+  if (flags.json && !flags.planOnly) fail('--json needs --plan-only');
+  if (!flags.yes && !flags.planOnly && !process.stdin.isTTY) fail('no terminal to confirm on; review with `adopt --plan-only` and pass --yes');
+  const cfg = resolveClientConfig(flags);
+  const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
+  await withClient(flags, async client => {
+    const serverId = await client.getServerId();
+    const remote = await client.getServerConfiguration();
+    const adopted = adoptTarget(local, remote);
+    const plan = planPush(adopted.config, remote, {}, adopted.known);
+    if (!flags.json) {
+      process.stdout.write(`Adopt ${target} (installation ${serverId}) as this tree's baseline.\nLocal content is preserved; the following differences become reviewed edits for a subsequent push:\n`);
+      printChanges(plan);
+      if (plan.serverOnly.length) process.stdout.write(`left alone: ${plan.serverOnly.join(', ')}\n`);
+      if (plan.notPushed.length) process.stdout.write(`not pushed by scoped push: ${plan.notPushed.join(', ')}\n`);
+    }
+    if (flags.planOnly) {
+      reportPlanOnly(flags, plan, planProblems(plan, {}), { target, mode: 'adopt', serverId });
+      return;
+    }
+    if (!flags.yes && !(await confirm('Accept this baseline?'))) {
+      process.stdout.write('aborted.\n');
+      return;
+    }
+    if (await client.getServerId() !== serverId || !sameServerConfig(remote, await client.getServerConfiguration())) {
+      fail('the target changed while adopting; nothing was written. Review the new baseline and try again');
+    }
+    if (!sameServerConfig(stored, await engine.implode({ root }))) fail('the local tree changed while adopting; nothing was written');
+    await replaceTree(root, envFilePath(root, flags), async next => {
+      const rebased = adoptTarget(stored, remote);
+      await engine.explode(rebased.config, { root: next });
+      await writeMeta(next, target, rebased.config, previous, serverId, adopted.known);
+    });
+    process.stdout.write(`adopted installation ${serverId}; review with push --plan-only before writing the server\n`);
+  });
 });
 
 addBackupDirFlags(addEnvFlag(addConnectionFlags(
@@ -1275,7 +1347,7 @@ addJsonFlag(addEnvFlag(
 let unlock: (() => Promise<void>) | undefined;
 program.hook('preAction', async (_program, command) => {
   const name = command.name();
-  if (!['explode', 'pull', 'push', 'implode', 'diff', 'status'].includes(name)) return;
+  if (!['explode', 'pull', 'adopt', 'push', 'implode', 'diff', 'status'].includes(name)) return;
   if (name === 'diff') errorExitCode = 2;
   const root = path.resolve(String(command.processedArgs[name === 'explode' ? 1 : 0]));
   unlock = await lockTree(root);
