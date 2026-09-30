@@ -781,8 +781,9 @@ async function scopedPush(
   process.stdout.write(`pushed ${result.applied.length} change(s)\n`);
 
   if (toDeploy.length > 0) {
-    const failures = await deployChannels(client, toDeploy, nameOf);
-    process.stdout.write(`deployed ${toDeploy.length - failures.length} of ${toDeploy.length} channel(s)\n`);
+    const { deployed, skipped, failures } = await deployChannels(client, toDeploy, nameOf);
+    process.stdout.write(`deployed ${deployed.length} of ${toDeploy.length} channel(s)\n`);
+    if (skipped.length) process.stdout.write(`redeploy skipped (no longer deployed): ${skipped.join(', ')}\n`);
     for (const f of failures) process.stderr.write(`deploy failed: ${f.name}: ${scrub(f.error)}\n`);
     if (failures.length > 0) process.exitCode = 1;
   }
