@@ -40,3 +40,12 @@ export function runCli(args: string[], env: NodeJS.ProcessEnv = {}): Promise<Cli
   running.child.stdin.end();
   return running.finished;
 }
+
+/** Test fixture paths and credentials contain no quotes; execute the complete printed undo arguments. */
+export function printedUndoArgs(stdout: string): string[] {
+  const command = /\(undo with: (.+)\)\r?\n/.exec(stdout)?.[1];
+  if (!command) throw new Error('missing undo command');
+  const tokens = command.match(/'[^']*'|\S+/g)!;
+  if (tokens[0] !== 'channelvault') throw new Error('unexpected undo executable');
+  return tokens.slice(1).map(token => token.startsWith("'") ? token.slice(1, -1) : token);
+}
