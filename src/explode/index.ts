@@ -16,7 +16,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync } from 'node:fs';
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
@@ -28,7 +28,7 @@ import {
   type ExplodeOptions,
   type Json,
 } from '../types.js';
-import { parseJson, readJson } from '../json.js';
+import { parseJson } from '../json.js';
 
 // --- shared helpers --------------------------------------------------------
 
@@ -905,14 +905,16 @@ async function readWithinRoot(root: string, target: string, rel: string): Promis
  * of the JSON file this value came from (markers are relative to it); `root` is
  * the working-tree root that every marker target must stay within.
  */
-async function resolveMarkers(value: Json, jsonDir: string, root: string): Promise<Json> {
+const pathKey = (file: string): string => process.platform === 'win32' ? file.toLowerCase() : file;
+
+async function resolveMarkers(value: Json, jsonDir: string, root: string, referenced: Set<string>): Promise<Json> {
   if (Array.isArray(value)) {
     const out: Json[] = [];
     for (const item of value) {
       // A collection member whose file is gone was deleted from the tree
       // (e.g. `rm -r channels/<name>`), so it is dropped, not an error.
       if (isRefMarker(item) && !existsSync(resolveWithinRoot(root, jsonDir, item['@ref']))) continue;
-      out.push(await resolveMarkers(item, jsonDir, root));
+      out.push(await resolveMarkers(item, jsonDir, root, referenced));
     }
     return out;
   }
@@ -926,8 +928,9 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
   if (isRefMarker(value)) {
     const target = resolveWithinRoot(root, jsonDir, value['@ref']);
     const text = await readWithinRoot(root, target, value['@ref']);
+    referenced.add(pathKey(await realpath(target)));
     const parsed = parseJson<Json>(text, target);
-    return resolveMarkers(parsed, path.dirname(target), root);
+    return resolveMarkers(parsed, path.dirname(target), root, referenced);
   }
 
   if (isPlainObject(value)) {
@@ -935,12 +938,63 @@ async function resolveMarkers(value: Json, jsonDir: string, root: string): Promi
     for (const [k, v] of Object.entries(value)) {
       // Same for a one-member collection, which explode stores as a bare marker.
       if (isRefMarker(v) && !existsSync(resolveWithinRoot(root, jsonDir, v['@ref']))) continue;
-      out[k] = await resolveMarkers(v, jsonDir, root);
+      out[k] = await resolveMarkers(v, jsonDir, root, referenced);
     }
     return out;
   }
 
   return value;
+}
+
+/** Canonical resource files are discoverable, so additions and directory renames cannot disappear. */
+async function discoverResources(config: CanonicalConfig, root: string, referenced: Set<string>): Promise<void> {
+  const realRoot = await realpath(root);
+  const contained = async (file: string): Promise<string> => {
+    const real = await realpath(file);
+    if (real !== realRoot && !real.startsWith(realRoot + path.sep)) throw new Error(`resource path escapes the working tree through a link: ${file}`);
+    return real;
+  };
+  const layouts = [
+    { folder: 'channels', filename: 'channel.json', container: 'channels', member: 'channel' },
+    { folder: 'codeTemplates', filename: 'library.json', container: 'codeTemplateLibraries', member: 'codeTemplateLibrary' },
+    { folder: 'channelGroups', filename: null, container: 'channelGroups', member: 'channelGroup' },
+  ];
+  for (const layout of layouts) {
+    const dir = path.join(root, layout.folder);
+    if (!existsSync(dir)) continue;
+    await contained(dir);
+    const entries = (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    const additions: Json[] = [];
+    for (const entry of entries) {
+      let file = path.join(dir, entry.name);
+      if (layout.filename) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        await contained(file);
+        file = path.join(file, layout.filename);
+        if (!existsSync(file)) continue;
+      } else if (!entry.name.endsWith('.json')) continue;
+      const real = await contained(file);
+      if (referenced.has(pathKey(real))) continue;
+      const parsed = parseJson<Json>(await readWithinRoot(root, file, file), file);
+      const resource = await resolveMarkers(parsed, path.dirname(file), root, referenced);
+      if (!isPlainObject(resource) || typeof resource['id'] !== 'string' || !resource['id'].trim() || typeof resource['name'] !== 'string' || !resource['name'].trim()) {
+        throw new Error(`new resource ${file} needs a nonempty id and name`);
+      }
+      additions.push(resource);
+      referenced.add(pathKey(real));
+    }
+    if (!additions.length) continue;
+    const container = isPlainObject(config[layout.container]) ? config[layout.container] as Record<string, Json> : {};
+    const old = container[layout.member];
+    const members = [...(old == null || old === '' ? [] : asArray<Json>(old)), ...additions];
+    const ids = new Set<string>();
+    for (const member of members.filter(isPlainObject)) {
+      const id = String(member['id']);
+      if (ids.has(id)) throw new Error(`duplicate ${layout.member} id ${id}: a copied resource keeps its source's id; give each copy a new UUID`);
+      ids.add(id);
+    }
+    config[layout.container] = { ...container, [layout.member]: members.length === 1 ? members[0]! : members };
+  }
 }
 
 async function implode(opts: ExplodeOptions): Promise<CanonicalConfig> {
@@ -950,8 +1004,11 @@ async function implode(opts: ExplodeOptions): Promise<CanonicalConfig> {
   }
   const serverDir = path.join(root, 'server');
   const configPath = path.join(serverDir, 'configuration.json');
-  const parsed = await readJson<Json>(configPath);
-  const resolved = await resolveMarkers(parsed, serverDir, root);
+  const parsed = parseJson<Json>(await readWithinRoot(root, configPath, configPath), configPath);
+  const referenced = new Set<string>();
+  const resolved = await resolveMarkers(parsed, serverDir, root, referenced);
+  if (!isPlainObject(resolved)) throw new Error('server/configuration.json must hold a configuration object');
+  await discoverResources(resolved, root, referenced);
   return resolved as CanonicalConfig;
 }
 
