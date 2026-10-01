@@ -214,10 +214,32 @@ async function saveServerBackup(
 }
 
 /** Before a push changes anything: a backup to undo it with, unless --no-backup. */
-async function backupBeforePush(client: MirthClientExt, flags: ConnectionFlags & BackupFlags): Promise<void> {
+async function backupBeforePush(client: MirthClientExt, flags: ConnectionFlags & BackupFlags & { overwriteConfigMap?: boolean; deploy?: boolean }): Promise<void> {
   if (flags.backup === false) return;
   const file = await saveServerBackup(client, await client.getServerConfigurationXml(), flags);
-  process.stdout.write(`backed up the server to ${file} (undo with: channelvault restore "${file}")\n`);
+  process.stdout.write(`backed up the server to ${file} (undo with: ${undoCommand(file, flags)})\n`);
+  printUndoLimits(flags);
+}
+
+/** Literal arguments for the user's shell; never include a connection password. */
+function shellArgument(value: string): string {
+  return process.platform === 'win32' ? `'${value.replace(/'/g, "''")}'` : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function undoCommand(file: string, flags: ConnectionFlags & BackupFlags & { overwriteConfigMap?: boolean }): string {
+  const cfg = resolveClientConfig(flags);
+  const args = ['channelvault', 'restore', shellArgument(file),
+    '--host', shellArgument(cfg.host), '--port', String(cfg.port), '--user', shellArgument(cfg.username),
+    '--backup-dir', shellArgument(backupDirOf(flags))];
+  if (cfg.https === false) args.push('--no-https');
+  if (cfg.disableTlsCheck) args.push('--insecure');
+  if (flags.overwriteConfigMap) args.push('--overwrite-config-map');
+  return args.join(' ');
+}
+
+function printUndoLimits(flags: ConnectionFlags & { deploy?: boolean }): void {
+  if (flags.pass !== undefined) process.stdout.write('undo authentication: supply this server\'s password through MIRTH_PASS; it is omitted from the command\n');
+  if (flags.deploy) process.stdout.write('the undo restores saved configuration; runtime deployment state is not in the backup. Review targeted redeployment separately\n');
 }
 
 /** `host:port`, for telling people which server a backup came from. */
@@ -1035,6 +1057,7 @@ addBackupDirFlags(addEnvFlag(addConnectionFlags(
     if (flags.wholeServer && (flags.channel || flags.library || flags.globalScripts)) {
       fail('--whole-server replaces everything; it cannot be combined with --channel, --library or --global-scripts');
     }
+    if (flags.overwriteConfigMap && !flags.wholeServer) fail('--overwrite-config-map needs --whole-server');
     const root = path.resolve(dir);
     assertTree(root);
     const config = await renderedTree(root, flags);
@@ -1170,7 +1193,8 @@ addBackupDirFlags(addConnectionFlags(
     // The undo: the configuration about to be replaced. The backup being
     // restored is protected from rotation.
     const undo = await saveServerBackup(client, freshText, flags, chosen);
-    process.stdout.write(`saved the current configuration to ${undo} (undo with: channelvault restore "${undo}")\n`);
+    process.stdout.write(`saved the current configuration to ${undo} (undo with: ${undoCommand(undo, flags)})\n`);
+    printUndoLimits(flags);
 
     const afterBackup = parseBackup(await client.getServerConfigurationXml(), 'the server configuration');
     if (!sameServerConfig(parseBackup(freshText, 'the server configuration'), afterBackup)) {

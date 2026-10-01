@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MANIFEST } from '../src/backup/index.js';
 import type { CanonicalConfig } from '../src/types.js';
 import { XmlConfigAdapter } from '../src/xml/index.js';
-import { runCli } from './helpers/cli.js';
+import { printedUndoArgs, runCli } from './helpers/cli.js';
 import { startFakeMirth, type FakeMirth } from './helpers/fakeMirth.js';
 
 const xml = new XmlConfigAdapter();
@@ -101,7 +101,7 @@ describe('restore', () => {
     // The configuration it replaced, kept as the newest backup.
     const undo = (await files()).filter((f) => f.startsWith('vns-gov-')).at(-1)!;
     expect(channelNames(xml.parse(await readFile(path.join(backups, undo), 'utf8')))).toEqual(['Alpha', 'Beta']);
-    expect(r.stdout).toContain(`channelvault restore "${path.join(backups, undo)}"`);
+    expect(printedUndoArgs(r.stdout)).toContain(path.join(backups, undo));
   });
 
   // A restore or whole-server push carries the server name to another server,

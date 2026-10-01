@@ -19,7 +19,7 @@ function asXmlShape(value: Json): Json {
   return Object.fromEntries(Object.entries(value).map(([k, v]) => [k.startsWith('@') && !k.startsWith('@_') ? `@_${k.slice(1)}` : k, asXmlShape(v)]));
 }
 
-export interface FakeRequest { method: string; path: string; body: string }
+export interface FakeRequest { method: string; path: string; body: string; query: Record<string, string> }
 /** `body` is sent as JSON; `raw` is sent as-is (plain text, XML). */
 export interface FakeResponse { status: number; body?: unknown; raw?: string }
 type Obj = Record<string, Json>;
@@ -54,7 +54,7 @@ export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(value));
       };
-      const request = { method: req.method ?? '', path: url.pathname, body };
+      const request = { method: req.method ?? '', path: url.pathname, body, query: Object.fromEntries(url.searchParams) };
       state.requests.push(request);
       if (url.pathname === '/api/users/_login') {
         res.setHeader('Set-Cookie', 'JSESSIONID=fake; Path=/');
@@ -84,7 +84,12 @@ export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth
         return json(200, { serverConfiguration: state.config });
       }
       if (req.method === 'PUT' && url.pathname === '/api/server/configuration') {
-        state.config = sendsXml ? xml.parse(body) : (JSON.parse(body) as { serverConfiguration: CanonicalConfig }).serverConfiguration;
+        const incoming = sendsXml ? xml.parse(body) : (JSON.parse(body) as { serverConfiguration: CanonicalConfig }).serverConfiguration;
+        if (url.searchParams.get('overwriteConfigMap') !== 'true') {
+          if ('configurationMap' in state.config) incoming.configurationMap = state.config.configurationMap!;
+          else delete incoming.configurationMap;
+        }
+        state.config = incoming;
         return json(200, {});
       }
       if (req.method === 'PUT' && url.pathname === '/api/server/globalScripts') {

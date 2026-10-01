@@ -10,7 +10,7 @@ import { channelsOf } from '../../src/push/index.js';
 import { readEnvFile, updateEnvFile } from '../../src/secrets/envfile.js';
 import { XmlConfigAdapter } from '../../src/xml/index.js';
 import type { Json } from '../../src/types.js';
-import { runCli } from '../helpers/cli.js';
+import { printedUndoArgs, runCli } from '../helpers/cli.js';
 
 type Obj = Record<string, Json>;
 const enabled = process.env.CHANNELVAULT_INTEGRATION === '1';
@@ -143,6 +143,30 @@ describe.skipIf(!enabled)('two disposable Mirth 4.5.2 servers', () => {
     const diff = await runCli(['diff', path.join(work, 'target-observed'), '--insecure'], env(targetPort));
     expect(diff.status, diff.stdout + diff.stderr).toBe(0);
     expect(diff.stdout).toContain('no differences');
+  }, 120_000);
+
+  it('restores an overwritten configuration map with the complete printed undo command', async () => {
+    const root = path.join(work, 'map-undo');
+    const backupDir = path.join(work, 'map undo backups');
+    const pulled = await runCli(['pull', root, '--insecure'], env(targetPort));
+    expect(pulled.status, pulled.stderr).toBe(0);
+    const before = (await target.getServerConfiguration()).configurationMap;
+    const file = path.join(root, 'server', 'configuration.json');
+    const config = JSON.parse(await readFile(file, 'utf8'));
+    const entries = Array.isArray(config.configurationMap.entry) ? config.configurationMap.entry : [config.configurationMap.entry];
+    const property = entries[0]['com.mirth.connect.util.ConfigurationProperty'];
+    expect(property).toBeDefined();
+    property.value = 'synthetic-map-replacement';
+    await writeFile(file, JSON.stringify(config));
+    const pushed = await runCli(['push', root, '--insecure', '--yes', '--whole-server', '--overwrite-config-map', '--backup-dir', backupDir], env(targetPort));
+    expect(pushed.status, pushed.stderr).toBe(0);
+    expect(JSON.stringify((await target.getServerConfiguration()).configurationMap)).toContain('synthetic-map-replacement');
+    const args = printedUndoArgs(pushed.stdout);
+    expect(args).toContain('--overwrite-config-map');
+    expect(args).toContain('--insecure');
+    const restored = await runCli([...args, '--yes'], { ...env(targetPort), MIRTH_PORT: '1' });
+    expect(restored.status, restored.stderr).toBe(0);
+    expect((await target.getServerConfiguration()).configurationMap).toEqual(before);
   }, 120_000);
 
   it('backs up the server and restores it after a channel is deleted', async () => {

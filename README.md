@@ -124,7 +124,7 @@ channelvault push ./mirth --library Formatting --deploy  # one library, then red
 - After a push the tree's revision numbers are updated from the server, so `diff` and the next `push` stay clean.
 - Server settings, the configuration map, channel groups and tags are **not** pushed; `push` names them if they differ. `--whole-server` replaces the entire server configuration instead. It shows the same change list and needs the same `--allow-deletes` / `--force`, and it can't be combined with `--channel` or `--library`.
 - A tree exploded from an XML backup is refused (its shape differs from the live API's); `--ignore-origin` overrides that.
-- Before it changes anything, `push` backs up the server (see below) and prints the `restore` command that undoes it. `--no-backup` skips that.
+- Before it changes anything, `push` backs up the server (see below) and prints a configuration undo command with the original target, TLS options, user and backup directory. It includes `--overwrite-config-map` when the push overwrites that map. Passwords are omitted; supply the server's credential through `MIRTH_PASS`. `--no-backup` skips the backup. Backups do not capture runtime deployment state; review targeted redeployment separately after a configuration undo.
 - Without a terminal, `push` needs `--yes`.
 - `--plan-only` shows the plan and what would stop it, and changes nothing: no prompt, no backup, no writes. It works without a terminal.
 
@@ -148,9 +148,17 @@ channelvault restore .backup/vns-gov-20260925T143012Z.xml --deploy
   - The preview says when the restore changes the server's name. `push --whole-server` does too.
   - A backup from a newer Mirth version is refused; an older one is converted by the server.
   - It previews the channels and templates it creates, changes and deletes, and asks before continuing (`--yes` without a terminal).
-  - It saves the server's current configuration first, as a new backup, and prints the command that undoes the restore. That backup is the newest, so a second plain `restore` reverts the first.
+  - It saves the server's current configuration first, as a new backup, and prints the command that undoes the restore. That backup is the newest, so a second plain `restore` reverts the saved configuration except an overwritten configuration map: use the printed command, which repeats `--overwrite-config-map` when needed. Runtime deployment state is not captured in a configuration backup.
   - If the server changes while you confirm, nothing is restored; run it again to review the new state.
   - `--deploy` redeploys every channel afterwards; `--overwrite-config-map` also replaces the configuration map.
+
+## First production use
+
+1. Build and pin the reviewed revision. The integration suite exercises Mirth 4.5.2; rehearse on your own Mirth version and installed plugins in staging, with isolated connectors and destination credentials.
+2. Start with `pull`, `status`, `diff` and `push --plan-only --json`. Pull into a fresh directory, or commit/stash local edits first: pull replaces configuration content and does not merge edits. Commit the resulting tree while keeping env files and backups private.
+3. Rehearse a scoped edit and its printed configuration undo in staging. If a change overwrites the configuration map, verify that undo restores it too. Check deployed channels and message behavior separately, since configuration backups do not capture runtime state.
+4. For the first production write, use a single-writer change window and one noncritical channel with `push --channel <name>`. Review the target and plan, keep the automatic backup, and use the normal conflict checks. Promotion to another installation requires reviewed `adopt` first.
+5. After writing, inspect `diff` and the next push plan, and verify behavior in Mirth. Expand the scope after the pilot succeeds. A scoped push can stop after some resources are saved; inspect its applied count and failure before retrying or using the backup.
 
 ## Using channelvault with an AI agent
 
