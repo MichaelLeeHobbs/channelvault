@@ -67,9 +67,28 @@ function same(a: Json | undefined, b: Json | undefined): boolean {
   return false;
 }
 
+/**
+ * A channel's tag and dependency links. Saving a channel replaces them with
+ * whatever the payload carries, so push carries the server's over.
+ */
+export const ASSOCIATIONS = ['channelTags', 'dependentIds', 'dependencyIds'];
+
+/**
+ * Mirth holds a code template's context types in a Java set, so two servers
+ * list the same contexts in different orders (seen on 4.5.0).
+ */
+function withSortedContexts(o: Obj): Obj {
+  const set = o['contextSet'];
+  const delegate = isObj(set) ? set['delegate'] : undefined;
+  const types = isObj(delegate) ? delegate['contextType'] : undefined;
+  if (!isObj(set) || !isObj(delegate) || !Array.isArray(types)) return o;
+  const sorted = [...types].sort((a, b) => String(a).localeCompare(String(b), 'en'));
+  return { ...o, contextSet: { ...set, delegate: { ...delegate, contextType: sorted } } };
+}
+
 /** Drop the fields Mirth changes on every save, so they never count as a change. */
 function stripVolatile(o: Obj): Obj {
-  const out: Obj = { ...o };
+  const out: Obj = withSortedContexts({ ...o });
   delete out['revision'];
   delete out['lastModified'];
   // Of exportData, compare only the channel's own metadata. Its tags and
@@ -100,11 +119,15 @@ export function withoutVolatile(c: CanonicalConfig): CanonicalConfig {
   const strip = (o: Obj): void => {
     delete o['revision'];
     delete o['lastModified'];
-    const md = isObj(o['exportData']) ? o['exportData']['metadata'] : undefined;
+    const exportData = o['exportData'];
+    const md = isObj(exportData) ? exportData['metadata'] : undefined;
     if (isObj(md)) {
       delete md['lastModified'];
       delete md['userId'];
     }
+    // Null and absent are the same to Mirth (see stripVolatile).
+    if (isObj(exportData)) for (const key of ASSOCIATIONS) if (exportData[key] === null) delete exportData[key];
+    if (isObj(o['contextSet'])) o['contextSet'] = withSortedContexts(o)['contextSet']!;
   };
   for (const ch of channelsOf(out)) strip(ch);
   for (const lib of librariesOf(out)) {

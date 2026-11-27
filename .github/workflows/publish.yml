@@ -36,16 +36,23 @@ jobs:
       # Authenticates via npm trusted publishing (OIDC); no NPM_TOKEN secret.
       # A version already on npm (the first one, published by hand before a
       # trusted publisher could be configured) is not published again.
+      # A prerelease (1.2.0-rc.1) goes to the `next` dist-tag: without one npm
+      # would make it `latest`, and npm 11 refuses to publish it at all.
       - name: Publish
         run: |
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
           if npm view "$name@$version" version >/dev/null 2>&1; then
             echo "::notice::$name@$version is already on npm; not publishing it again"
+          elif [[ "$version" == *-* ]]; then
+            npm publish --provenance --access public --tag next
           else
             npm publish --provenance --access public
           fi
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+        run: |
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes --title "${GITHUB_REF_NAME}" "${prerelease[@]}"

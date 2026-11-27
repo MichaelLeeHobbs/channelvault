@@ -52,10 +52,20 @@ afterEach(() => {
 });
 
 describe('createMirthClient', () => {
-  it.each(['', '{}', 'not-an-installation-id'])('refuses an invalid installation ID %j', async id => {
+  it.each(['', '   ', '<html>\n<body>error</body>\n</html>', 'id\u001b[2J', 'x'.repeat(256), 'mirth‮gov'])('refuses an invalid installation ID %j', async id => {
     fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(new Response(id));
     const client = createMirthClient(CONFIG);
     try { await expect(client.getServerId()).rejects.toThrow('invalid installation ID'); }
+    finally { await client.close(); }
+  });
+  it.each([
+    ['a generated UUID', '0b6c3f0e-2a8e-4f5d-9c1a-7e2b4d6f8a10'],
+    ['a name an admin set in appdata/server.id', 'mirth-gov'],
+    ['a name that is not ASCII', 'café prod'],
+  ])('accepts %s as the installation ID', async (_label, id) => {
+    fetchMock.mockResolvedValueOnce(loginResponse()).mockResolvedValueOnce(new Response(id + '\n'));
+    const client = createMirthClient(CONFIG);
+    try { await expect(client.getServerId()).resolves.toBe(id); }
     finally { await client.close(); }
   });
   it('reads a standalone template with its revision', async () => {

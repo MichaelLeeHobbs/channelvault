@@ -77,15 +77,24 @@ type Segment = string;
 
 /**
  * A stable address for a value: array elements are identified by `id` or
- * `metaDataId` when they have one, so reordering or adding channels does not
- * move an existing placeholder to a different value.
+ * `metaDataId` when they have one, and configuration-map entries by their key,
+ * so removing, reordering or adding elements does not move an existing
+ * placeholder to a different value.
  */
 function elementSegment(el: Json, index: number): Segment {
   if (el && typeof el === 'object' && !Array.isArray(el)) {
     const id = el['id'] ?? el['metaDataId'];
     if (typeof id === 'string' || typeof id === 'number') return `[${String(id)}]`;
+    const mapKey = CONFIG_PROPERTY in el ? configMapKeyOf(el) : undefined;
+    if (mapKey !== undefined) return `[${mapKey}]`;
   }
   return `[${index}]`;
+}
+
+function configMapKeyOf(entry: Record<string, Json>): string | undefined {
+  const key = entry['string'];
+  if (typeof key === 'string') return key;
+  return Array.isArray(key) && typeof key[0] === 'string' ? key[0] : undefined;
 }
 
 export interface Leaf {
@@ -112,15 +121,7 @@ export function mapLeaves(config: CanonicalConfig, visit: (value: string, leaf: 
       const name = node['name'];
       const inner = typeof name === 'string' && name.trim() !== '' ? [...labels, name] : labels;
       // A configuration-map entry: { string: key | [key], ConfigurationProperty: { value, comment } }.
-      const entryKey = node['string'];
-      const mapKey =
-        section === 'configurationMap' && CONFIG_PROPERTY in node
-          ? typeof entryKey === 'string'
-            ? entryKey
-            : Array.isArray(entryKey) && typeof entryKey[0] === 'string'
-              ? entryKey[0]
-              : undefined
-          : cmKey;
+      const mapKey = section === 'configurationMap' && CONFIG_PROPERTY in node ? configMapKeyOf(node) : cmKey;
       const out: Record<string, Json> = {};
       for (const [k, v] of Object.entries(node)) {
         out[k] = walk(v, k, [...path, k], inner, section || k, mapKey);

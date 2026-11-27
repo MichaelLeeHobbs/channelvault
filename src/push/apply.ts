@@ -10,6 +10,7 @@ import type { MirthClientExt } from '../client/index.js';
 import { readJson } from '../json.js';
 import type { CanonicalConfig, Json } from '../types.js';
 import {
+  ASSOCIATIONS,
   changedSince,
   findChannel,
   findTemplate,
@@ -130,13 +131,10 @@ async function checkTemplate(client: MirthClientExt, change: Change, remote: Can
 }
 
 /**
- * Saving a channel replaces its tag and dependency links with whatever the
- * payload carries, and the server configuration we pulled omits them, so a
- * plain PUT would silently untag the channel (seen on 4.5.2). Carry the
- * server's current links over; push only syncs the channel itself.
+ * The server configuration we pulled omits a channel's tag and dependency
+ * links, so a plain PUT would silently untag the channel (seen on 4.5.2).
+ * Carry the server's current links over; push only syncs the channel itself.
  */
-const ASSOCIATIONS = ['channelTags', 'dependentIds', 'dependencyIds'];
-
 async function withServerAssociations(
   client: MirthClientExt,
   channel: Obj,

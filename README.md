@@ -15,6 +15,12 @@ npm install -g @ubercode/channelvault     # then: channelvault --help
 npx @ubercode/channelvault --help         # or run it without installing
 ```
 
+0.3.0 is in release candidates, published under the `next` tag; `latest` stays on 0.2.1 until 0.3.0 is final:
+
+```
+npm install -D @ubercode/channelvault@next
+```
+
 ## How it works
 
 Everything centers on one in-memory representation, the **canonical config**: a plain JSON object mirroring Mirth's `serverConfiguration` document. Two adapters produce it:
@@ -184,7 +190,7 @@ MIRTH_HOST=localhost MIRTH_PORT=8443 MIRTH_USER=admin MIRTH_PASS=admin \
   channelvault pull ./work --insecure
 ```
 
-To try channelvault on a **real** configuration, use `docker compose -f docker-compose.isolated.yml up -d` instead: the same server with no outbound network (a deployed channel cannot reach anything), startup deploy off, and port 8443 on localhost only. `down` deletes it and everything in it.
+To try channelvault on a **real** configuration, use `docker compose -f docker-compose.isolated.yml up -d` instead: the same server with no outbound network (a deployed channel cannot reach anything), startup deploy off, and port 8443 on localhost only. `down` deletes it and everything in it. It gives Mirth a 2 GB heap: with the image's default 256 MB, restoring a real configuration fails with out-of-memory errors that show only in `/opt/connect/logs/mirth.log`, not in the Administrator.
 
 `pnpm test:integration` creates two disposable Mirth 4.5.2 servers on random localhost ports and runs two suites. The mesh suite loads the production-shaped mesh and checks that a pull converges (nothing to push, no diff) before and after scoped pushes, a redeploy and a restore. The promotion suite imports the synthetic fixture and drives the CLI through a promotion with different destination credentials and independent revision history. It verifies installation refusal, reviewed target adoption, preserved tags and unrelated channels, and a clean repeat push. It removes its containers and network on success or failure. Docker is required; unavailable servers fail the command.
 
