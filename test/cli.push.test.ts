@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -656,5 +657,20 @@ describe('push output when the export breaks', () => {
     expect(result.stderr).toContain('replaced the configuration at');
     expect(result.stderr).toContain("The tree's baseline was not refreshed");
     expect(result.stderr).toContain('including the undo command above');
+  });
+});
+
+describe('after a push', () => {
+  // Agents and developers forgot to commit the refreshed revisions, so the next push read them as conflicts.
+  it('names the tree files to commit with the change', async () => {
+    const git = (...args: string[]) => spawnSync('git', ['-c', 'user.email=t@example.com', '-c', 'user.name=t', ...args], { cwd: tree, encoding: 'utf8' });
+    expect(git('init', '-q').status).toBe(0);
+    expect(git('add', '.').status).toBe(0);
+    expect(git('commit', '-q', '-m', 'pull').status).toBe(0);
+    await edit('Alpha');
+    const result = await runCli(pushArgs('--yes'), env);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toMatch(/commit the refreshed baseline with your change \(paths from the repository root\): .*channelvault\.json/);
+    expect(result.stdout).toContain('channels/Alpha/scripts/deploy.js');
   });
 });

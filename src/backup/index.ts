@@ -17,10 +17,18 @@ import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { configDir } from '../profiles.js';
 import type { CanonicalConfig, Json } from '../types.js';
 
-/** Default backup directory, relative to the current directory. */
-export const DEFAULT_BACKUP_DIR = '.backup';
+/**
+ * Shared by every checkout, so a push run from a worktree keeps its undo file
+ * when the worktree is removed; the manifest keeps servers apart.
+ */
+export function defaultBackupDir(): string {
+  return path.join(configDir(), 'backups');
+}
+/** Where backups went before 0.3.0-rc.3, relative to the current directory; restore still looks there. */
+export const LEGACY_BACKUP_DIR = '.backup';
 /** Backups kept per server unless `--keep` says otherwise. */
 export const DEFAULT_KEEP = 10;
 
