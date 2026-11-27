@@ -2,7 +2,7 @@
  * Differences between servers that are representation, not content: what a
  * tree pulled from one installation must not report against another.
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -88,5 +88,17 @@ describe('diff and push across representations', () => {
     serverExportData()['channelTags'] = { channelTag: [{ id: 'g1', name: 'lab', channelIds: { string: ['c1'] } }] };
     const diff = await run('diff', tree, '--json');
     expect(diff.status).toBe(1);
+  });
+});
+
+describe('a code template holding a character XML 1.0 forbids', () => {
+  // The production incident: U+FFFE in a regex inside a code template.
+  it('is refused before any backup or save, naming the template and its file', async () => {
+    await writeFile(path.join(tree, 'codeTemplates', 'Lib', 'trim.js'), 'function trim() { return /[\uFFFE]/; }');
+    const result = await run('push', tree, '--yes', '--backup-dir', path.join(dir, 'backups'));
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Lib › trim › code: line 1, column 28 of the value (U+FFFE)');
+    expect(result.stderr).toContain('codeTemplates/Lib/trim.js:1:28 (U+FFFE)');
+    expect(mirth.writes).toEqual([]);
   });
 });

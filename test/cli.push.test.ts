@@ -608,3 +608,53 @@ describe('redeploy after saving', () => {
     expect(writes()).toEqual(['PUT /api/channels/c1']);
   });
 });
+
+describe('push output when the export breaks', () => {
+  it('lists the problem under wouldStop in plan-only JSON', async () => {
+    await writeFile(path.join(tree, 'channels', 'Alpha', 'scripts', 'deploy.js'), 'return "\uFFFF";');
+    const r = await runCli(pushArgs('--plan-only', '--json'), env);
+    expect(r.status, r.stderr).toBe(0);
+    const out = JSON.parse(r.stdout) as { wouldStop: string[] };
+    expect(out.wouldStop.some(p => p.includes('Alpha › deployScript: line 1, column 9 of the value (U+FFFF)'))).toBe(true);
+  });
+
+  it('checks each saved channel on its own, and does not redeploy one edited again', async () => {
+    await Promise.all(['Alpha', 'Beta'].map(edit));
+    mirth.deployed = new Set(['c1', 'c2']);
+    mirth.onRequest = req => {
+      if (req.method === 'GET' && req.path === '/api/server/configuration' && mirth.writes.some(w => w.method === 'PUT')) {
+        channelsOf(mirth.config)[1]!['deployScript'] = 'colleagueAfterSave();';
+        return { status: 500, body: 'cannot export' };
+      }
+    };
+    const result = await runCli(pushArgs('--yes', '--deploy'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('these changed again after saving: Beta');
+    expect(result.stderr).toContain('2 channel(s) NOT redeployed: Alpha, Beta');
+    expect(result.stderr).toContain('could not read the server configuration back: HTTP 500');
+    expect(writes()).toEqual(['PUT /api/channels/c1', 'PUT /api/channels/c2']);
+  });
+
+  it('does not point at an undo command that --no-backup never printed', async () => {
+    await edit('Alpha');
+    mirth.onRequest = req => req.method === 'GET' && req.path === '/api/server/configuration' && mirth.writes.length
+      ? { status: 500, body: 'cannot export' }
+      : undefined;
+    const result = await runCli(pushArgs('--yes', '--no-backup'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('pull, diff, push and restore fail until');
+    expect(result.stderr).not.toContain('undo command');
+  });
+
+  it('says so when a whole-server replace cannot be read back', async () => {
+    await edit('Alpha');
+    mirth.onRequest = req => req.method === 'GET' && req.path === '/api/server/configuration' && mirth.writes.some(w => w.method === 'PUT')
+      ? { status: 500, body: 'cannot export' }
+      : undefined;
+    const result = await runCli(pushArgs('--yes', '--whole-server'), env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('replaced the configuration at');
+    expect(result.stderr).toContain("The tree's baseline was not refreshed");
+    expect(result.stderr).toContain('including the undo command above');
+  });
+});

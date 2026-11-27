@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -50,7 +50,7 @@ import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_BACKUP_
 import { readJson } from './json.js';
 import { forbiddenXmlChars, xmlSafetyProblem } from './xml/chars.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
-import { JOURNAL, lockTree, MANAGED_DIRS, recoverTree, replaceTree, STAGING_DIR } from './tree/transaction.js';
+import { JOURNAL, lockTree, MANAGED_DIRS, recoverTree, replaceTree, STAGING_DIR, treeFiles } from './tree/transaction.js';
 
 const engine = createExplodeEngine();
 const xml = new XmlConfigAdapter();
@@ -627,7 +627,7 @@ async function bindingProblems(root: string, serverId: string): Promise<string[]
 }
 
 async function xmlProblems(root: string, config: CanonicalConfig): Promise<string[]> {
-  const problem = await xmlSafetyProblem(config, { root, dirs: MANAGED_DIRS });
+  const problem = await xmlSafetyProblem(config, root);
   return problem ? [problem] : [];
 }
 
@@ -809,12 +809,13 @@ async function scopedPush(
   // redeploy of changes that are saved.
   let baselineError: string | undefined;
   let changedAgain: string[] = [];
+  let unverified: string[] = [];
   let after: CanonicalConfig | undefined;
   try {
     after = await client.getServerConfiguration();
   } catch (err) {
-    baselineError = `could not read the server configuration back: ${err instanceof Error ? err.message : String(err)}. ` +
-      'If the server cannot export its configuration, pull, diff, push and restore (including the undo command above) fail until the resource that broke it is fixed in the Administrator; then pull or adopt to refresh the baseline';
+    baselineError = `could not read the server configuration back: ${err instanceof Error ? err.message : String(err)}. ${exportBrokenHint(flags)}`;
+    ({ changed: changedAgain, unverified } = await changedAgainSingly(client, result.applied, local));
   }
   if (after) {
     try {
@@ -839,14 +840,15 @@ async function scopedPush(
   const notRedeployed = toDeploy.length > 0
     ? `\n${toDeploy.length} channel(s) NOT redeployed: ${toDeploy.map(nameOf).join(', ')}; redeploy them from the Administrator once the server is as intended`
     : '';
+  const againNote = changedAgain.length > 0 ? `\nchanged again after saving (pull and review before retrying): ${changedAgain.join(', ')}` : '';
   if (result.failed) {
     if (baselineError) process.stderr.write(`warning: could not refresh the local sync baseline: ${scrub(baselineError)}\n`);
     const { change, error } = result.failed;
-    fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}${notRedeployed}`);
+    fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}${againNote}${notRedeployed}`);
   }
   // Someone else's edit landed on a pushed resource; a redeploy would put it live unreviewed.
   if (changedAgain.length > 0) {
-    fail(`applied ${result.applied.length} change(s), but these changed again after saving: ${changedAgain.join(', ')}; pull and review before retrying${notRedeployed}`);
+    fail(`applied ${result.applied.length} change(s), but these changed again after saving: ${changedAgain.join(', ')}; pull and review before retrying${notRedeployed}${baselineError ? `\n${baselineError}` : ''}`);
   }
   process.stdout.write(`pushed ${result.applied.length} change(s)\n`);
 
@@ -857,7 +859,46 @@ async function scopedPush(
     for (const f of failures) process.stderr.write(`deploy failed: ${f.name}: ${scrub(f.error)}\n`);
     if (failures.length > 0) process.exitCode = 1;
   }
-  if (baselineError) fail(`pushed ${result.applied.length} change(s), but could not refresh the local sync baseline: ${baselineError}`);
+  if (baselineError) {
+    const note = unverified.length > 0 ? `\nnot checked after saving (these cannot be read one at a time): ${unverified.join(', ')}` : '';
+    fail(`pushed ${result.applied.length} change(s), but could not refresh the local sync baseline: ${baselineError}${note}`);
+  }
+}
+
+function exportBrokenHint(flags: BackupFlags): string {
+  const undo = flags.backup === false ? '' : ' (including the undo command above)';
+  return `If the server cannot export its configuration, pull, diff, push and restore${undo} fail until the resource that broke it is fixed in the Administrator; then pull or adopt to refresh the baseline`;
+}
+
+/**
+ * The redeploy guard when the server export fails: Mirth still serves
+ * channels and code templates one at a time. Libraries and global scripts
+ * have no such endpoint here, so they are reported as unchecked.
+ */
+async function changedAgainSingly(
+  client: MirthClientExt,
+  applied: Change[],
+  local: CanonicalConfig,
+): Promise<{ changed: string[]; unverified: string[] }> {
+  const changed: string[] = [];
+  const unverified: string[] = [];
+  for (const c of applied) {
+    if (c.kind !== 'channel' && c.kind !== 'codeTemplate') {
+      unverified.push(c.label);
+      continue;
+    }
+    try {
+      const current = (c.kind === 'channel' ? await client.getChannel(c.id) : await client.getCodeTemplate(c.id)) as Record<string, Json> | null;
+      const held = current ? [current] : [];
+      const server = (c.kind === 'channel'
+        ? { channels: { channel: held } }
+        : { codeTemplateLibraries: { codeTemplateLibrary: [{ codeTemplates: { codeTemplate: held } }] } }) as CanonicalConfig;
+      if (!savedChangeMatches(c, local, server)) changed.push(c.label);
+    } catch {
+      changed.push(`${c.label} (could not be read)`);
+    }
+  }
+  return { changed, unverified };
 }
 
 /** The full replace, gated like a scoped push: it lists and guards deletions and conflicts too. */
@@ -932,7 +973,7 @@ async function wholeServerPush(
     after = await client.getServerConfiguration();
   } catch (err) {
     fail(`replaced the configuration at ${target}${flags.deploy ? ' (Mirth redeploys as part of the replace)' : ''}, but could not read it back: ${err instanceof Error ? err.message : String(err)}. ` +
-      'The tree\'s baseline was not refreshed. If the server cannot export its configuration, pull, diff, push and restore (including the undo command above) fail until the resource that broke it is fixed in the Administrator; then pull or adopt to refresh the baseline');
+      `The tree's baseline was not refreshed. ${exportBrokenHint(flags)}`);
   }
   if (planPush(local, after, {}, undefined, { wholeReplace: true }).changes.length > 0) {
     fail('applied the whole-server replacement, but resources changed again after saving; pull and review before retrying');
@@ -1355,17 +1396,7 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
  * comparison agrees with the patch.
  */
 async function changedFiles(treeDir: string, serverDir: string): Promise<Array<{ path: string; change: 'modified' | 'only-in-tree' | 'only-on-server' }>> {
-  const list = async (base: string): Promise<string[]> => {
-    const out: string[] = [];
-    for (const d of MANAGED_DIRS) {
-      if (!existsSync(path.join(base, d))) continue;
-      for (const entry of await readdir(path.join(base, d), { recursive: true, withFileTypes: true })) {
-        if (entry.isFile()) out.push(path.relative(base, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'));
-      }
-    }
-    return out;
-  };
-  const [local, remote] = await Promise.all([list(treeDir), list(serverDir)]);
+  const [local, remote] = await Promise.all([treeFiles(treeDir), treeFiles(serverDir)]);
   const remoteSet = new Set(remote);
   const files: Array<{ path: string; change: 'modified' | 'only-in-tree' | 'only-on-server' }> = [];
   for (const p of local) {

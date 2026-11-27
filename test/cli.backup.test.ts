@@ -144,6 +144,17 @@ describe('restore', () => {
     expect(same.stderr).toContain('so which server it came from cannot be checked');
   });
 
+  it('refuses a backup holding a character XML 1.0 forbids, before changing anything', async () => {
+    const outside = path.join(dir, 'exported.xml');
+    await writeFile(outside, serverXml({ name: 'VNS Gov', channels: ['Al&#xFFFE;pha'] }));
+    const refused = await cli('restore', outside, '--yes');
+    expect(refused.status).toBe(1);
+    expect(refused.stderr).toContain('1 character(s) that XML 1.0 forbids');
+    expect(refused.stderr).toContain('line 1, column 3 of the value (U+FFFE)');
+    expect(mirth.writes).toEqual([]);
+    expect(await files()).toEqual([]);
+  });
+
   it('refuses a backup from a newer Mirth version, even with a suffix', async () => {
     const newer = await backupFile('vns-gov', '20260922T100000Z', ['Alpha'], { version: '4.6.0-SNAPSHOT' });
     const r = await cli('restore', newer, '--yes');
