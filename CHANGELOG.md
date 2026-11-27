@@ -2,6 +2,13 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `push` and `restore` refuse a configuration holding a character XML 1.0 forbids (C0 controls other than tab and line breaks, U+FFFE, U+FFFF, unpaired surrogates) before the backup and before any save, naming the resource, the line and column, and the tree file. Mirth saves such a character, but then cannot export its configuration (HTTP 500), so every later pull, diff, push and restore fails until the resource is fixed in the Administrator. `push --plan-only` lists it under what would stop the push, `diff` and `status` warn about it, and `status --json` lists it as `xmlForbiddenChars`.
+- A scoped `push --deploy` redeploys the channels it saved even when refreshing the local sync baseline afterwards fails, then reports that failure. When it does not redeploy (a save failed, or a pushed resource changed again on the server), it names the channels it did not redeploy. When the server cannot export its configuration after a push, the message says that restore and the printed undo command fail too until the server is fixed.
+
 ## [0.3.0-rc.1] — 2026-11-27
 
 Release candidate, published under the npm `next` tag.
