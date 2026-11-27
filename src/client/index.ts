@@ -459,7 +459,7 @@ class MirthClientImpl implements MirthClientExt {
     if (response.status >= 300 && response.status < 400) {
       await response.body?.cancel();
       throw new Error(`the server answered ${new URL(url).pathname} with a redirect (HTTP ${response.status}${redirectTarget(url, response)}); ` +
-        'channelvault does not follow redirects, so a login cannot be sent elsewhere. Point --host/--port (or MIRTH_HOST/MIRTH_PORT) at the server itself');
+        'channelvault does not follow redirects, so credentials and session cookies are never sent elsewhere. Connect to the address it redirects to: check https vs --no-https, --host and --port (or MIRTH_HOST/MIRTH_PORT)');
     }
     return response;
   }

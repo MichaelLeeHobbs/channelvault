@@ -344,7 +344,7 @@ async function loadEnv(file: string): Promise<Record<string, string | undefined>
 function addEnvFlag(cmd: Command): Command {
   // Not --env-file: Node scans the whole command line for that name and parses
   // the file itself (it fails on a directory and honours NODE_OPTIONS in it).
-  return cmd.option('--dotenv <path>', 'env file holding secrets and per-environment values (default <dir>/.env)');
+  return cmd.option('--dotenv <path>', 'env file holding the tree\'s placeholder values, not the login (default <dir>/.env)');
 }
 
 function addExtractFlag(cmd: Command): Command {
