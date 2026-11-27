@@ -75,8 +75,7 @@ export const ASSOCIATIONS = ['channelTags', 'dependentIds', 'dependencyIds'];
 
 /**
  * Mirth holds a code template's context types in a Java set, so two servers
- * list the same contexts in different orders (seen on 4.5.0). Returns `o` with
- * the list sorted, or `o` itself when there is nothing to sort.
+ * list the same contexts in different orders (seen on 4.5.0).
  */
 function withSortedContexts(o: Obj): Obj {
   const set = o['contextSet'];
@@ -126,7 +125,7 @@ export function withoutVolatile(c: CanonicalConfig): CanonicalConfig {
       delete md['lastModified'];
       delete md['userId'];
     }
-    // Mirth flips these between absent and null after unrelated saves.
+    // Null and absent are the same to Mirth (see stripVolatile).
     if (isObj(exportData)) for (const key of ASSOCIATIONS) if (exportData[key] === null) delete exportData[key];
     if (isObj(o['contextSet'])) o['contextSet'] = withSortedContexts(o)['contextSet']!;
   };

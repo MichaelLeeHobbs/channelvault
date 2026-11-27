@@ -8,7 +8,9 @@ Release candidate, published under the npm `next` tag.
 
 ### Changed
 
-- **A tree is bound to the server installation it was pulled from.** `pull` records Mirth's installation ID, and `push` refuses a tree from a different or unknown installation, even with `--force`: revision numbers from another server say nothing about this one. A tree pulled with an earlier version has no installation ID, so it needs a fresh pull (with a merge) or `adopt` before its next push.
+- **A tree is bound to the server installation it was pulled from.** `pull` records Mirth's installation ID, and `push` refuses a tree from a different or unknown installation, even with `--force`: revision numbers from another server say nothing about this one. A tree pulled with an earlier version has no installation ID, so it needs a fresh pull (with a merge) or `adopt` before its next push. The ID is taken as Mirth gives it: a generated UUID, or any one-line name an admin set in `appdata/server.id` (such as `mirth-gov`), up to 255 characters. A pull whose installation changes while it reads the server is refused.
+- Configuration-map entries are addressed by key, not position (see Fixed). An entry in `channelvault.allow.json` that allowed a finding in a configuration-map field (such as an entry's comment) no longer matches and must be added again.
+- A scoped push reports the channels it redeployed, skipped and failed to redeploy separately, and refuses a redeploy whose deployment status it cannot read.
 - Tree commands hold a lock on the tree, so two commands cannot change it at once.
 
 ### Added
@@ -25,7 +27,6 @@ Release candidate, published under the npm `next` tag.
 - A live configuration that is empty or not shaped like one (an HTTP 200 carrying an error) is refused instead of replacing a healthy tree or feeding a push plan.
 - The printed undo command after a push or restore is complete: it keeps the connection and TLS options and the backup directory, repeats `--overwrite-config-map` when it was used, and quotes arguments for the shell. `--overwrite-config-map` is refused on a scoped push.
 - `diff` and the push plan compare a code template's context types as a set (Mirth lists them in a different order on each server), and treat a channel's tags and dependency links as the same whether null or absent. A tree pulled from one server no longer shows every library and channel as modified against another.
-- Live commands accept any single-line installation ID, not only a UUID: Mirth reads it from `appdata/server.id`, which admins can set to a name such as `mirth-gov`.
 - A re-pull no longer gives configuration-map entries each other's placeholders after an earlier entry is removed from the server. Entries were addressed by position, so each one after the removed entry inherited its neighbour's placeholder name (the values in the env file stayed with the right entry). Entries are now addressed by key. A tree pulled with an affected version keeps the wrong names on re-pull: pull it into a fresh directory to regenerate them.
 
 ## [0.2.1] — 2026-09-29

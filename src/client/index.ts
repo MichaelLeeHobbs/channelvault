@@ -288,10 +288,11 @@ class MirthClientImpl implements MirthClientExt {
   async getServerId(): Promise<string> {
     // JSON is refused (406); the ID comes as plain text. Mirth generates a UUID but reads it from
     // appdata/server.id, which admins can set to any name (one 4.5.0 server answers "mirth-gov").
-    // It is only compared and printed, so accept one printable line and refuse control characters.
+    // It is only compared and printed, so accept one printable line and refuse control and
+    // format characters (terminal escapes, newlines, bidi overrides).
     const response = await this.request('GET', '/server/id', { headers: { Accept: 'text/plain' } });
     const id = (await response.text()).trim();
-    if (!/^[\x20-\x7e]{1,255}$/.test(id)) throw new Error('the server returned an invalid installation ID');
+    if (!/^[^\p{Cc}\p{Cf}]{1,255}$/u.test(id)) throw new Error('the server returned an invalid installation ID');
     return id;
   }
 
