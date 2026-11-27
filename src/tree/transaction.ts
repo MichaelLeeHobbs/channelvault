@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { constants, existsSync } from 'node:fs';
-import { copyFile, lstat, mkdir, readlink, realpath, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readdir, readlink, realpath, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import * as path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -8,6 +8,18 @@ import { writePrivate } from '../backup/index.js';
 import { readJson } from '../json.js';
 
 export const MANAGED_DIRS = ['server', 'channels', 'codeTemplates', 'channelGroups'];
+
+/** Files under the managed directories of `base`, as `/`-separated paths relative to it. */
+export async function treeFiles(base: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const d of MANAGED_DIRS) {
+    if (!existsSync(path.join(base, d))) continue;
+    for (const entry of await readdir(path.join(base, d), { recursive: true, withFileTypes: true })) {
+      if (entry.isFile()) out.push(path.relative(base, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'));
+    }
+  }
+  return out;
+}
 export const STAGING_DIR = '.channelvault-staging';
 export const JOURNAL = '.channelvault-transaction.json';
 const ITEMS = [...MANAGED_DIRS, 'channelvault.json', '.gitignore', '.secrets', 'env'];

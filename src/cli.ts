@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -48,8 +48,9 @@ import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './s
 import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
 import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_BACKUP_DIR, DEFAULT_KEEP, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
 import { readJson } from './json.js';
+import { forbiddenXmlChars, xmlSafetyProblem } from './xml/chars.js';
 import type { CanonicalConfig, ClientConfig, Json } from './types.js';
-import { JOURNAL, lockTree, MANAGED_DIRS, recoverTree, replaceTree, STAGING_DIR } from './tree/transaction.js';
+import { JOURNAL, lockTree, MANAGED_DIRS, recoverTree, replaceTree, STAGING_DIR, treeFiles } from './tree/transaction.js';
 
 const engine = createExplodeEngine();
 const xml = new XmlConfigAdapter();
@@ -625,6 +626,11 @@ async function bindingProblems(root: string, serverId: string): Promise<string[]
   return [`this tree's baseline belongs to ${meta?.serverId ? `installation ${meta.serverId}` : 'an unknown installation'}, not the target (${serverId}); pull the target and merge your edits, or review with 'adopt <dir> --plan-only' and run 'adopt <dir>' to establish its baseline; --force does not bypass installation binding`];
 }
 
+async function xmlProblems(root: string, config: CanonicalConfig): Promise<string[]> {
+  const problem = await xmlSafetyProblem(config, root);
+  return problem ? [problem] : [];
+}
+
 async function assertBinding(client: MirthClientExt, root: string): Promise<void> {
   const problems = await bindingProblems(root, await client.getServerId());
   if (problems.length) fail(problems.join('\n'));
@@ -734,7 +740,7 @@ async function scopedPush(
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
   const plan = planPush(local, remote, scope, known);
-  const problems = [...await bindingProblems(root, await client.getServerId()), ...planProblems(plan, flags)];
+  const problems = [...await bindingProblems(root, await client.getServerId()), ...planProblems(plan, flags), ...await xmlProblems(root, local)];
   const names = new Map(
     [...channelsOf(remote), ...channelsOf(local)].map((c) => [String(c['id']), String(c['name'])] as const),
   );
@@ -798,27 +804,51 @@ async function scopedPush(
   await assertBinding(client, root);
   const result = await applyPlan(client, plan, local, afterBackup, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
-  // resources that did go through don't read as conflicts next time.
+  // resources that did go through don't read as conflicts next time. The
+  // baseline is local bookkeeping: failing to refresh it does not stop the
+  // redeploy of changes that are saved.
+  let baselineError: string | undefined;
+  let changedAgain: string[] = [];
+  let unverified: string[] = [];
+  let after: CanonicalConfig | undefined;
   try {
-    const after = await client.getServerConfiguration();
-    const refreshedLibraries: Change[] = librariesOf(local)
-      .filter(l => result.touchedIds.has(String(l['id'])))
-      .map(l => ({ kind: 'library', op: 'update', id: String(l['id']), label: String(l['name']) }));
-    const membershipSent = result.sentLibraries
-      ? { ...local, codeTemplateLibraries: { codeTemplateLibrary: result.sentLibraries } }
-      : local;
-    const changedAgain = [...result.applied, ...refreshedLibraries].filter(c => !savedChangeMatches(c, c.kind === 'library' ? membershipSent : local, after));
-    if (changedAgain.length > 0) fail(`changed again after saving: ${[...new Set(changedAgain.map(c => c.label))].join(', ')}; pull and review before retrying`);
-    if (result.touchedIds.size > 0) await refreshRevisions(root, after, result.touchedIds);
-    if (known) await writeKnown(root, knownAfterPush(known, result.applied, result.touchedIds, after));
+    after = await client.getServerConfiguration();
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!result.failed) fail(`applied ${result.applied.length} change(s), but could not refresh the local sync baseline: ${message}; inspect the server before retrying`);
-    process.stderr.write(`warning: could not refresh the local sync baseline: ${scrub(message)}\n`);
+    baselineError = `could not read the server configuration back: ${err instanceof Error ? err.message : String(err)}. ${exportBrokenHint(flags)}`;
+    ({ changed: changedAgain, unverified } = await changedAgainSingly(client, result.applied, local));
   }
+  if (after) {
+    try {
+      const refreshedLibraries: Change[] = librariesOf(local)
+        .filter(l => result.touchedIds.has(String(l['id'])))
+        .map(l => ({ kind: 'library', op: 'update', id: String(l['id']), label: String(l['name']) }));
+      const membershipSent = result.sentLibraries
+        ? { ...local, codeTemplateLibraries: { codeTemplateLibrary: result.sentLibraries } }
+        : local;
+      const saved = after;
+      changedAgain = [...new Set([...result.applied, ...refreshedLibraries]
+        .filter(c => !savedChangeMatches(c, c.kind === 'library' ? membershipSent : local, saved))
+        .map(c => c.label))];
+      if (changedAgain.length === 0) {
+        if (result.touchedIds.size > 0) await refreshRevisions(root, after, result.touchedIds);
+        if (known) await writeKnown(root, knownAfterPush(known, result.applied, result.touchedIds, after));
+      }
+    } catch (err) {
+      baselineError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  const notRedeployed = toDeploy.length > 0
+    ? `\n${toDeploy.length} channel(s) NOT redeployed: ${toDeploy.map(nameOf).join(', ')}; redeploy them from the Administrator once the server is as intended`
+    : '';
+  const againNote = changedAgain.length > 0 ? `\nchanged again after saving (pull and review before retrying): ${changedAgain.join(', ')}` : '';
   if (result.failed) {
+    if (baselineError) process.stderr.write(`warning: could not refresh the local sync baseline: ${scrub(baselineError)}\n`);
     const { change, error } = result.failed;
-    fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}`);
+    fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}${againNote}${notRedeployed}`);
+  }
+  // Someone else's edit landed on a pushed resource; a redeploy would put it live unreviewed.
+  if (changedAgain.length > 0) {
+    fail(`applied ${result.applied.length} change(s), but these changed again after saving: ${changedAgain.join(', ')}; pull and review before retrying${notRedeployed}${baselineError ? `\n${baselineError}` : ''}`);
   }
   process.stdout.write(`pushed ${result.applied.length} change(s)\n`);
 
@@ -829,6 +859,46 @@ async function scopedPush(
     for (const f of failures) process.stderr.write(`deploy failed: ${f.name}: ${scrub(f.error)}\n`);
     if (failures.length > 0) process.exitCode = 1;
   }
+  if (baselineError) {
+    const note = unverified.length > 0 ? `\nnot checked after saving (these cannot be read one at a time): ${unverified.join(', ')}` : '';
+    fail(`pushed ${result.applied.length} change(s), but could not refresh the local sync baseline: ${baselineError}${note}`);
+  }
+}
+
+function exportBrokenHint(flags: BackupFlags): string {
+  const undo = flags.backup === false ? '' : ' (including the undo command above)';
+  return `If the server cannot export its configuration, pull, diff, push and restore${undo} fail until the resource that broke it is fixed in the Administrator; then pull or adopt to refresh the baseline`;
+}
+
+/**
+ * The redeploy guard when the server export fails: Mirth still serves
+ * channels and code templates one at a time. Libraries and global scripts
+ * have no such endpoint here, so they are reported as unchecked.
+ */
+async function changedAgainSingly(
+  client: MirthClientExt,
+  applied: Change[],
+  local: CanonicalConfig,
+): Promise<{ changed: string[]; unverified: string[] }> {
+  const changed: string[] = [];
+  const unverified: string[] = [];
+  for (const c of applied) {
+    if (c.kind !== 'channel' && c.kind !== 'codeTemplate') {
+      unverified.push(c.label);
+      continue;
+    }
+    try {
+      const current = (c.kind === 'channel' ? await client.getChannel(c.id) : await client.getCodeTemplate(c.id)) as Record<string, Json> | null;
+      const held = current ? [current] : [];
+      const server = (c.kind === 'channel'
+        ? { channels: { channel: held } }
+        : { codeTemplateLibraries: { codeTemplateLibrary: [{ codeTemplates: { codeTemplate: held } }] } }) as CanonicalConfig;
+      if (!savedChangeMatches(c, local, server)) changed.push(c.label);
+    } catch {
+      changed.push(`${c.label} (could not be read)`);
+    }
+  }
+  return { changed, unverified };
 }
 
 /** The full replace, gated like a scoped push: it lists and guards deletions and conflicts too. */
@@ -842,7 +912,7 @@ async function wholeServerPush(
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
   const plan = planPush(local, remote, {}, known, { wholeReplace: true });
-  const problems = [...await bindingProblems(root, await client.getServerId()), ...wholeServerProblems(plan, flags)];
+  const problems = [...await bindingProblems(root, await client.getServerId()), ...wholeServerProblems(plan, flags), ...await xmlProblems(root, local)];
   if (flags.planOnly && flags.json) {
     reportPlanOnly(flags, plan, problems, { target, mode: 'whole-server' });
     return;
@@ -898,7 +968,13 @@ async function wholeServerPush(
     deploy: flags.deploy === true,
     overwriteConfigMap: flags.overwriteConfigMap === true,
   });
-  const after = await client.getServerConfiguration();
+  let after: CanonicalConfig;
+  try {
+    after = await client.getServerConfiguration();
+  } catch (err) {
+    fail(`replaced the configuration at ${target}${flags.deploy ? ' (Mirth redeploys as part of the replace)' : ''}, but could not read it back: ${err instanceof Error ? err.message : String(err)}. ` +
+      `The tree's baseline was not refreshed. ${exportBrokenHint(flags)}`);
+  }
   if (planPush(local, after, {}, undefined, { wholeReplace: true }).changes.length > 0) {
     fail('applied the whole-server replacement, but resources changed again after saving; pull and review before retrying');
   }
@@ -1143,6 +1219,8 @@ addBackupDirFlags(addConnectionFlags(
     }
     const text = await readFile(chosen, 'utf8');
     const backup = parseBackup(text, chosen);
+    const unsafe = await xmlSafetyProblem(backup);
+    if (unsafe) fail(`${chosen} holds ${unsafe}`);
 
     // A backup of another server would replace this one's configuration with it.
     const origin = await originOf(dir, chosen);
@@ -1234,6 +1312,7 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
   const messages: string[] = [
     ...Object.keys(envUpdates).map((name) => `${name} differs between the server and the env file`),
     ...notes,
+    ...await xmlProblems(root, tree),
   ];
   // Redact both sides the same way, so neither can print a secret and a raw
   // secret held on both sides doesn't read as a difference.
@@ -1317,17 +1396,7 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
  * comparison agrees with the patch.
  */
 async function changedFiles(treeDir: string, serverDir: string): Promise<Array<{ path: string; change: 'modified' | 'only-in-tree' | 'only-on-server' }>> {
-  const list = async (base: string): Promise<string[]> => {
-    const out: string[] = [];
-    for (const d of MANAGED_DIRS) {
-      if (!existsSync(path.join(base, d))) continue;
-      for (const entry of await readdir(path.join(base, d), { recursive: true, withFileTypes: true })) {
-        if (entry.isFile()) out.push(path.relative(base, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'));
-      }
-    }
-    return out;
-  };
-  const [local, remote] = await Promise.all([list(treeDir), list(serverDir)]);
+  const [local, remote] = await Promise.all([treeFiles(treeDir), treeFiles(serverDir)]);
   const remoteSet = new Set(remote);
   const files: Array<{ path: string; change: 'modified' | 'only-in-tree' | 'only-on-server' }> = [];
   for (const p of local) {
@@ -1352,9 +1421,13 @@ addJsonFlag(addEnvFlag(
   const metaPath = path.join(root, 'channelvault.json');
   const meta = existsSync(metaPath) ? await readJson<SyncMeta>(metaPath) : null;
   if (flags.json) {
-    writeJson({ root, source: meta?.source ?? null, pulledAt: meta?.pulledAt ?? null, engineVersion: meta?.engineVersion ?? null, counts: s });
+    writeJson({
+      root, source: meta?.source ?? null, pulledAt: meta?.pulledAt ?? null, engineVersion: meta?.engineVersion ?? null, counts: s,
+      xmlForbiddenChars: forbiddenXmlChars(config),
+    });
     return;
   }
+  for (const p of await xmlProblems(root, config)) process.stderr.write(`warning: ${p}\n`);
   if (meta) {
     process.stdout.write(`source:  ${meta.source}\n`);
     process.stdout.write(`pulled:  ${meta.pulledAt}\n`);
