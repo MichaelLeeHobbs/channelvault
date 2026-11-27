@@ -75,7 +75,7 @@ channelvault pull <dir>                     # live server -> tree
 channelvault push <dir>                     # changed channels/templates -> live server
 channelvault diff <dir>                     # tree vs live server
 channelvault status <dir>                   # summary of a tree
-channelvault backup                         # live server -> .backup/<server>-<UTC time>.xml
+channelvault backup                         # live server -> ~/.channelvault/backups/<server>-<UTC time>.xml
 channelvault restore [file]                 # backup -> live server (default: newest of this server)
 ```
 
@@ -124,7 +124,7 @@ channelvault push ./mirth --library Formatting --deploy  # one library, then red
 - **Deletions** (a channel directory or template you removed) need `--allow-deletes`. Something created on the server since your last pull is never treated as a deletion; `push` leaves it alone and says so. Library saves retain server-only templates and their membership, including with `--force`. Deleting a library containing unfamiliar templates is refused; pull and review them first.
 - **Conflicts**: if the server's copy has a newer revision than your tree (someone saved it in the Administrator since your last pull), `push` refuses. Pull, merge in git, and push again, or pass `--force`.
   Push rechecks its plan after the backup and checks each resource immediately before saving or deleting it. These checks include content changes and revision resets, and library-list saves check every library. Restore and whole-server push also recheck after their backup. The check and write are separate API requests: use a single-writer change window to exclude Administrator edits and other deployment clients during production writes.
-- **Installation baseline**: `pull` records Mirth's installation ID. Push refuses a different or unknown installation even with `--force`; revision numbers from another server are unrelated. For promotion, copy the tree, select destination credentials with `--dotenv`, review `channelvault adopt ./mirth --dotenv .env.prod --plan-only`, then run the same command with `--yes` instead of `--plan-only`. Adoption writes no server resources: it preserves local content and placeholders, captures destination revisions and the global-script baseline, and leaves destination-only resources unfamiliar. It rechecks the target before committing the local baseline. Review `push --plan-only` again before pushing. Older trees without an installation ID require a fresh pull with a merge, or this explicit adoption.
+- **Installation baseline**: `pull` records Mirth's installation ID. Push refuses a different or unknown installation even with `--force`; revision numbers from another server are unrelated. For promotion, copy the tree, point the connection at the destination (`MIRTH_HOST`, `MIRTH_PORT`, `MIRTH_USER`, `MIRTH_PASS` or the connection flags; `--dotenv` supplies only the tree's placeholder values, never the login), review `channelvault adopt ./mirth --dotenv .env.prod --plan-only`, then run the same command with `--yes` instead of `--plan-only`. Adoption writes no server resources: it preserves local content and placeholders, captures destination revisions and the global-script baseline, and leaves destination-only resources unfamiliar. It rechecks the target before committing the local baseline. Review `push --plan-only` again before pushing. Older trees without an installation ID require a fresh pull with a merge, or this explicit adoption.
 - **Snapshots**: live reads require the configuration wrapper, an engine version, and a valid channels collection. Present library, template and group collections are checked too. Empty or malformed success responses are refused before tree replacement or push planning; valid empty collections and plugin fields are preserved.
 - **`--deploy`** redeploys the channels that changed and the channels a changed code-template library is enabled for, but only those deployed when planning and still deployed immediately before their redeploy. Channels taken down during the push are skipped and reported. Status-read failures prevent that channel's redeploy and are reported per channel. Keep a single-writer change window: Mirth's status check and deployment are separate requests.
 - After a push the tree's revision numbers are updated from the server, so `diff` and the next `push` stay clean.
@@ -139,13 +139,13 @@ channelvault push ./mirth --library Formatting --deploy  # one library, then red
 `backup` saves the server's configuration exactly as the Administrator's *Backup Config* does, so the Administrator can restore it too. `restore` puts one back. They are for recovery, outside the git workflow: the tree is what you review and promote.
 
 ```
-channelvault backup                              # .backup/vns-gov-20260925T143012Z.xml
+channelvault backup                              # ~/.channelvault/backups/vns-gov-20260925T143012Z.xml
 channelvault backup --out before-upgrade.xml     # exactly this file
 channelvault restore                             # the newest backup of this server
-channelvault restore .backup/vns-gov-20260925T143012Z.xml --deploy
+channelvault restore ~/.channelvault/backups/vns-gov-20260925T143012Z.xml --deploy
 ```
 
-- **Names.** The file is named after the server name in Server Settings, else the environment name, else the host and port, followed by the time in UTC. `.backup` is relative to the current directory; `--backup-dir` picks another.
+- **Names.** The file is named after the server name in Server Settings, else the environment name, else the host and port, followed by the time in UTC. Backups go to `~/.channelvault/backups` (or `$CHANNELVAULT_CONFIG_DIR/backups`), shared by every checkout and worktree, so a push run from a worktree keeps its undo file after the worktree is removed; `--backup-dir` picks another folder. Before 0.3.0-rc.3 the default was `./.backup` in the current directory; restore names that folder when it holds backups of the server.
 - **Which server.** That name is part of the configuration, so a restore or `push --whole-server` carries it to another server. Which server a backup came from is therefore recorded by Mirth's server ID, which belongs to the installation, in the directory's `channelvault-backups.json`. Choosing, checking and rotating backups go by that ID.
 - **Plain-text credentials.** A backup holds every connector password and configuration-map value; channelvault's `{{env:…}}` placeholders don't apply. Files are readable by their owner only (on Windows they get the folder's permissions instead), and a backup directory channelvault creates contains a `.gitignore` that ignores everything in it. If git would still commit a backup, you get a warning. Keep backups off shared drives and out of CI artifacts.
 - **Rotation.** The newest 10 backups of each server are kept (`--keep` changes that); older ones are deleted. Files the manifest doesn't attribute to the server, such as ones copied in by hand, are never deleted.
@@ -157,6 +157,7 @@ channelvault restore .backup/vns-gov-20260925T143012Z.xml --deploy
   - It saves the server's current configuration first, as a new backup, and prints the command that undoes the restore. That backup is the newest, so a second plain `restore` reverts the saved configuration except an overwritten configuration map: use the printed command, which repeats `--overwrite-config-map` when needed. Runtime deployment state is not captured in a configuration backup.
   - If the server changes while you confirm, nothing is restored; run it again to review the new state.
   - `--deploy` redeploys every channel afterwards; `--overwrite-config-map` also replaces the configuration map.
+  - **When the server cannot export its configuration** (HTTP 500, as after a resource holding a character XML 1.0 forbids was saved), a plain restore cannot read the current state and stops. `restore --export-broken` restores anyway: it checks the backup was taken from this installation (or needs `--force`), asks you to type the installation ID (or `--yes`), sends the backup, and verifies the result once the export works again. There is no preview, no undo backup and no version check, and it refuses to run while the export works.
 
 ## First production use
 
@@ -177,7 +178,7 @@ An agent can safely edit a tree and check its work. Pushing, restoring and anyth
 
 - Edit the `.js` and `.json` files; leave `id`, `revision`, `channelvault.json` and the `{"@file": …}` / `{"@ref": …}` markers alone. A new channel or template needs its own new UUID for `id`; a copied directory keeps the old one.
 - Mirth runs these scripts in Rhino, not Node: no `async`/`await`, optional chaining (`?.`), classes, `require`, `import` or shorthand object properties (`{ status }`; write `{ status: status }`). `let`, `const` and arrow functions work.
-- `{{env:NAME}}` is a placeholder for a secret kept outside git. Never replace one with a real value, and never read, print or copy `.env`, `.secrets/` or `.backup/`.
+- `{{env:NAME}}` is a placeholder for a secret kept outside git. Never replace one with a real value, and never read, print or copy `.env`, `.secrets/`, `.backup/` or `~/.channelvault/backups/`.
 - Check your work with `channelvault diff mirth --json` (exit 0: matches the server, 1: differs) and `channelvault push mirth --plan-only --json`, which shows what a push would change and `wouldStop` reasons.
 - Do not run `channelvault push` (other than with `--plan-only`), `restore` or `pull`, and never pass `--force`, `--allow-deletes` or `--yes`. Summarise the plan and let a person push.
 ```

@@ -90,7 +90,7 @@ describe('diff --json', () => {
 
     const text = await run('diff', tree);
     expect(text.stdout).toContain('no differences');
-    expect(text.stderr).toContain("1 resource(s) have a newer revision on the server; pull to update the tree's baseline");
+    expect(text.stderr).toContain("1 resource(s) have a newer revision on the server; pull to update the tree's baseline, or adopt it when the content already matches");
   });
 
   it('still exits 2 on an error, with the error on stderr', async () => {

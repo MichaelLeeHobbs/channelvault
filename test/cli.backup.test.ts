@@ -89,6 +89,89 @@ describe('restore', () => {
     return file;
   }
 
+  // Mirth 4.5.0 answered GET /server/configuration with HTTP 500 after a saved template held U+FFFE.
+  describe('when the server cannot export its configuration', () => {
+    let exportBroken: boolean;
+    beforeEach(() => {
+      exportBroken = true;
+      mirth.onRequest = (req) => req.method === 'GET' && req.path === '/api/server/configuration' && exportBroken
+        ? { status: 500, body: 'cannot serialize' }
+        : undefined;
+    });
+
+    it('names --export-broken when a plain restore cannot read the current configuration', async () => {
+      await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);
+      const r = await cli('restore', '--yes');
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('restore with --export-broken');
+      expect(mirth.writes).toEqual([]);
+    });
+
+    it('restores the newest backup of this server without a preview or undo backup, then verifies', async () => {
+      await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);
+      mirth.onRequest = (req) => {
+        if (req.method === 'PUT' && req.path === '/api/server/configuration') exportBroken = false;
+        return req.method === 'GET' && req.path === '/api/server/configuration' && exportBroken ? { status: 500, body: 'x' } : undefined;
+      };
+      const r = await cli('restore', '--export-broken', '--yes');
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toContain('no preview, no undo backup and no version check');
+      expect(r.stdout).toContain('the server exports its configuration again');
+      expect(channelNames(mirth.config)).toEqual(['Alpha']);
+      expect(await files()).toEqual(['vns-gov-20260921T100000Z.xml']);
+    });
+
+    it('says so when the server still cannot export after the restore', async () => {
+      await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);
+      const r = await cli('restore', '--export-broken', '--yes');
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('but the server still cannot export its configuration');
+    });
+
+    it('refuses a backup of another server, and one it cannot place, without --force', async () => {
+      await backupFile('vns-dev', '20260922T100000Z', ['Dev Only'], { name: 'VNS Dev', origin: OTHER });
+      const other = await cli('restore', path.join(backups, 'vns-dev-20260922T100000Z.xml'), '--export-broken', '--yes');
+      expect(other.stderr).toContain('not this server');
+      const outside = path.join(dir, 'exported.xml');
+      await writeFile(outside, serverXml({ name: 'VNS Gov', channels: ['Alpha'] }));
+      const unplaced = await cli('restore', outside, '--export-broken', '--yes');
+      expect(unplaced.stderr).toContain('pass --force to restore it anyway');
+      expect(mirth.writes).toEqual([]);
+    });
+
+    it('refuses --export-broken when the export fails for another reason, such as a proxy timeout', async () => {
+      await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);
+      mirth.onRequest = (req) => req.method === 'GET' && req.path === '/api/server/configuration' ? { status: 504, body: 'gateway timeout' } : undefined;
+      const r = await cli('restore', '--export-broken', '--yes');
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('cannot tell whether the export is broken');
+      expect(mirth.writes).toEqual([]);
+    });
+
+    it('refuses --export-broken when the export works', async () => {
+      exportBroken = false;
+      await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);
+      const r = await cli('restore', '--export-broken', '--yes');
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('the server can export its configuration');
+      expect(mirth.writes).toEqual([]);
+    });
+  });
+
+  // A push from a git worktree left its undo file in that worktree, gone when the worktree was removed.
+  it('keeps backups in the shared folder by default, wherever the command runs', async () => {
+    const shared = path.join(process.env.CHANNELVAULT_CONFIG_DIR!, 'backups');
+    try {
+      const r = await runCli(['backup', '--no-https'], env);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toContain(shared);
+      const restored = await runCli(['restore', '--no-https', '--yes'], env);
+      expect(restored.status, restored.stderr).toBe(0);
+    } finally {
+      await rm(shared, { recursive: true, force: true });
+    }
+  });
+
   it("restores this server's newest backup, not a newer one of another server, keeping an undo backup", async () => {
     await backupFile('vns-gov', '20260920T100000Z', ['Old']);
     await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);

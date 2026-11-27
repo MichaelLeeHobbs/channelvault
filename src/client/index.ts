@@ -55,6 +55,14 @@ function connectionError(url: string, err: unknown): Error & { code?: string } {
   return error;
 }
 
+/** `, to <origin>` for a redirect's Location; only the origin, since a path or query can carry a token. */
+function redirectTarget(url: string, response: Response): string {
+  const location = response.headers.get('location');
+  if (!location) return '';
+  try { return `, to ${new URL(location, url).origin}`; }
+  catch { return ''; }
+}
+
 /** Optional flags accepted by `putServerConfiguration` (Mirth query params). */
 export interface PutServerConfigurationOptions {
   /** Redeploy all channels after applying the configuration. */
@@ -431,17 +439,29 @@ class MirthClientImpl implements MirthClientExt {
     return response;
   }
 
-  /** fetch through this client's pool, with network failures explained. */
+  /**
+   * fetch through this client's pool, with network failures explained. Never
+   * follows a redirect: fetch re-sends a 307/308 body, so a redirected login
+   * would post the username and password to wherever the server points.
+   */
   private async send(url: string, init: RequestInit): Promise<Response> {
+    let response: Response;
     try {
-      return await fetch(url, {
+      response = await fetch(url, {
         ...init,
+        redirect: 'manual',
         // @ts-expect-error - dispatcher is a Node.js/undici specific option
         dispatcher: this.dispatcher,
       });
     } catch (err) {
       throw connectionError(url, err);
     }
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      throw new Error(`the server answered ${new URL(url).pathname} with a redirect (HTTP ${response.status}${redirectTarget(url, response)}); ` +
+        'channelvault does not follow redirects, so credentials and session cookies are never sent elsewhere. Connect to the address it redirects to: check https vs --no-https, --host and --port (or MIRTH_HOST/MIRTH_PORT)');
+    }
+    return response;
   }
 
   /** Build an absolute URL with an optional query string. */

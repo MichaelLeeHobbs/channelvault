@@ -46,10 +46,10 @@ import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
 import { mapLeaves, redactKnownSecrets, render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
 import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
-import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_BACKUP_DIR, DEFAULT_KEEP, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
+import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_KEEP, defaultBackupDir, LEGACY_BACKUP_DIR, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
 import { readJson } from './json.js';
 import { forbiddenXmlChars, xmlSafetyProblem } from './xml/chars.js';
-import type { CanonicalConfig, ClientConfig, Json } from './types.js';
+import type { ApiError, CanonicalConfig, ClientConfig, Json } from './types.js';
 import { JOURNAL, lockTree, MANAGED_DIRS, recoverTree, replaceTree, STAGING_DIR, treeFiles } from './tree/transaction.js';
 
 const engine = createExplodeEngine();
@@ -168,12 +168,12 @@ interface BackupFlags {
 
 function addBackupDirFlags(cmd: Command): Command {
   return cmd
-    .option('--backup-dir <dir>', `where backups are kept (default ./${DEFAULT_BACKUP_DIR})`)
+    .option('--backup-dir <dir>', 'where backups are kept (default ~/.channelvault/backups, shared by every checkout)')
     .option('--keep <n>', `backups kept per server (default ${DEFAULT_KEEP})`);
 }
 
 function backupDirOf(flags: BackupFlags): string {
-  return path.resolve(flags.backupDir ?? DEFAULT_BACKUP_DIR);
+  return path.resolve(flags.backupDir ?? defaultBackupDir());
 }
 
 function keepOf(flags: BackupFlags): number {
@@ -249,20 +249,24 @@ function hostOf(flags: ConnectionFlags): string {
   return `${cfg.host}:${cfg.port}`;
 }
 
-async function confirm(question: string): Promise<boolean> {
+async function ask(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const controller = new AbortController();
   rl.once('close', () => controller.abort());
   rl.once('SIGINT', () => controller.abort());
   try {
-    const answer = (await rl.question(`${question} [y/N] `, { signal: controller.signal })).trim().toLowerCase();
-    return answer === 'y' || answer === 'yes';
+    return (await rl.question(question, { signal: controller.signal })).trim();
   } catch (err) {
-    if (controller.signal.aborted) fail('confirmation interrupted; nothing was pushed');
+    if (controller.signal.aborted) fail('confirmation interrupted; nothing was changed');
     throw err;
   } finally {
     rl.close();
   }
+}
+
+async function confirm(question: string): Promise<boolean> {
+  const answer = (await ask(`${question} [y/N] `)).toLowerCase();
+  return answer === 'y' || answer === 'yes';
 }
 
 /** Walk a canonical config and tally headline resource counts for `status`. */
@@ -344,7 +348,7 @@ async function loadEnv(file: string): Promise<Record<string, string | undefined>
 function addEnvFlag(cmd: Command): Command {
   // Not --env-file: Node scans the whole command line for that name and parses
   // the file itself (it fails on a directory and honours NODE_OPTIONS in it).
-  return cmd.option('--dotenv <path>', 'env file holding secrets and per-environment values (default <dir>/.env)');
+  return cmd.option('--dotenv <path>', 'env file holding the tree\'s placeholder values, not the login (default <dir>/.env)');
 }
 
 function addExtractFlag(cmd: Command): Command {
@@ -863,10 +867,32 @@ async function scopedPush(
     const note = unverified.length > 0 ? `\nnot checked after saving (these cannot be read one at a time): ${unverified.join(', ')}` : '';
     fail(`pushed ${result.applied.length} change(s), but could not refresh the local sync baseline: ${baselineError}${note}`);
   }
+  printCommitHint(root);
+}
+
+/** After a push the tree's revisions and channelvault.json change; name them, since they belong in the same commit. */
+function printCommitHint(root: string): void {
+  // -z: plain porcelain quotes paths with spaces (most channel names) and escapes non-ASCII.
+  const r = spawnSync('git', ['status', '--porcelain', '-z', '--untracked-files=all', '--', '.'], { cwd: root, encoding: 'utf8' });
+  if (r.status !== 0 || !r.stdout) return;
+  const entries = r.stdout.split('\0');
+  const files: string[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (entry.length < 4) continue;
+    files.push(entry.slice(3));
+    // A rename or copy is followed by its source path.
+    if (entry[0] === 'R' || entry[0] === 'C') i++;
+  }
+  if (files.length === 0) return;
+  const shown = files.length > 10 ? [...files.slice(0, 10), `and ${files.length - 10} more`] : files;
+  process.stdout.write(`commit the refreshed baseline with your change (paths from the repository root): ${shown.join(', ')}\n`);
 }
 
 function exportBrokenHint(flags: BackupFlags): string {
-  const undo = flags.backup === false ? '' : ' (including the undo command above)';
+  const undo = flags.backup === false
+    ? ''
+    : ' (including the undo command above, unless you add --export-broken to it, which restores without a preview or an undo backup)';
   return `If the server cannot export its configuration, pull, diff, push and restore${undo} fail until the resource that broke it is fixed in the Administrator; then pull or adopt to refresh the baseline`;
 }
 
@@ -982,6 +1008,7 @@ async function wholeServerPush(
   await refreshRevisions(root, after, new Set([...Object.keys(ids.channels), ...Object.keys(ids.libraries), ...Object.keys(ids.codeTemplates)]));
   if (known) await writeKnown(root, resourceIds(after));
   process.stdout.write(`pushed ${root} -> ${target}\n`);
+  printCommitHint(root);
 }
 
 // --- commands -------------------------------------------------------------
@@ -1156,7 +1183,7 @@ addBackupDirFlags(addEnvFlag(addConnectionFlags(
 addBackupDirFlags(addConnectionFlags(
   program
     .command('backup')
-    .description(`Save the server configuration as <server>-<UTC time>.xml in ./${DEFAULT_BACKUP_DIR} (holds credentials in plain text)`)
+    .description('Save the server configuration as <server>-<UTC time>.xml in ~/.channelvault/backups (holds credentials in plain text)')
     .option('--out <file>', 'write to this file instead (no rotation)'),
 )).action(async (flags: ConnectionFlags & BackupFlags & { out?: string }) => {
   const cfg = resolveClientConfig(flags);
@@ -1182,6 +1209,77 @@ interface RestoreFlags extends ConnectionFlags, BackupFlags {
   overwriteConfigMap?: boolean;
   yes?: boolean;
   force?: boolean;
+  exportBroken?: boolean;
+}
+
+/** The backup named, else the newest taken from this server (by server ID: the name in the file name travels with the configuration). */
+async function chooseBackup(dir: string, file: string | undefined, serverId: string, target: string): Promise<string> {
+  if (file) {
+    const chosen = path.resolve(file);
+    if (!existsSync(chosen)) fail(`${chosen} does not exist`);
+    return chosen;
+  }
+  const mine = await backupsOf(dir, serverId);
+  if (mine.length === 0) {
+    const others = (await originsIn(dir)).map((o) => o.host);
+    const legacy = path.resolve(LEGACY_BACKUP_DIR);
+    const inLegacy = legacy !== dir && (await backupsOf(legacy, serverId)).length > 0;
+    fail(`no backups of ${target} in ${dir}${others.length ? ` (it has backups of: ${others.join(', ')})` : ''}` +
+      (inLegacy ? `; ${legacy} has backups of this server (the default before 0.3.0-rc.3): pass --backup-dir ${shellArgument(legacy)}` : ''));
+  }
+  return mine[mine.length - 1]!.file;
+}
+
+/**
+ * Restore without reading the current configuration, for a server whose
+ * export fails (HTTP 500 after a resource holding a character XML forbids was
+ * saved, seen on 4.5.0): no preview, no undo backup, no name or version check.
+ */
+async function restoreWithBrokenExport(client: MirthClientExt, file: string | undefined, flags: RestoreFlags, target: string): Promise<void> {
+  try {
+    await client.getServerConfigurationXml();
+    fail('the server can export its configuration; run restore without --export-broken, which shows a preview and saves an undo backup first');
+  } catch (err) {
+    if (err instanceof CliError) throw err;
+    // A proxy timeout or a dropped connection on a healthy server must not unlock a restore without preview or undo.
+    if ((err as Partial<ApiError>).status !== 500) {
+      fail(`cannot tell whether the export is broken: ${err instanceof Error ? err.message : String(err)}; --export-broken only proceeds when the server answers its export with HTTP 500`);
+    }
+  }
+  const serverId = await client.getServerId();
+  const dir = backupDirOf(flags);
+  const chosen = await chooseBackup(dir, file, serverId, target);
+  const text = await readFile(chosen, 'utf8');
+  const backup = parseBackup(text, chosen);
+  const unsafe = await xmlSafetyProblem(backup);
+  if (unsafe) fail(`${chosen} holds ${unsafe}`);
+  const origin = await originOf(dir, chosen);
+  if (!origin && !flags.force) {
+    fail(`${chosen} is not in ${path.join(dir, MANIFEST)}, and without the server's export its name cannot be compared either; pass --force to restore it anyway`);
+  }
+  if (origin && origin.serverId !== serverId && !flags.force) {
+    fail(`${chosen} was taken from ${origin.host} (server ID ${origin.serverId}), not this server (${serverId}); pass --force to restore it here anyway`);
+  }
+  process.stdout.write(
+    `Restore ${chosen}\nto ${target} (installation ${serverId}), replacing its ENTIRE configuration${flags.deploy ? ', then redeploy all channels' : ''}.\n` +
+      'The server cannot export its configuration, so there is no preview, no undo backup and no version check.\n',
+  );
+  if (!flags.yes && (await ask(`Type the installation ID (${serverId}) to continue: `)) !== serverId) {
+    process.stdout.write('aborted.\n');
+    return;
+  }
+  await client.putServerConfigurationXml(text, { deploy: flags.deploy === true, overwriteConfigMap: flags.overwriteConfigMap === true });
+  let afterText: string;
+  try {
+    afterText = await client.getServerConfigurationXml();
+  } catch (err) {
+    fail(`sent ${chosen} to ${target}, but the server still cannot export its configuration: ${err instanceof Error ? err.message : String(err)}; inspect it in the Administrator`);
+  }
+  const differ = planPush(backup, parseBackup(afterText, 'the server configuration'), {}, undefined, { wholeReplace: true }).changes;
+  if (differ.length > 0) {
+    fail(`restored, but these differ from the backup afterwards: ${differ.map((c) => c.label).join(', ')}; inspect the server`);
+  }
+  process.stdout.write(`restored ${chosen} to ${target}; the server exports its configuration again\n`);
 }
 
 addBackupDirFlags(addConnectionFlags(
@@ -1192,6 +1290,7 @@ addBackupDirFlags(addConnectionFlags(
     .option('--deploy', 'redeploy all channels afterwards', false)
     .option('--overwrite-config-map', 'also replace the configuration map', false)
     .option('--force', 'restore a backup taken from another server', false)
+    .option('--export-broken', 'the server cannot export its configuration (HTTP 500): restore without a preview, undo backup or version check', false)
     .option('-y, --yes', 'skip the confirmation prompt', false),
 )).action(async (file: string | undefined, flags: RestoreFlags) => {
   const cfg = resolveClientConfig(flags);
@@ -1199,24 +1298,20 @@ addBackupDirFlags(addConnectionFlags(
   if (!flags.yes && !process.stdin.isTTY) fail('no terminal to confirm on; pass --yes');
   const dir = backupDirOf(flags);
   await withClient(flags, async (client) => {
-    const currentText = await client.getServerConfigurationXml();
+    if (flags.exportBroken) {
+      await restoreWithBrokenExport(client, file, flags, target);
+      return;
+    }
+    let currentText: string;
+    try {
+      currentText = await client.getServerConfigurationXml();
+    } catch (err) {
+      fail(`cannot read the server's current configuration: ${err instanceof Error ? err.message : String(err)}. ` +
+        'If its export is broken (for example HTTP 500), restore with --export-broken, which skips the preview and the undo backup');
+    }
     const current = parseBackup(currentText, 'the server configuration');
     const serverId = await client.getServerId();
-
-    // Which backup: the one named, else the newest taken from this server
-    // (by server ID: the name in the file name travels with the configuration).
-    let chosen: string;
-    if (file) {
-      chosen = path.resolve(file);
-      if (!existsSync(chosen)) fail(`${chosen} does not exist`);
-    } else {
-      const mine = await backupsOf(dir, serverId);
-      if (mine.length === 0) {
-        const others = (await originsIn(dir)).map((o) => o.host);
-        fail(`no backups of ${target} in ${dir}${others.length ? ` (it has backups of: ${others.join(', ')})` : ''}`);
-      }
-      chosen = mine[mine.length - 1]!.file;
-    }
+    const chosen = await chooseBackup(dir, file, serverId, target);
     const text = await readFile(chosen, 'utf8');
     const backup = parseBackup(text, chosen);
     const unsafe = await xmlSafetyProblem(backup);
@@ -1322,7 +1417,7 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
   // compare content, and report newer revisions separately.
   const staleRevisions = newerOnServer(tree, templatedRemote);
   if (staleRevisions.length > 0) {
-    messages.push(`${staleRevisions.length} resource(s) have a newer revision on the server; pull to update the tree's baseline`);
+    messages.push(`${staleRevisions.length} resource(s) have a newer revision on the server; pull to update the tree's baseline, or adopt it when the content already matches`);
   }
   const treeView = scanSecrets(redactKnownSecrets(normalizeEolDeep(withoutVolatile(tree))), { mode: 'redact', allow });
   const serverView = scanSecrets(redactKnownSecrets(normalizeEolDeep(withoutVolatile(templatedRemote))), { mode: 'redact', allow });

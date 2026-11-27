@@ -2,6 +2,25 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0-rc.3] — 2026-11-27
+
+Release candidate, published under the npm `next` tag.
+
+### Changed
+
+- **Backups default to `~/.channelvault/backups`** (or `$CHANNELVAULT_CONFIG_DIR/backups`), shared by every checkout and worktree, instead of `./.backup` in the current directory. A push run from a git worktree used to leave its undo file in that worktree, where it disappeared with the worktree, and one server's backups ended up scattered across checkouts. The manifest still keeps servers apart. `--backup-dir` still overrides the folder. When the new folder has no backup of the server and `./.backup` does, restore says so. The newest 10 backups per server are now kept across all checkouts together. CI, or anything else with a throwaway or read-only home folder, should pass `--backup-dir` or set `CHANNELVAULT_CONFIG_DIR`. Two pushes that back up the same folder at the same moment can race on its manifest.
+
+### Added
+
+- `restore --export-broken`, for a server that cannot export its configuration (HTTP 500, as after a pushed template held U+FFFE on Mirth 4.5.0). It restores a backup taken from this installation without a preview, an undo backup or a version check, after you type the installation ID (or pass `--yes`). It verifies the result once the export works again, and refuses to run unless the export answers HTTP 500 (a working export, a proxy timeout or a dropped connection all refuse). A plain restore that cannot read the current configuration now names this flag, and so does the message after a push whose read-back failed. It has not yet been tried against a real server with a broken export.
+- After a push, channelvault names the tree files to commit with the change (the refreshed revisions and `channelvault.json`).
+
+### Fixed
+
+- `diff`'s note about newer revisions on the server names `adopt` as well as `pull`, since adopt refreshes the baseline when the content already matches.
+- The client never follows an HTTP redirect. A server (or anything answering on its address) that redirected the login would get the username and password re-sent to wherever it pointed, even over plain http. A redirect is now an error naming only the target's origin.
+- README: the promotion steps no longer say the destination's login comes from `--dotenv`. The env file only fills the tree's placeholders; the login comes from `MIRTH_*` or the connection flags.
+
 ## [0.3.0-rc.2] — 2026-11-27
 
 Release candidate, published under the npm `next` tag.
@@ -71,6 +90,7 @@ First release. Tested against Mirth Connect 4.5.2; the offline round trip is als
 - `backup` / `restore`: the server's own configuration XML saved as `.backup/<server>-<UTC time>.xml`, identified by Mirth's server ID, restored with a preview, an undo backup and a version check. `push` backs up first unless `--no-backup`.
 - `diff` exits 0 when the tree matches the server, 1 when it differs, 2 on error.
 
+[0.3.0-rc.3]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.3
 [0.3.0-rc.2]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.2
 [0.3.0-rc.1]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.1
 [0.2.1]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.2.1
