@@ -7,6 +7,7 @@ All notable changes to `@ubercode/channelvault` are documented here. The format 
 ### Fixed
 
 - Live commands accept any single-line installation ID, not only a UUID: Mirth reads it from `appdata/server.id`, which admins can set to a name such as `mirth-gov`.
+- A re-pull no longer gives configuration-map entries each other's placeholders after an earlier entry is removed from the server. Entries were addressed by position, so each one after the removed entry inherited its neighbour's placeholder name (the values in the env file stayed with the right entry). Entries are now addressed by key. A tree pulled with an affected version keeps the wrong names on re-pull: pull it into a fresh directory to regenerate them.
 
 ## [0.2.1] — 2026-09-29
 

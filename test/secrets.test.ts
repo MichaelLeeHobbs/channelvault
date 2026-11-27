@@ -58,6 +58,19 @@ describe('templatize', () => {
     });
   });
 
+  it('keeps each configuration-map placeholder on its own key when an earlier entry is removed', () => {
+    const entry = (key: string, value: string): Obj => ({ string: key, 'com.mirth.connect.util.ConfigurationProperty': { value, comment: null } });
+    const map = (...entries: Obj[]): CanonicalConfig => ({ configurationMap: { entry: entries } });
+    const first = templatize(map(entry('OLD_KEY', 'old-secret'), entry('PORTAL_API_KEY', 'portal-key'), entry('DIAGNOSTIC_CODES', '{"2":"minor"}')), null, {});
+    const env = first.envUpdates;
+
+    const { config, envUpdates } = templatize(map(entry('PORTAL_API_KEY', 'portal-key'), entry('DIAGNOSTIC_CODES', '{"2":"minor"}')), first.config, env);
+
+    const values = ((config['configurationMap'] as Obj)['entry'] as Obj[]).map((e) => (e['com.mirth.connect.util.ConfigurationProperty'] as Obj)['value']);
+    expect(values).toEqual(['{{env:CONFIG_MAP__PORTAL_API_KEY}}', '{{env:CONFIG_MAP__DIAGNOSTIC_CODES}}']);
+    expect(envUpdates).toEqual({});
+  });
+
   it('leaves empty credentials, non-secret fields and non-string values alone', () => {
     const { config } = templatize(liveConfig(), null, {});
     expect(dest(config, 1)['password']).toBe('');
