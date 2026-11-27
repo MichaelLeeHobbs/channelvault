@@ -2,6 +2,12 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Live commands accept any single-line installation ID, not only a UUID: Mirth reads it from `appdata/server.id`, which admins can set to a name such as `mirth-gov`.
+
 ## [0.2.1] — 2026-09-29
 
 ### Fixed
