@@ -24,6 +24,10 @@ services:
       - KEYSTORE_STOREPASS=changeit
       - KEYSTORE_KEYPASS=changeit
       - _MP_SERVER_STARTUPDEPLOY=false
+      # The image's default -Xmx256m runs out of heap restoring a real
+      # configuration (32 channels, 86 templates), and the Administrator
+      # shows no error: the OutOfMemoryErrors are only in logs/mirth.log.
+      - VMOPTIONS=-Xmx2048m
     networks:
       - isolated
 
