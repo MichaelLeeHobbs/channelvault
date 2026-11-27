@@ -139,6 +139,15 @@ describe('restore', () => {
       expect(mirth.writes).toEqual([]);
     });
 
+    it('refuses --export-broken when the export fails for another reason, such as a proxy timeout', async () => {
+      await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);
+      mirth.onRequest = (req) => req.method === 'GET' && req.path === '/api/server/configuration' ? { status: 504, body: 'gateway timeout' } : undefined;
+      const r = await cli('restore', '--export-broken', '--yes');
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('cannot tell whether the export is broken');
+      expect(mirth.writes).toEqual([]);
+    });
+
     it('refuses --export-broken when the export works', async () => {
       exportBroken = false;
       await backupFile('vns-gov', '20260921T100000Z', ['Alpha']);

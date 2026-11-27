@@ -181,7 +181,7 @@ function sameFile(a: string, b: string): boolean {
  */
 export async function ensureBackupDir(dir: string): Promise<void> {
   if (existsSync(dir)) return;
-  await mkdir(dir, { recursive: true });
+  await mkdir(dir, { recursive: true, mode: 0o700 });
   await writeFile(path.join(dir, '.gitignore'), '# channelvault backups hold credentials in plain text\n*\n');
 }
 

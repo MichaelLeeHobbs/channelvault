@@ -49,7 +49,7 @@ import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secr
 import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_KEEP, defaultBackupDir, LEGACY_BACKUP_DIR, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
 import { readJson } from './json.js';
 import { forbiddenXmlChars, xmlSafetyProblem } from './xml/chars.js';
-import type { CanonicalConfig, ClientConfig, Json } from './types.js';
+import type { ApiError, CanonicalConfig, ClientConfig, Json } from './types.js';
 import { JOURNAL, lockTree, MANAGED_DIRS, recoverTree, replaceTree, STAGING_DIR, treeFiles } from './tree/transaction.js';
 
 const engine = createExplodeEngine();
@@ -872,9 +872,18 @@ async function scopedPush(
 
 /** After a push the tree's revisions and channelvault.json change; name them, since they belong in the same commit. */
 function printCommitHint(root: string): void {
-  const r = spawnSync('git', ['status', '--porcelain', '--untracked-files=no', '--', '.'], { cwd: root, encoding: 'utf8' });
+  // -z: plain porcelain quotes paths with spaces (most channel names) and escapes non-ASCII.
+  const r = spawnSync('git', ['status', '--porcelain', '-z', '--untracked-files=all', '--', '.'], { cwd: root, encoding: 'utf8' });
   if (r.status !== 0 || !r.stdout) return;
-  const files = r.stdout.split('\n').filter(Boolean).map((line) => line.slice(3));
+  const entries = r.stdout.split('\0');
+  const files: string[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (entry.length < 4) continue;
+    files.push(entry.slice(3));
+    // A rename or copy is followed by its source path.
+    if (entry[0] === 'R' || entry[0] === 'C') i++;
+  }
   if (files.length === 0) return;
   const shown = files.length > 10 ? [...files.slice(0, 10), `and ${files.length - 10} more`] : files;
   process.stdout.write(`commit the refreshed baseline with your change (paths from the repository root): ${shown.join(', ')}\n`);
@@ -1232,6 +1241,10 @@ async function restoreWithBrokenExport(client: MirthClientExt, file: string | un
     fail('the server can export its configuration; run restore without --export-broken, which shows a preview and saves an undo backup first');
   } catch (err) {
     if (err instanceof CliError) throw err;
+    // A proxy timeout or a dropped connection on a healthy server must not unlock a restore without preview or undo.
+    if ((err as Partial<ApiError>).status !== 500) {
+      fail(`cannot tell whether the export is broken: ${err instanceof Error ? err.message : String(err)}; --export-broken only proceeds when the server answers its export with HTTP 500`);
+    }
   }
   const serverId = await client.getServerId();
   const dir = backupDirOf(flags);
