@@ -2,6 +2,15 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0-rc.3] — 2026-11-27
+
+Release candidate, published under the npm `next` tag.
+
+### Fixed
+
+- The client never follows an HTTP redirect. A server (or anything answering on its address) that redirected the login would get the username and password re-sent to wherever it pointed, even over plain http. A redirect is now an error naming only the target's origin.
+- README: the promotion steps no longer say the destination's login comes from `--dotenv`. The env file only fills the tree's placeholders; the login comes from `MIRTH_*` or the connection flags.
+
 ## [0.3.0-rc.2] — 2026-11-27
 
 Release candidate, published under the npm `next` tag.
@@ -71,6 +80,7 @@ First release. Tested against Mirth Connect 4.5.2; the offline round trip is als
 - `backup` / `restore`: the server's own configuration XML saved as `.backup/<server>-<UTC time>.xml`, identified by Mirth's server ID, restored with a preview, an undo backup and a version check. `push` backs up first unless `--no-backup`.
 - `diff` exits 0 when the tree matches the server, 1 when it differs, 2 on error.
 
+[0.3.0-rc.3]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.3
 [0.3.0-rc.2]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.2
 [0.3.0-rc.1]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.1
 [0.2.1]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.2.1
