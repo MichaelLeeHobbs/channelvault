@@ -157,7 +157,9 @@ export function profileOwning(profiles: Profiles, serverId: string): string | un
  * MIRTH_HOST, then the profile matching the tree's serverId. Pure: every input
  * is passed in.
  */
-export function resolveConnection(input: SelectionInput): Connection {
+export function resolveConnection(given: SelectionInput): Connection {
+  // `MIRTH_HOST=` clears a variable in most shells' habits; treat it as unset.
+  const input = { ...given, env: Object.fromEntries(Object.entries(given.env).filter(([, v]) => v !== '')) };
   const { flags, env, profiles } = input;
   const loginTyped = flags.host !== undefined || flags.port !== undefined || flags.user !== undefined || flags.pass !== undefined;
   let conn: Connection;
