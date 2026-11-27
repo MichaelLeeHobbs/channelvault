@@ -1,6 +1,7 @@
 /**
  * What a user sees when the server can't be reached, and `diff`'s exit codes.
  */
+import { X509Certificate } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer, type Server } from 'node:https';
@@ -10,15 +11,18 @@ import * as path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { createMirthClient, UNTRUSTED_CERT_CODES } from '../src/client/index.js';
+import { createMirthClient, presentedFingerprint, UNTRUSTED_CERT_CODES } from '../src/client/index.js';
 import { runCli } from './helpers/cli.js';
 import { TEST_CERT, TEST_KEY } from './helpers/selfSignedCert.js';
 
 let server: Server;
 let port: number;
+let requests = 0;
+const FINGERPRINT = new X509Certificate(TEST_CERT).fingerprint256.replace(/:/g, '').toLowerCase();
 
 beforeAll(async () => {
   server = createServer({ key: TEST_KEY, cert: TEST_CERT }, (req, res) => {
+    requests++;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ 'com.mirth.connect.model.LoginStatus': { status: 'SUCCESS', message: null } }));
   });
@@ -67,13 +71,52 @@ describe('connection errors', () => {
     await client.close();
   });
 
-  it('come with a hint to use --insecure in the CLI', async () => {
+  it('come with the presented fingerprint to pin, before --insecure, in the CLI', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-tls-'));
     try {
       const r = await runCli(['pull', dir], { MIRTH_HOST: '127.0.0.1', MIRTH_PORT: String(port), MIRTH_USER: 'admin', MIRTH_PASS: 'admin' });
       expect(r.status).toBe(1);
       expect(r.stderr).toContain(`cannot reach https://127.0.0.1:${port}`);
-      expect(r.stderr).toContain('pass --insecure');
+      expect(r.stderr).toContain(`--tls-fingerprint ${FINGERPRINT}`);
+      expect(r.stderr.indexOf('--tls-fingerprint')).toBeLessThan(r.stderr.indexOf('--insecure'));
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+});
+
+describe('certificate pinning', () => {
+  it('reads the fingerprint a server presents', async () => {
+    expect(await presentedFingerprint('127.0.0.1', port)).toBe(FINGERPRINT);
+  });
+
+  it('logs in to the pinned certificate without CA verification', async () => {
+    const client = createMirthClient({ host: '127.0.0.1', port, ...login, tlsFingerprint: FINGERPRINT });
+    await client.login();
+    expect(client.isAuthenticated()).toBe(true);
+    await client.close();
+  });
+
+  it('refuses another certificate before sending anything, so the login never leaves', async () => {
+    const before = requests;
+    const client = createMirthClient({ host: '127.0.0.1', port, ...login, tlsFingerprint: 'ab'.repeat(32) });
+    const error = await client.login().then(() => undefined, (err: unknown) => err as Error & { code?: string });
+    await client.close();
+    expect(error?.code).toBe('TLS_PIN_MISMATCH');
+    expect(error?.message).toContain(FINGERPRINT);
+    expect(requests).toBe(before);
+  });
+
+  it('names the mismatch and the way back in the CLI', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'channelvault-pin-'));
+    try {
+      const env = { MIRTH_HOST: '127.0.0.1', MIRTH_PORT: String(port), MIRTH_USER: 'admin', MIRTH_PASS: 'admin', MIRTH_TLS_FINGERPRINT: 'AB:'.repeat(31) + 'AB' };
+      const r = await runCli(['pull', dir], env);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('[tls-pin-mismatch]');
+      expect(r.stderr).toContain('update --tls-fingerprint');
+      const both = await runCli(['pull', dir, '--insecure'], env);
+      expect(both.stderr).toContain('[flag-conflict]');
     } finally {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }

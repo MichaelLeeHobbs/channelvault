@@ -11,18 +11,25 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { Writable } from 'node:stream';
 
 import { Command, CommanderError } from 'commander';
 
 import { createExplodeEngine } from './explode/index.js';
 import { XmlConfigAdapter } from './xml/index.js';
-import { createMirthClient, UNTRUSTED_CERT_CODES, type MirthClientExt } from './client/index.js';
+import { createMirthClient, presentedFingerprint, UNTRUSTED_CERT_CODES, type MirthClientExt } from './client/index.js';
+import { connectionJson, describeConnection, profileOwning, resolveConnection, urlOf, type Connection, type ConnectionFlags } from './connection.js';
+import {
+  credentialsFile, formatFingerprint, isLoopback, loadProfiles, normalizeFingerprint, PROFILE_NAME, profileProblems, profilesFile,
+  readCredentials, ReasonError, saveProfiles, setCredential, type Profile, type Profiles,
+} from './profiles.js';
+import { canonical, isWithin, resolvedPath, samePath } from './paths.js';
 import {
   adoptTarget,
   changedSince,
@@ -50,7 +57,7 @@ import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_KEEP, d
 import { readJson } from './json.js';
 import { forbiddenXmlChars, xmlSafetyProblem } from './xml/chars.js';
 import type { ApiError, CanonicalConfig, ClientConfig, Json } from './types.js';
-import { JOURNAL, lockTree, MANAGED_DIRS, recoverTree, replaceTree, STAGING_DIR, treeFiles } from './tree/transaction.js';
+import { JOURNAL, lockTree, MANAGED_DIRS, pendingEnvFile, recoverTree, replaceTree, STAGING_DIR, treeFiles } from './tree/transaction.js';
 
 const engine = createExplodeEngine();
 const xml = new XmlConfigAdapter();
@@ -60,16 +67,16 @@ const VERSION = (createRequire(import.meta.url)('../package.json') as { version:
 
 // --- helpers --------------------------------------------------------------
 
-/** A user-facing error: printed without a stack trace. */
-class CliError extends Error {}
+/** A user-facing error: printed without a stack trace, with its reason code when it has one. */
+class CliError extends ReasonError {}
 
 /**
  * Abort the command. Throws rather than calling process.exit so open
  * connections close first; exiting while undici sockets are closing crashes
  * Node on Windows with a libuv assertion.
  */
-function fail(message: string): never {
-  throw new CliError(message);
+function fail(message: string, reason?: string): never {
+  throw new CliError(message, reason);
 }
 
 /** Exit status for an error. `diff` uses 2, because its 1 means "differences found". */
@@ -82,57 +89,84 @@ let errorExitCode = 1;
  */
 const RM_OPTS = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 
-interface ConnectionFlags {
-  host?: string;
-  port?: string;
-  user?: string;
-  pass?: string;
-  insecure?: boolean;
-  https?: boolean;
+function addConnectionFlags(cmd: Command): Command {
+  return cmd
+    .option('--profile <name>', 'saved connection profile (env MIRTH_PROFILE); see `channelvault profile list`')
+    .option('--host <host>', 'Mirth server host (env MIRTH_HOST)')
+    .option('--port <port>', 'Mirth server port (env MIRTH_PORT)')
+    .option('--user <user>', 'username (env MIRTH_USER)')
+    .option('--pass <pass>', 'password (env MIRTH_PASS)')
+    .option('--tls-fingerprint <sha256>', 'accept only the server certificate with this SHA-256 fingerprint (env MIRTH_TLS_FINGERPRINT)')
+    .option('--insecure', 'turn TLS certificate verification off (prefer --tls-fingerprint)', false)
+    .option('--no-https', 'use http instead of https');
 }
 
-/** Resolve server connection from flags, falling back to MIRTH_* env vars. */
-function resolveClientConfig(flags: ConnectionFlags): ClientConfig {
-  const host = flags.host ?? process.env.MIRTH_HOST;
-  const portStr = flags.port ?? process.env.MIRTH_PORT;
-  const username = flags.user ?? process.env.MIRTH_USER;
-  const password = flags.pass ?? process.env.MIRTH_PASS;
-
-  if (!host) fail('no server host (pass --host or set MIRTH_HOST)');
-  if (!portStr) fail('no server port (pass --port or set MIRTH_PORT)');
-  if (!username) fail('no username (pass --user or set MIRTH_USER)');
-  if (password == null) fail('no password (pass --pass or set MIRTH_PASS)');
-
-  const port = Number(portStr);
-  if (!Number.isInteger(port)) fail(`invalid port: ${portStr}`);
-
+function clientConfigOf(conn: Connection): ClientConfig {
   return {
-    host,
-    port,
-    username,
-    password,
-    https: flags.https !== false,
-    disableTlsCheck: flags.insecure === true,
+    host: conn.host,
+    port: conn.port,
+    username: conn.user,
+    password: conn.password,
+    https: conn.https,
+    disableTlsCheck: conn.insecure,
+    ...(conn.tlsFingerprint ? { tlsFingerprint: conn.tlsFingerprint } : {}),
     // Opt-in: error bodies can echo credentials (see `scrub`, applied to all output).
     includeResponseBodies: Boolean(process.env.CHANNELVAULT_DEBUG),
   };
 }
 
-function addConnectionFlags(cmd: Command): Command {
-  return cmd
-    .option('--host <host>', 'Mirth server host (env MIRTH_HOST)')
-    .option('--port <port>', 'Mirth server port (env MIRTH_PORT)')
-    .option('--user <user>', 'username (env MIRTH_USER)')
-    .option('--pass <pass>', 'password (env MIRTH_PASS)')
-    .option('--insecure', 'allow self-signed TLS certificates', false)
-    .option('--no-https', 'use http instead of https');
+/** The connection in use, for the error hints printed after a failure. */
+let activeConnection: Connection | undefined;
+let loadedProfiles: Profiles = {};
+
+/**
+ * Resolve this command's connection once, before anything connects. `root`
+ * is the tree whose committed serverId can select a profile and must match an
+ * explicit one; `write` applies the typed-profile rule for real writes.
+ */
+async function selectConnection(root: string | undefined, flags: ConnectionFlags & { yes?: boolean }, opts: { write?: boolean } = {}): Promise<Connection> {
+  loadedProfiles = await loadProfiles();
+  const meta = root ? await readMeta(root) : null;
+  const conn = resolveConnection({
+    flags,
+    env: process.env,
+    profiles: loadedProfiles,
+    credentials: await readCredentials(),
+    ...(meta?.serverId ? { treeServerId: meta.serverId } : {}),
+    write: opts.write === true,
+    yes: flags.yes === true,
+  });
+  rememberSecret(conn.password, { stdout: true });
+  activeConnection = conn;
+  return conn;
 }
 
-async function withClient<T>(flags: ConnectionFlags, fn: (client: MirthClientExt) => Promise<T>): Promise<T> {
-  const client = createMirthClient(resolveClientConfig(flags));
+/** For people: the URL, and the profile when one was used. */
+function targetOf(conn: Connection): string {
+  return conn.profile ? `${urlOf(conn)} (profile ${conn.profile})` : urlOf(conn);
+}
+
+/**
+ * Log in, verify which installation answered, and print where the command is
+ * going (stderr; under --json it goes into the document instead).
+ */
+async function withClient<T>(
+  conn: Connection,
+  fn: (client: MirthClientExt, serverId: string) => Promise<T>,
+  opts: { envFile?: string; quiet?: boolean } = {},
+): Promise<T> {
+  const client = createMirthClient(clientConfigOf(conn));
   try {
     await client.login();
-    return await fn(client);
+    const serverId = await client.getServerId();
+    if (conn.serverId && serverId !== conn.serverId) {
+      fail(`profile ${conn.profile} is installation ${conn.serverId}, but ${urlOf(conn)} answered as installation ${serverId}; nothing was done. ` +
+        'If the server was reinstalled, check it with the administrator and update the profile', 'server-mismatch');
+    }
+    const owner = conn.source === 'env' ? profileOwning(loadedProfiles, serverId) : undefined;
+    if (owner) fail(`MIRTH_HOST reaches installation ${serverId}, which is profile ${owner}; use --profile ${owner}, or unset MIRTH_HOST`, 'env-shadowed');
+    if (!opts.quiet) process.stderr.write(`${describeConnection(conn, serverId, opts.envFile)}\n`);
+    return await fn(client, serverId);
   } finally {
     await client.logout().catch(() => undefined);
     await client.close().catch(() => undefined);
@@ -184,9 +218,8 @@ function keepOf(flags: BackupFlags): number {
 }
 
 /** The name a server's backups are filed under; the host and port when it has no configured name. */
-function serverNameOf(config: CanonicalConfig, flags: ConnectionFlags): string {
-  const cfg = resolveClientConfig(flags);
-  return backupName(config, `${cfg.host}-${cfg.port}`);
+function serverNameOf(config: CanonicalConfig, conn: Connection): string {
+  return backupName(config, `${conn.host}-${conn.port}`);
 }
 
 /** Parse backup XML, naming the file in the error. */
@@ -202,12 +235,13 @@ function parseBackup(text: string, where: string): CanonicalConfig {
 async function saveServerBackup(
   client: MirthClientExt,
   text: string,
-  flags: ConnectionFlags & BackupFlags,
+  conn: Connection,
+  flags: BackupFlags,
   protect?: string,
 ): Promise<string> {
   const config = parseBackup(text, 'the server configuration');
-  const origin = { serverId: await client.getServerId(), host: hostOf(flags) };
-  const file = await saveBackup(backupDirOf(flags), serverNameOf(config, flags), text, { keep: keepOf(flags), origin, protect });
+  const origin = { serverId: await client.getServerId(), host: hostOf(conn) };
+  const file = await saveBackup(backupDirOf(flags), serverNameOf(config, conn), text, { keep: keepOf(flags), origin, protect });
   if (gitWouldCommit(file)) {
     process.stderr.write(`warning: git does not ignore ${file}, which holds credentials in plain text; add it to .gitignore\n`);
   }
@@ -215,11 +249,11 @@ async function saveServerBackup(
 }
 
 /** Before a push changes anything: a backup to undo it with, unless --no-backup. */
-async function backupBeforePush(client: MirthClientExt, flags: ConnectionFlags & BackupFlags & { overwriteConfigMap?: boolean; deploy?: boolean }): Promise<void> {
+async function backupBeforePush(client: MirthClientExt, conn: Connection, flags: BackupFlags & { overwriteConfigMap?: boolean; deploy?: boolean }): Promise<void> {
   if (flags.backup === false) return;
-  const file = await saveServerBackup(client, await client.getServerConfigurationXml(), flags);
-  process.stdout.write(`backed up the server to ${file} (undo with: ${undoCommand(file, flags)})\n`);
-  printUndoLimits(flags);
+  const file = await saveServerBackup(client, await client.getServerConfigurationXml(), conn, flags);
+  process.stdout.write(`backed up the server to ${file} (undo with: ${undoCommand(file, conn, flags)})\n`);
+  printUndoLimits(conn, flags);
 }
 
 /** Literal arguments for the user's shell; never include a connection password. */
@@ -227,35 +261,47 @@ function shellArgument(value: string): string {
   return process.platform === 'win32' ? `'${value.replace(/'/g, "''")}'` : `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function undoCommand(file: string, flags: ConnectionFlags & BackupFlags & { overwriteConfigMap?: boolean }): string {
-  const cfg = resolveClientConfig(flags);
-  const args = ['channelvault', 'restore', shellArgument(file),
-    '--host', shellArgument(cfg.host), '--port', String(cfg.port), '--user', shellArgument(cfg.username),
-    '--backup-dir', shellArgument(backupDirOf(flags))];
-  if (cfg.https === false) args.push('--no-https');
-  if (cfg.disableTlsCheck) args.push('--insecure');
+/** Never `--yes`: an undo is a whole-server replace and gets its own review. */
+function undoCommand(file: string, conn: Connection, flags: BackupFlags & { overwriteConfigMap?: boolean }): string {
+  const args = ['channelvault', 'restore', shellArgument(file)];
+  if (conn.profile) {
+    args.push('--profile', shellArgument(conn.profile));
+  } else {
+    args.push('--host', shellArgument(conn.host), '--port', String(conn.port), '--user', shellArgument(conn.user));
+    if (!conn.https) args.push('--no-https');
+    if (conn.tlsFingerprint) args.push('--tls-fingerprint', conn.tlsFingerprint);
+    else if (conn.insecure) args.push('--insecure');
+  }
+  args.push('--backup-dir', shellArgument(backupDirOf(flags)));
   if (flags.overwriteConfigMap) args.push('--overwrite-config-map');
   return args.join(' ');
 }
 
-function printUndoLimits(flags: ConnectionFlags & { deploy?: boolean }): void {
-  if (flags.pass !== undefined) process.stdout.write('undo authentication: supply this server\'s password through MIRTH_PASS; it is omitted from the command\n');
+function printUndoLimits(conn: Connection, flags: { deploy?: boolean }): void {
+  if (conn.passwordSource === '--pass') process.stdout.write('undo authentication: supply this server\'s password through MIRTH_PASS; it is omitted from the command\n');
   if (flags.deploy) process.stdout.write('the undo restores saved configuration; runtime deployment state is not in the backup. Review targeted redeployment separately\n');
 }
 
 /** `host:port`, for telling people which server a backup came from. */
-function hostOf(flags: ConnectionFlags): string {
-  const cfg = resolveClientConfig(flags);
-  return `${cfg.host}:${cfg.port}`;
+function hostOf(conn: Connection): string {
+  return `${conn.host}:${conn.port}`;
 }
 
-async function ask(question: string): Promise<string> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+/** With `secret`, nothing typed is echoed. */
+async function ask(question: string, opts: { secret?: boolean } = {}): Promise<string> {
+  let output: NodeJS.WritableStream = process.stdout;
+  if (opts.secret) {
+    process.stdout.write(question);
+    output = new Writable({ write: (_chunk, _enc, done) => done() });
+  }
+  const rl = createInterface({ input: process.stdin, output, terminal: opts.secret ? Boolean(process.stdin.isTTY) : undefined });
   const controller = new AbortController();
   rl.once('close', () => controller.abort());
   rl.once('SIGINT', () => controller.abort());
   try {
-    return (await rl.question(question, { signal: controller.signal })).trim();
+    const answer = await rl.question(opts.secret ? '' : question, { signal: controller.signal });
+    if (opts.secret) process.stdout.write('\n');
+    return opts.secret ? answer : answer.trim();
   } catch (err) {
     if (controller.signal.aborted) fail('confirmation interrupted; nothing was changed');
     throw err;
@@ -306,6 +352,25 @@ interface SyncMeta {
   serverId?: string;
 }
 
+/** The tree's channelvault.json; null when it has none. */
+async function readMeta(root: string): Promise<SyncMeta | null> {
+  const metaPath = path.join(root, 'channelvault.json');
+  if (!existsSync(metaPath)) return null;
+  let meta: unknown;
+  try {
+    meta = await readJson(metaPath);
+  } catch (err) {
+    meta = err;
+  }
+  if (meta === null || typeof meta !== 'object' || Array.isArray(meta) || meta instanceof Error || typeof (meta as SyncMeta).source !== 'string') {
+    fail(
+      `${metaPath} is unreadable or not channelvault metadata${meta instanceof Error ? ` (${meta.message})` : ''}; nothing was written. ` +
+        'Restore it (for example `git checkout -- channelvault.json`) and retry.',
+    );
+  }
+  return meta as SyncMeta;
+}
+
 async function writeMeta(root: string, source: string, config: CanonicalConfig, previous: SyncMeta | null, serverId?: string, resources = resourceIds(config)): Promise<void> {
   const meta: SyncMeta = {
     tool: 'channelvault',
@@ -336,8 +401,25 @@ interface EnvFlags {
   extractSecrets?: boolean;
 }
 
-function envFilePath(root: string, flags: EnvFlags): string {
-  return flags.dotenv ? path.resolve(flags.dotenv) : path.join(root, '.env');
+/**
+ * The env file holding the tree's placeholder values: --dotenv, else the
+ * connection profile's `dotenv` when `<dir>/.env` is absent or is that same
+ * file, else `<dir>/.env`. Two different candidates are refused rather than
+ * guessed between.
+ */
+async function envFileFor(root: string, flags: EnvFlags, conn?: Connection): Promise<string> {
+  if (flags.dotenv) return path.resolve(flags.dotenv);
+  const local = path.join(root, '.env');
+  if (!conn?.dotenv) return local;
+  if (!existsSync(local) || samePath(await canonical(local), await canonical(conn.dotenv))) return conn.dotenv;
+  fail(`both ${local} and profile ${conn.profile}'s env file ${conn.dotenv} exist; pass --dotenv to choose one, or remove the one that is stale`, 'env-ambiguous');
+}
+
+/** Every env file an interrupted replacement in `root` may legitimately name. */
+async function recoveryCandidates(root: string, flags: EnvFlags): Promise<string[]> {
+  if (flags.dotenv) return [path.resolve(flags.dotenv)];
+  const dotenvs = Object.values(await loadProfiles()).flatMap(p => (p.dotenv ? [p.dotenv] : []));
+  return [path.join(root, '.env'), ...dotenvs];
 }
 
 /** The env file overlaid with the process environment (which wins, as in CI). */
@@ -361,28 +443,40 @@ async function existingTree(root: string): Promise<CanonicalConfig | null> {
 }
 
 /** The tree with placeholders filled from the env file; fails listing any missing names. */
-async function renderedTree(root: string, flags: EnvFlags): Promise<CanonicalConfig> {
+async function renderedTree(root: string, envFile: string): Promise<CanonicalConfig> {
   const tree = await engine.implode({ root });
-  const env = await loadEnv(envFilePath(root, flags));
+  const env = await loadEnv(envFile);
   rememberSecrets(tree, env);
   return render(tree, env);
 }
 
 /**
- * The values behind the tree's placeholders. A server's error can echo what
- * was sent, so everything printed about a failure goes through `scrub`.
+ * The values behind the tree's placeholders, and the connection password. A
+ * server's error can echo what was sent, so everything printed about a failure
+ * goes through `scrub`; the connection password is scrubbed from every line.
  */
 const knownSecrets = new Set<string>();
+const everywhereSecrets = new Set<string>();
+
+function rememberSecret(value: string | undefined, opts: { stdout?: boolean } = {}): void {
+  // Shorter values (a port, "true") would redact ordinary words in error text;
+  // on every line, so would a short password ("admin" in "administrator").
+  if (value === undefined || value.length < 4) return;
+  knownSecrets.add(value);
+  if (opts.stdout && value.length >= 8) everywhereSecrets.add(value);
+}
 
 function rememberSecrets(tree: CanonicalConfig, env: Record<string, string | undefined>): void {
   mapLeaves(tree, (value) => {
-    for (const m of value.matchAll(/\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g)) {
-      const secret = env[m[1]!];
-      // Shorter values (a port, "true") would redact ordinary words.
-      if (secret !== undefined && secret.length >= 4) knownSecrets.add(secret);
-    }
+    for (const m of value.matchAll(/\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g)) rememberSecret(env[m[1]!]);
     return value;
   });
+}
+
+for (const stream of [process.stdout, process.stderr]) {
+  const write = stream.write.bind(stream) as (chunk: unknown, ...rest: unknown[]) => boolean;
+  stream.write = ((chunk: unknown, ...rest: unknown[]) =>
+    write(typeof chunk === 'string' && everywhereSecrets.size > 0 ? scrub(chunk, everywhereSecrets) : chunk, ...rest)) as typeof stream.write;
 }
 
 /**
@@ -390,8 +484,8 @@ function rememberSecrets(tree: CanonicalConfig, env: Record<string, string | und
  * reach here decoded (see `readableBody`); the encoded forms cover text that
  * quotes a secret some other way.
  */
-function scrub(text: string): string {
-  const forms = [...knownSecrets].flatMap((s) => [
+function scrub(text: string, secrets: ReadonlySet<string> = knownSecrets): string {
+  const forms = [...secrets].flatMap((s) => [
     s,
     JSON.stringify(s).slice(1, -1),
     s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'),
@@ -419,8 +513,7 @@ async function readAllow(root: string): Promise<AllowEntry[]> {
  * placeholders; their values go to the env file, never to the tree. Anything
  * that still looks like a secret stops the write unless --extract-secrets.
  */
-async function writeTree(root: string, fetched: CanonicalConfig, source: string, flags: EnvFlags, serverId?: string): Promise<void> {
-  const envFile = envFilePath(root, flags);
+async function writeTree(root: string, fetched: CanonicalConfig, source: string, flags: EnvFlags, envFile: string, serverId?: string): Promise<void> {
   const previousMeta = await preflightTree(root, envFile);
   const env = await loadEnv(envFile);
   const templated = templatize(fetched, await existingTree(root), env);
@@ -490,22 +583,6 @@ function gitWouldCommit(file: string): boolean {
   return r.status === 1;
 }
 
-/** `p` with links resolved as far as it exists (the rest may not be created yet). */
-async function resolvedPath(p: string): Promise<string> {
-  const abs = path.resolve(p);
-  let existing = abs;
-  while (!existsSync(existing) && path.dirname(existing) !== existing) existing = path.dirname(existing);
-  return path.join(await realpath(existing), path.relative(existing, abs));
-}
-
-/** `child` is `parent` or inside it (case-insensitively on Windows). */
-function isWithin(child: string, parent: string): boolean {
-  const norm = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
-  const rel = path.relative(norm(parent), norm(child));
-  // `..runtime.env` is a file name, not a step up.
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
-}
-
 /**
  * Everything that can stop `pull`/`explode` must be checked before either
  * writes: they update the env file, then replace the managed directories,
@@ -521,22 +598,8 @@ async function preflightTree(root: string, envFile: string): Promise<SyncMeta | 
   );
   if (doomed) fail(`the env file ${envFile} is inside ${doomed}/, which this command replaces; keep it elsewhere`);
 
-  const metaPath = path.join(root, 'channelvault.json');
-  if (existsSync(metaPath)) {
-    let meta: unknown;
-    try {
-      meta = await readJson(metaPath);
-    } catch (err) {
-      meta = err;
-    }
-    if (meta === null || typeof meta !== 'object' || Array.isArray(meta) || meta instanceof Error || typeof (meta as SyncMeta).source !== 'string') {
-      fail(
-        `${metaPath} is unreadable or not channelvault metadata${meta instanceof Error ? ` (${meta.message})` : ''}; nothing was written. ` +
-          'Restore it (for example `git checkout -- channelvault.json`) and retry.',
-      );
-    }
-    return meta as SyncMeta;
-  }
+  const meta = await readMeta(root);
+  if (meta) return meta;
   // The managed directories must be ones channelvault wrote.
   const foreign = MANAGED_DIRS.filter((d) => existsSync(path.join(root, d)));
   if (foreign.length > 0) {
@@ -568,11 +631,9 @@ type TreeOrigin = 'xml' | 'live' | 'unknown';
 
 /** Read the recorded origin from `channelvault.json` (`source` field). */
 async function readTreeOrigin(root: string): Promise<TreeOrigin> {
-  const metaPath = path.join(root, 'channelvault.json');
-  if (!existsSync(metaPath)) return 'unknown';
   try {
-    const meta = await readJson<SyncMeta>(metaPath);
-    if (typeof meta.source === 'string') {
+    const meta = await readMeta(root);
+    if (typeof meta?.source === 'string') {
       if (meta.source.startsWith('file:')) return 'xml';
       if (/^https?:\/\//i.test(meta.source)) return 'live';
     }
@@ -624,8 +685,7 @@ function collect(value: string, previous: string[] | undefined): string[] {
 // --- push ---------------------------------------------------------------------
 
 async function bindingProblems(root: string, serverId: string): Promise<string[]> {
-  const file = path.join(root, 'channelvault.json');
-  const meta = existsSync(file) ? await readJson<SyncMeta>(file) : null;
+  const meta = await readMeta(root);
   if (meta?.serverId === serverId) return [];
   return [`this tree's baseline belongs to ${meta?.serverId ? `installation ${meta.serverId}` : 'an unknown installation'}, not the target (${serverId}); pull the target and merge your edits, or review with 'adopt <dir> --plan-only' and run 'adopt <dir>' to establish its baseline; --force does not bypass installation binding`];
 }
@@ -642,18 +702,15 @@ async function assertBinding(client: MirthClientExt, root: string): Promise<void
 
 /** Resource ids recorded at the last pull, if this tree has them. */
 async function readKnown(root: string): Promise<Known | undefined> {
-  const metaPath = path.join(root, 'channelvault.json');
-  if (!existsSync(metaPath)) return undefined;
-  return knownFrom((await readJson<SyncMeta>(metaPath)).resources);
+  const meta = await readMeta(root);
+  return meta ? knownFrom(meta.resources) : undefined;
 }
 
 async function writeKnown(root: string, known: Known): Promise<void> {
-  const metaPath = path.join(root, 'channelvault.json');
-  if (!existsSync(metaPath)) return;
-  const meta = await readJson<SyncMeta>(metaPath);
-  if (!meta.resources) return; // an older tree: leave it to the next pull
+  const meta = await readMeta(root);
+  if (!meta?.resources) return; // no metadata, or an older tree: leave it to the next pull
   meta.resources = known;
-  await writeFile(metaPath, JSON.stringify(meta, null, 2) + '\n', 'utf8');
+  await writeFile(path.join(root, 'channelvault.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8');
 }
 
 /**
@@ -703,13 +760,15 @@ function reportPlanOnly(
   flags: PushFlags,
   plan: Plan,
   problems: string[],
-  extra: { target: string; mode: 'scoped' | 'whole-server' | 'adopt'; serverId?: string; redeploy?: string[]; notRedeployed?: string[] },
+  live: Live,
+  extra: { target: string; mode: 'scoped' | 'whole-server' | 'adopt'; redeploy?: string[]; notRedeployed?: string[] },
 ): void {
   if (flags.json) {
     writeJson({
       target: extra.target,
       mode: extra.mode,
-      ...(extra.serverId ? { serverId: extra.serverId } : {}),
+      serverId: live.serverId,
+      connection: connectionJson(live.conn, live.serverId, live.envFile),
       changes: plan.changes,
       conflicts: plan.conflicts,
       serverOnly: plan.serverOnly,
@@ -721,6 +780,13 @@ function reportPlanOnly(
   }
   for (const p of problems) process.stdout.write(`a push would stop: ${p}\n`);
   process.stdout.write('plan only: nothing was changed\n');
+}
+
+/** Where a live command is connected: the resolved connection, the installation that answered, the env file in use. */
+interface Live {
+  conn: Connection;
+  serverId: string;
+  envFile?: string;
 }
 
 interface PushFlags extends ConnectionFlags, BackupFlags, JsonFlags {
@@ -740,11 +806,12 @@ async function scopedPush(
   scope: Scope,
   target: string,
   flags: PushFlags,
+  live: Live,
 ): Promise<void> {
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
   const plan = planPush(local, remote, scope, known);
-  const problems = [...await bindingProblems(root, await client.getServerId()), ...planProblems(plan, flags), ...await xmlProblems(root, local)];
+  const problems = [...await bindingProblems(root, live.serverId), ...planProblems(plan, flags), ...await xmlProblems(root, local)];
   const names = new Map(
     [...channelsOf(remote), ...channelsOf(local)].map((c) => [String(c['id']), String(c['name'])] as const),
   );
@@ -758,7 +825,7 @@ async function scopedPush(
 
   if (flags.planOnly && flags.json) {
     const redeploy = flags.deploy ? { redeploy: toDeploy.map(nameOf), notRedeployed: notDeployed.map(nameOf) } : {};
-    reportPlanOnly(flags, plan, problems, { target, mode: 'scoped', ...redeploy });
+    reportPlanOnly(flags, plan, problems, live, { target, mode: 'scoped', ...redeploy });
     return;
   }
   if (plan.changes.length === 0) {
@@ -778,7 +845,7 @@ async function scopedPush(
     process.stdout.write(`left alone (created on the server since the last pull; pull to get them): ${plan.serverOnly.join(', ')}\n`);
   }
   if (flags.planOnly) {
-    reportPlanOnly(flags, plan, problems, { target, mode: 'scoped' });
+    reportPlanOnly(flags, plan, problems, live, { target, mode: 'scoped' });
     return;
   }
   if (problems.length > 0) fail(problems.join('\n'));
@@ -799,7 +866,7 @@ async function scopedPush(
   }
   // Apply against the fresh snapshot, so whatever is sent for resources
   // outside the plan (the rest of the library list) is the server's latest.
-  await backupBeforePush(client, flags);
+  await backupBeforePush(client, live.conn, flags);
   const afterBackup = await client.getServerConfiguration();
   const changedDuringBackup = changedSince(plan, fresh, afterBackup);
   if (!flags.force && changedDuringBackup.length) {
@@ -934,13 +1001,14 @@ async function wholeServerPush(
   local: CanonicalConfig,
   target: string,
   flags: PushFlags,
+  live: Live,
 ): Promise<void> {
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
   const plan = planPush(local, remote, {}, known, { wholeReplace: true });
-  const problems = [...await bindingProblems(root, await client.getServerId()), ...wholeServerProblems(plan, flags), ...await xmlProblems(root, local)];
+  const problems = [...await bindingProblems(root, live.serverId), ...wholeServerProblems(plan, flags), ...await xmlProblems(root, local)];
   if (flags.planOnly && flags.json) {
-    reportPlanOnly(flags, plan, problems, { target, mode: 'whole-server' });
+    reportPlanOnly(flags, plan, problems, live, { target, mode: 'whole-server' });
     return;
   }
   const s = summarize(local);
@@ -963,7 +1031,7 @@ async function wholeServerPush(
   if (replaced.length > 0) process.stdout.write(`also replaced: ${replaced.join(', ')}\n`);
   if (keptMap) process.stdout.write('configuration map differs but is kept (--overwrite-config-map replaces it)\n');
   if (flags.planOnly) {
-    reportPlanOnly(flags, plan, problems, { target, mode: 'whole-server' });
+    reportPlanOnly(flags, plan, problems, live, { target, mode: 'whole-server' });
     return;
   }
   if (problems.length > 0) fail(problems.join('\n'));
@@ -982,7 +1050,7 @@ async function wholeServerPush(
   if (!flags.allowDeletes && (freshPlan.serverOnly.length > 0 || freshPlan.changes.some(c => c.op === 'delete'))) {
     fail('the replace now deletes resources from the server; review the new plan and pass --allow-deletes');
   }
-  await backupBeforePush(client, flags);
+  await backupBeforePush(client, live.conn, flags);
   const afterBackup = await client.getServerConfiguration();
   if (!sameServerConfig(fresh, afterBackup) && !flags.force) fail('the server changed during backup; pull and try again');
   const finalPlan = planPush(local, afterBackup, {}, known, { wholeReplace: true });
@@ -1032,7 +1100,7 @@ addExtractFlag(addEnvFlag(
 )).action(async (backupPath: string, dir: string, flags: EnvFlags) => {
   const config = xml.parse(await readFile(backupPath, 'utf8'));
   const root = path.resolve(dir);
-  await writeTree(root, config, `file:${path.resolve(backupPath)}`, flags);
+  await writeTree(root, config, `file:${path.resolve(backupPath)}`, flags, await envFileFor(root, flags));
   const s = summarize(config);
   process.stdout.write(`exploded ${s.channels} channels, ${s.codeTemplates} code templates -> ${root}\n`);
 });
@@ -1047,7 +1115,7 @@ addEnvFlag(
 ).action(async (dir: string, outPath: string, flags: EnvFlags & { force?: boolean }) => {
     const root = path.resolve(dir);
     assertTree(root);
-    const config = await renderedTree(root, flags);
+    const config = await renderedTree(root, await envFileFor(root, flags));
     await assertCompatibleOrigin(root, config, 'xml', flags.force === true);
     const xmlStr = xml.build(config);
     await writeFile(outPath, xmlStr, 'utf8');
@@ -1061,15 +1129,21 @@ addExtractFlag(addEnvFlag(addConnectionFlags(
     .argument('<dir>', 'working-tree directory'),
 ))).action(async (dir: string, flags: ConnectionFlags & EnvFlags) => {
   const root = path.resolve(dir);
-  await preflightTree(root, envFilePath(root, flags)); // before fetching a whole server for nothing
-  const { config, serverId } = await withClient(flags, async client => {
-    const serverId = await client.getServerId();
+  const conn = await selectConnection(root, flags);
+  const envFile = await envFileFor(root, flags, conn);
+  // Another worktree's pull may be writing the same profile env file.
+  if (!isWithin(path.resolve(envFile), root)) await lockAlso(envFile);
+  const previous = await preflightTree(root, envFile); // before fetching a whole server for nothing
+  const { config, serverId } = await withClient(conn, async (client, serverId) => {
+    if (previous?.serverId && previous.serverId !== serverId) {
+      fail(`this tree belongs to installation ${previous.serverId}, but ${urlOf(conn)} is installation ${serverId}; nothing was written. ` +
+        "Pull into another directory, or rebind this tree deliberately with 'adopt <dir> --plan-only' and 'adopt <dir>'", 'installation-mismatch');
+    }
     const config = await client.getServerConfiguration();
     if (await client.getServerId() !== serverId) fail('the installation changed while pulling; nothing was written');
     return { config, serverId };
-  });
-  const cfg = resolveClientConfig(flags);
-  await writeTree(root, config, `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`, flags, serverId);
+  }, { envFile });
+  await writeTree(root, config, urlOf(conn), flags, envFile, serverId);
   const s = summarize(config);
   process.stdout.write(`pulled ${s.channels} channels, ${s.codeTemplates} code templates -> ${root}\n`);
 });
@@ -1083,27 +1157,28 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
 ))).action(async (dir: string, flags: ConnectionFlags & EnvFlags & JsonFlags & { planOnly?: boolean; yes?: boolean }) => {
   const root = path.resolve(dir);
   assertTree(root);
-  const previous = await preflightTree(root, envFilePath(root, flags));
-  const stored = await engine.implode({ root });
-  const local = await renderedTree(root, flags);
-  await assertCompatibleOrigin(root, local, 'live', false);
   if (flags.json && !flags.planOnly) fail('--json needs --plan-only');
   if (!flags.yes && !flags.planOnly && !process.stdin.isTTY) fail('no terminal to confirm on; review with `adopt --plan-only` and pass --yes');
-  const cfg = resolveClientConfig(flags);
-  const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
-  await withClient(flags, async client => {
-    const serverId = await client.getServerId();
+  // Adopting rebinds the tree, so its current serverId neither selects nor has to match the profile.
+  const conn = await selectConnection(undefined, flags, { write: !flags.planOnly });
+  const envFile = await envFileFor(root, flags, conn);
+  const previous = await preflightTree(root, envFile);
+  const stored = await engine.implode({ root });
+  const local = await renderedTree(root, envFile);
+  await assertCompatibleOrigin(root, local, 'live', false);
+  const target = urlOf(conn);
+  await withClient(conn, async (client, serverId) => {
     const remote = await client.getServerConfiguration();
     const adopted = adoptTarget(local, remote);
     const plan = planPush(adopted.config, remote, {}, adopted.known);
     if (!flags.json) {
-      process.stdout.write(`Adopt ${target} (installation ${serverId}) as this tree's baseline.\nLocal content is preserved; the following differences become reviewed edits for a subsequent push:\n`);
+      process.stdout.write(`Adopt ${targetOf(conn)} (installation ${serverId}) as this tree's baseline.\nLocal content is preserved; the following differences become reviewed edits for a subsequent push:\n`);
       printChanges(plan);
       if (plan.serverOnly.length) process.stdout.write(`left alone: ${plan.serverOnly.join(', ')}\n`);
       if (plan.notPushed.length) process.stdout.write(`not pushed by scoped push: ${plan.notPushed.join(', ')}\n`);
     }
     if (flags.planOnly) {
-      reportPlanOnly(flags, plan, planProblems(plan, {}), { target, mode: 'adopt', serverId });
+      reportPlanOnly(flags, plan, planProblems(plan, {}), { conn, serverId, envFile }, { target, mode: 'adopt' });
       return;
     }
     if (!flags.yes && !(await confirm('Accept this baseline?'))) {
@@ -1114,13 +1189,13 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
       fail('the target changed while adopting; nothing was written. Review the new baseline and try again');
     }
     if (!sameServerConfig(stored, await engine.implode({ root }))) fail('the local tree changed while adopting; nothing was written');
-    await replaceTree(root, envFilePath(root, flags), async next => {
+    await replaceTree(root, envFile, async next => {
       const rebased = adoptTarget(stored, remote);
       await engine.explode(rebased.config, { root: next });
       await writeMeta(next, target, rebased.config, previous, serverId, adopted.known);
     });
     process.stdout.write(`adopted installation ${serverId}; review with push --plan-only before writing the server\n`);
-  });
+  }, { envFile, quiet: flags.json });
 });
 
 addBackupDirFlags(addEnvFlag(addConnectionFlags(
@@ -1163,20 +1238,22 @@ addBackupDirFlags(addEnvFlag(addConnectionFlags(
     if (flags.overwriteConfigMap && !flags.wholeServer) fail('--overwrite-config-map needs --whole-server');
     const root = path.resolve(dir);
     assertTree(root);
-    const config = await renderedTree(root, flags);
-    await assertCompatibleOrigin(root, config, 'live', flags.ignoreOrigin === true);
-    const cfg = resolveClientConfig(flags);
-    const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
     if (flags.json && !flags.planOnly) fail('--json needs --plan-only');
     if (!flags.yes && !flags.planOnly && !process.stdin.isTTY) {
       fail('no terminal to confirm on; review with `push --plan-only` or `diff`, and pass --yes');
     }
+    const conn = await selectConnection(root, flags, { write: !flags.planOnly });
+    const envFile = await envFileFor(root, flags, conn);
+    const config = await renderedTree(root, envFile);
+    await assertCompatibleOrigin(root, config, 'live', flags.ignoreOrigin === true);
+    const target = targetOf(conn);
+    const quiet = flags.json === true;
     if (flags.wholeServer) {
-      await withClient(flags, (client) => wholeServerPush(client, root, config, target, flags));
+      await withClient(conn, (client, serverId) => wholeServerPush(client, root, config, target, flags, { conn, serverId, envFile }), { envFile, quiet });
       return;
     }
     const scope: Scope = { channels: flags.channel, libraries: flags.library, globalScripts: flags.globalScripts };
-    await withClient(flags, (client) => scopedPush(client, root, config, scope, target, flags));
+    await withClient(conn, (client, serverId) => scopedPush(client, root, config, scope, target, flags, { conn, serverId, envFile }), { envFile, quiet });
   },
 );
 
@@ -1186,11 +1263,11 @@ addBackupDirFlags(addConnectionFlags(
     .description('Save the server configuration as <server>-<UTC time>.xml in ~/.channelvault/backups (holds credentials in plain text)')
     .option('--out <file>', 'write to this file instead (no rotation)'),
 )).action(async (flags: ConnectionFlags & BackupFlags & { out?: string }) => {
-  const cfg = resolveClientConfig(flags);
-  const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
-  const file = await withClient(flags, async (client) => {
+  const conn = await selectConnection(undefined, flags);
+  const target = targetOf(conn);
+  const file = await withClient(conn, async (client) => {
     const text = await client.getServerConfigurationXml();
-    if (!flags.out) return saveServerBackup(client, text, flags);
+    if (!flags.out) return saveServerBackup(client, text, conn, flags);
     const out = path.resolve(flags.out);
     parseBackup(text, 'the server configuration');
     if (existsSync(out)) fail(`${out} already exists; choose another name`);
@@ -1235,7 +1312,7 @@ async function chooseBackup(dir: string, file: string | undefined, serverId: str
  * export fails (HTTP 500 after a resource holding a character XML forbids was
  * saved, seen on 4.5.0): no preview, no undo backup, no name or version check.
  */
-async function restoreWithBrokenExport(client: MirthClientExt, file: string | undefined, flags: RestoreFlags, target: string): Promise<void> {
+async function restoreWithBrokenExport(client: MirthClientExt, serverId: string, file: string | undefined, flags: RestoreFlags, target: string): Promise<void> {
   try {
     await client.getServerConfigurationXml();
     fail('the server can export its configuration; run restore without --export-broken, which shows a preview and saves an undo backup first');
@@ -1246,7 +1323,6 @@ async function restoreWithBrokenExport(client: MirthClientExt, file: string | un
       fail(`cannot tell whether the export is broken: ${err instanceof Error ? err.message : String(err)}; --export-broken only proceeds when the server answers its export with HTTP 500`);
     }
   }
-  const serverId = await client.getServerId();
   const dir = backupDirOf(flags);
   const chosen = await chooseBackup(dir, file, serverId, target);
   const text = await readFile(chosen, 'utf8');
@@ -1293,13 +1369,13 @@ addBackupDirFlags(addConnectionFlags(
     .option('--export-broken', 'the server cannot export its configuration (HTTP 500): restore without a preview, undo backup or version check', false)
     .option('-y, --yes', 'skip the confirmation prompt', false),
 )).action(async (file: string | undefined, flags: RestoreFlags) => {
-  const cfg = resolveClientConfig(flags);
-  const target = `${cfg.https === false ? 'http' : 'https'}://${cfg.host}:${cfg.port}`;
   if (!flags.yes && !process.stdin.isTTY) fail('no terminal to confirm on; pass --yes');
+  const conn = await selectConnection(undefined, flags, { write: true });
+  const target = targetOf(conn);
   const dir = backupDirOf(flags);
-  await withClient(flags, async (client) => {
+  await withClient(conn, async (client, serverId) => {
     if (flags.exportBroken) {
-      await restoreWithBrokenExport(client, file, flags, target);
+      await restoreWithBrokenExport(client, serverId, file, flags, target);
       return;
     }
     let currentText: string;
@@ -1310,7 +1386,6 @@ addBackupDirFlags(addConnectionFlags(
         'If its export is broken (for example HTTP 500), restore with --export-broken, which skips the preview and the undo backup');
     }
     const current = parseBackup(currentText, 'the server configuration');
-    const serverId = await client.getServerId();
     const chosen = await chooseBackup(dir, file, serverId, target);
     const text = await readFile(chosen, 'utf8');
     const backup = parseBackup(text, chosen);
@@ -1365,9 +1440,9 @@ addBackupDirFlags(addConnectionFlags(
     }
     // The undo: the configuration about to be replaced. The backup being
     // restored is protected from rotation.
-    const undo = await saveServerBackup(client, freshText, flags, chosen);
-    process.stdout.write(`saved the current configuration to ${undo} (undo with: ${undoCommand(undo, flags)})\n`);
-    printUndoLimits(flags);
+    const undo = await saveServerBackup(client, freshText, conn, flags, chosen);
+    process.stdout.write(`saved the current configuration to ${undo} (undo with: ${undoCommand(undo, conn, flags)})\n`);
+    printUndoLimits(conn, flags);
 
     const afterBackup = parseBackup(await client.getServerConfigurationXml(), 'the server configuration');
     if (!sameServerConfig(parseBackup(freshText, 'the server configuration'), afterBackup)) {
@@ -1399,11 +1474,20 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
   const root = path.resolve(dir);
   assertTree(root);
 
-  const fetched = await withClient(flags, (client) => client.getServerConfiguration());
+  const conn = await selectConnection(root, flags);
+  const envFile = await envFileFor(root, flags, conn);
+  const treeServerId = (await readMeta(root))?.serverId;
+  const { fetched, serverId } = await withClient(conn, async (client, serverId) => {
+    // Against another installation every resource would read as a difference.
+    if (treeServerId && treeServerId !== serverId) {
+      fail(`this tree belongs to installation ${treeServerId}, but ${urlOf(conn)} is installation ${serverId}; choose the server this tree was pulled from`, 'installation-mismatch');
+    }
+    return { fetched: await client.getServerConfiguration(), serverId };
+  }, { envFile, quiet: flags.json });
   const tree = await engine.implode({ root });
   // Compare like with like: the server's credentials become the placeholders
   // the tree holds. Values that differ from the env file are named, never shown.
-  const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, await loadEnv(envFilePath(root, flags)));
+  const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, await loadEnv(envFile));
   const messages: string[] = [
     ...Object.keys(envUpdates).map((name) => `${name} differs between the server and the env file`),
     ...notes,
@@ -1471,7 +1555,7 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
     if (!clean) process.exitCode = 1;
     if (flags.json) {
       const files = await changedFiles(path.join(tmp, 'tree'), path.join(tmp, 'server'));
-      writeJson({ clean, files, secretDrift, staleRevisions, notes: messages, patch: out });
+      writeJson({ clean, serverId, connection: connectionJson(conn, serverId, envFile), files, secretDrift, staleRevisions, notes: messages, patch: out });
     } else if (clean) {
       process.stdout.write('no differences — working tree matches the server.\n');
     } else {
@@ -1506,18 +1590,19 @@ async function changedFiles(treeDir: string, serverDir: string): Promise<Array<{
 addJsonFlag(addEnvFlag(
   program
     .command('status')
-    .description('Summarize a working tree')
+    .description('Summarize a working tree, and say which connection profile live commands would use')
     .argument('<dir>', 'working-tree directory'),
 )).action(async (dir: string, flags: JsonFlags & EnvFlags) => {
   const root = path.resolve(dir);
   assertTree(root);
   const config = await engine.implode({ root });
   const s = summarize(config);
-  const metaPath = path.join(root, 'channelvault.json');
-  const meta = existsSync(metaPath) ? await readJson<SyncMeta>(metaPath) : null;
+  const meta = await readMeta(root);
+  const connection = await offlineConnection(meta?.serverId);
   if (flags.json) {
     writeJson({
-      root, source: meta?.source ?? null, pulledAt: meta?.pulledAt ?? null, engineVersion: meta?.engineVersion ?? null, counts: s,
+      root, source: meta?.source ?? null, pulledAt: meta?.pulledAt ?? null, engineVersion: meta?.engineVersion ?? null,
+      serverId: meta?.serverId ?? null, connection, counts: s,
       xmlForbiddenChars: forbiddenXmlChars(config),
     });
     return;
@@ -1527,7 +1612,12 @@ addJsonFlag(addEnvFlag(
     process.stdout.write(`source:  ${meta.source}\n`);
     process.stdout.write(`pulled:  ${meta.pulledAt}\n`);
     process.stdout.write(`engine:  ${meta.engineVersion ?? 'unknown'}\n`);
+    if (meta.serverId) process.stdout.write(`server:  installation ${meta.serverId}\n`);
   }
+  process.stdout.write(`connect: ${'problem' in connection
+    ? connection.problem
+    : `${connection.profile ? `profile ${connection.profile}` : 'no profile'}, ${connection.url} as ${connection.user}, chosen by ${connection.source}` +
+      `${connection.passwordConfigured ? '' : ' (no password configured)'}`}\n`);
   process.stdout.write(
     `channels:               ${s.channels}\n` +
       `channel groups:         ${s.channelGroups}\n` +
@@ -1536,36 +1626,288 @@ addJsonFlag(addEnvFlag(
   );
 });
 
-let unlock: (() => Promise<void>) | undefined;
-program.hook('preAction', async (_program, command) => {
-  const name = command.name();
-  if (!['explode', 'pull', 'adopt', 'push', 'implode', 'diff', 'status'].includes(name)) return;
-  if (name === 'diff') errorExitCode = 2;
-  const root = path.resolve(String(command.processedArgs[name === 'explode' ? 1 : 0]));
-  unlock = await lockTree(root);
-  await recoverTree(root, envFilePath(root, command.opts<EnvFlags>()));
+/** Which connection a read of this tree would use, without connecting or needing its password. */
+async function offlineConnection(treeServerId: string | undefined): Promise<
+  { profile: string | null; url: string; user: string; source: string; passwordConfigured: boolean } | { problem: string }
+> {
+  try {
+    const profiles = await loadProfiles();
+    const credentials = await readCredentials();
+    const conn = resolveConnection({
+      flags: {},
+      env: process.env,
+      profiles,
+      // Resolve as if every password were set, then report the real state.
+      credentials: Object.fromEntries(Object.keys(profiles).map(n => [n, ''])),
+      ...(treeServerId ? { treeServerId } : {}),
+    });
+    const passwordConfigured = conn.profile ? Object.prototype.hasOwnProperty.call(credentials, conn.profile) : true;
+    return { profile: conn.profile ?? null, url: urlOf(conn), user: conn.user, source: conn.source, passwordConfigured };
+  } catch (err) {
+    if (!(err instanceof ReasonError)) throw err;
+    return { problem: `${err.reason ? `[${err.reason}] ` : ''}${err.message}` };
+  }
+}
+
+// --- profiles -----------------------------------------------------------------
+
+function needTerminal(what: string): void {
+  if (!process.stdin.isTTY) fail(`${what} asks at a terminal; run it yourself in a terminal (agents cannot)`, 'no-terminal');
+}
+
+async function askPassword(prompt: string): Promise<string> {
+  const password = await ask(prompt, { secret: true });
+  if (password.length < 8) fail('a profile password needs at least 8 characters; nothing was saved', 'weak-password');
+  return password;
+}
+
+function connectionOfProfile(name: string, profile: Profile, password: string): Connection {
+  return {
+    host: profile.host,
+    port: profile.port,
+    user: profile.user,
+    password,
+    https: profile.https !== false,
+    insecure: profile.insecure === true,
+    ...(profile.tlsFingerprint ? { tlsFingerprint: profile.tlsFingerprint } : {}),
+    source: 'profile-flag',
+    passwordSource: 'credentials',
+    profile: name,
+    ...(profile.serverId ? { serverId: profile.serverId } : {}),
+  };
+}
+
+/** Log in as the profile and return the installation that answered. */
+async function loginCheck(conn: Connection): Promise<string> {
+  rememberSecret(conn.password, { stdout: true });
+  activeConnection = conn;
+  return withClient(conn, async (_client, serverId) => serverId, { quiet: true });
+}
+
+function existingProfile(profiles: Profiles, name: string): Profile {
+  const profile = profiles[name];
+  if (!profile) fail(`no profile named ${name} (${Object.keys(profiles).join(', ') || 'none saved'})`, 'profile-unknown');
+  return profile;
+}
+
+const profileCommand = program.command('profile').description(`Manage connection profiles (${path.join('~', '.channelvault', 'profiles.json')}; passwords in its credentials file)`);
+
+addJsonFlag(profileCommand.command('list').description('List the saved profiles (never their passwords)')).action(async (flags: JsonFlags) => {
+  const profiles = await loadProfiles();
+  const credentials = await readCredentials();
+  const rows = Object.entries(profiles).map(([name, p]) => ({
+    name,
+    url: urlOf({ https: p.https !== false, host: p.host, port: p.port }),
+    user: p.user,
+    serverId: p.serverId ?? null,
+    tlsFingerprint: p.tlsFingerprint ?? null,
+    insecure: p.insecure === true,
+    dotenv: p.dotenv ?? null,
+    passwordConfigured: Object.prototype.hasOwnProperty.call(credentials, name),
+  }));
+  if (flags.json) {
+    writeJson({ profilesFile: profilesFile(), profiles: rows });
+    return;
+  }
+  if (rows.length === 0) {
+    process.stdout.write(`no profiles in ${profilesFile()}; add one at a terminal with: channelvault profile add <name> --host <host> --port <port> --user <user>\n`);
+    return;
+  }
+  for (const r of rows) {
+    const tls = r.tlsFingerprint ? `pinned ${formatFingerprint(r.tlsFingerprint).slice(0, 11)}…` : r.insecure ? 'certificate not checked' : r.url.startsWith('https') ? 'CA-verified' : 'plain http';
+    process.stdout.write(`${r.name}  ${r.url} as ${r.user}  installation ${r.serverId ?? '(not recorded)'}  ${tls}` +
+      `${r.dotenv ? `  env file ${r.dotenv}` : ''}${r.passwordConfigured ? '' : '  (no password: run profile set-password)'}\n`);
+  }
 });
 
-program.parseAsync().catch((err: unknown) => {
+profileCommand.command('add')
+  .description('Add a profile at a terminal: confirm the server and its certificate, enter the password, record its installation')
+  .argument('<name>', 'profile name (letters, digits, ".", "_", "-")')
+  .requiredOption('--host <host>', 'Mirth server host')
+  .requiredOption('--port <port>', 'Mirth server port')
+  .requiredOption('--user <user>', 'username')
+  .option('--dotenv <path>', "env file for this server's trees, used when a tree has no .env of its own")
+  .option('--tls-fingerprint <sha256>', "the certificate's SHA-256 fingerprint, when you have it from the administrator")
+  .option('--insecure', 'turn certificate verification off (loopback hosts only)', false)
+  .option('--no-https', 'use http (loopback hosts only)')
+  .action(async (name: string, flags: { host: string; port: string; user: string; dotenv?: string; tlsFingerprint?: string; insecure?: boolean; https?: boolean }) => {
+    needTerminal('profile add');
+    if (!PROFILE_NAME.test(name)) fail(`profile names are letters, digits, '.', '_' and '-', starting with a letter or digit: ${name}`, 'profile-invalid');
+    const profiles = await loadProfiles();
+    if (profiles[name]) fail(`profile ${name} already exists; change its password with \`channelvault profile set-password ${name}\`, or edit ${profilesFile()}`, 'profile-exists');
+    const port = Number(flags.port);
+    const profile: Profile = { host: flags.host, port, user: flags.user };
+    if (flags.https === false) profile.https = false;
+    if (flags.insecure) profile.insecure = true;
+    if (flags.dotenv) profile.dotenv = path.resolve(flags.dotenv);
+    if (flags.tlsFingerprint !== undefined) {
+      const pin = normalizeFingerprint(flags.tlsFingerprint);
+      if (!pin) fail('--tls-fingerprint must be a SHA-256 certificate fingerprint: 64 hex digits, colons allowed', 'bad-fingerprint');
+      profile.tlsFingerprint = pin;
+    }
+    const problems = profileProblems({ ...profiles, [name]: profile });
+    if (problems.length > 0) fail(problems.join('\n'), 'profile-invalid');
+    const conn = connectionOfProfile(name, profile, '');
+    process.stdout.write(`Add profile ${name}: ${urlOf(conn)} as ${profile.user}\n`);
+    if (conn.https && !conn.insecure) {
+      const presented = await presentedFingerprint(profile.host, port);
+      if (profile.tlsFingerprint && presented !== profile.tlsFingerprint) {
+        fail(`the server presents certificate SHA-256 ${formatFingerprint(presented)}, not the --tls-fingerprint given; nothing was saved`, 'tls-pin-mismatch');
+      }
+      profile.tlsFingerprint = presented;
+      process.stdout.write(`certificate SHA-256 ${formatFingerprint(presented)}\n` +
+        'channelvault will accept only this certificate from this server. Compare it with the one the server administrator gave you.\n');
+    }
+    if (!(await confirm('Is this the right server?'))) {
+      process.stdout.write('aborted.\n');
+      return;
+    }
+    const password = await askPassword(`Password for ${profile.user}: `);
+    profile.serverId = await loginCheck(connectionOfProfile(name, profile, password));
+    // Another process may have saved profiles while this one was waiting at the prompts.
+    const latest = await loadProfiles();
+    if (latest[name]) fail(`profile ${name} was added meanwhile; nothing was saved`, 'profile-exists');
+    await saveProfiles({ ...latest, [name]: profile });
+    await setCredential(name, password);
+    process.stdout.write(`added profile ${name} (installation ${profile.serverId}); password stored in ${credentialsFile()}\n`);
+  });
+
+profileCommand.command('set-password')
+  .description("Change a profile's stored password at a terminal; it is checked by logging in first")
+  .argument('<name>', 'profile name')
+  .action(async (name: string) => {
+    needTerminal('profile set-password');
+    const profile = existingProfile(await loadProfiles(), name);
+    process.stdout.write(`Profile ${name}: ${urlOf(connectionOfProfile(name, profile, ''))} as ${profile.user}\n`);
+    const password = await askPassword(`New password for ${profile.user}: `);
+    await loginCheck(connectionOfProfile(name, profile, password));
+    await setCredential(name, password);
+    process.stdout.write(`stored the password for profile ${name}\n`);
+  });
+
+addJsonFlag(profileCommand.command('check')
+  .description('Log in with each profile (or the one named) and verify its certificate and installation')
+  .argument('[name]', 'profile name')).action(async (name: string | undefined, flags: JsonFlags) => {
+  const profiles = await loadProfiles();
+  const credentials = await readCredentials();
+  if (name) existingProfile(profiles, name);
+  const names = name ? [name] : Object.keys(profiles);
+  if (names.length === 0) fail(`no profiles in ${profilesFile()}`, 'no-connection');
+  const results: Array<{ name: string; ok: boolean; serverId: string | null; problem: string | null }> = [];
+  for (const n of names) {
+    const password = credentials[n];
+    if (password === undefined) {
+      results.push({ name: n, ok: false, serverId: null, problem: `[no-password] run \`channelvault profile set-password ${n}\` at a terminal` });
+      continue;
+    }
+    try {
+      results.push({ name: n, ok: true, serverId: await loginCheck(connectionOfProfile(n, profiles[n]!, password)), problem: null });
+    } catch (err) {
+      results.push({ name: n, ok: false, serverId: null, problem: scrub(describeError(err)) });
+    }
+  }
+  if (results.some(r => !r.ok)) process.exitCode = 1;
+  if (flags.json) {
+    writeJson({ profiles: results });
+    return;
+  }
+  for (const r of results) process.stdout.write(r.ok ? `${r.name}: ok, installation ${r.serverId}\n` : `${r.name}: FAILED ${r.problem}\n`);
+});
+
+profileCommand.command('repin')
+  .description("Pin a profile's server certificate again after it was replaced, at a terminal")
+  .argument('<name>', 'profile name')
+  .action(async (name: string) => {
+    needTerminal('profile repin');
+    const profiles = await loadProfiles();
+    const profile = existingProfile(profiles, name);
+    if (profile.https === false || profile.insecure) fail(`profile ${name} does not check certificates, so there is nothing to pin`, 'profile-invalid');
+    const password = (await readCredentials())[name];
+    if (password === undefined) fail(`profile ${name} has no password yet; run \`channelvault profile set-password ${name}\` first`, 'no-password');
+    const presented = await presentedFingerprint(profile.host, profile.port);
+    if (presented === profile.tlsFingerprint) {
+      process.stdout.write(`profile ${name} already pins the certificate ${profile.host}:${profile.port} presents\n`);
+      return;
+    }
+    process.stdout.write(`Profile ${name}: ${profile.host}:${profile.port}\n` +
+      `pinned:    ${profile.tlsFingerprint ? formatFingerprint(profile.tlsFingerprint) : '(none)'}\n` +
+      `presented: ${formatFingerprint(presented)}\n` +
+      'Accept the new certificate only if the administrator replaced it and gave you this fingerprint; otherwise someone may be impersonating the server.\n');
+    if (!(await confirm('Pin the presented certificate?'))) {
+      process.stdout.write('aborted.\n');
+      return;
+    }
+    const repinned = { ...profile, tlsFingerprint: presented };
+    await loginCheck(connectionOfProfile(name, repinned, password));
+    const latest = await loadProfiles();
+    await saveProfiles({ ...latest, [name]: { ...existingProfile(latest, name), tlsFingerprint: presented } });
+    process.stdout.write(`profile ${name} now pins ${formatFingerprint(presented)}\n`);
+  });
+
+// --- locks, recovery, errors -------------------------------------------------------
+
+const unlocks: Array<() => Promise<void>> = [];
+
+/** Lock an env file outside the tree, the same way the tree is locked. */
+async function lockAlso(file: string): Promise<void> {
+  unlocks.push(await lockTree(path.resolve(file)));
+}
+
+program.hook('preAction', async (_program, command) => {
+  const name = command.name();
+  if (!['explode', 'pull', 'adopt', 'push', 'implode', 'diff', 'status'].includes(name) || command.parent !== program) return;
+  if (name === 'diff') errorExitCode = 2;
+  const root = path.resolve(String(command.processedArgs[name === 'explode' ? 1 : 0]));
+  unlocks.push(await lockTree(root));
+  // Recovery runs before the connection is chosen, so it accepts any env file this tree could have used.
+  const pending = await pendingEnvFile(root);
+  if (pending === null) return;
+  if (!isWithin(pending, await resolvedPath(root))) await lockAlso(pending);
+  await recoverTree(root, await recoveryCandidates(root, command.opts<EnvFlags>()));
+});
+
+/** The message with its reason code, as printed after `error:`. */
+function describeError(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  const reason = err instanceof ReasonError ? err.reason : code === 'TLS_PIN_MISMATCH' ? 'tls-pin-mismatch' : undefined;
+  return `${reason ? `[${reason}] ` : ''}${err instanceof Error ? err.message : String(err)}`;
+}
+
+/** What to do about a certificate the client refused. */
+async function certificateHint(code: string): Promise<string | undefined> {
+  const conn = activeConnection;
+  if (code === 'TLS_PIN_MISMATCH') {
+    return conn?.profile
+      ? `if the administrator replaced the certificate, check its new fingerprint with them and run \`channelvault profile repin ${conn.profile}\` at a terminal`
+      : 'if the administrator replaced the certificate, check its new fingerprint with them and update --tls-fingerprint (or MIRTH_TLS_FINGERPRINT)';
+  }
+  if (!UNTRUSTED_CERT_CODES.has(code)) return undefined;
+  const presented = conn ? await presentedFingerprint(conn.host, conn.port, 5_000).catch(() => undefined) : undefined;
+  const pin = presented ? ` It presents SHA-256 ${formatFingerprint(presented)}.` : '';
+  const loopback = conn ? isLoopback(conn.host) : false;
+  return `the server's TLS certificate is not trusted (Mirth's default certificate is self-signed).${pin} ` +
+    'Confirm that fingerprint with the server administrator, then save a profile at a terminal with ' +
+    '`channelvault profile add <name> --host <host> --port <port> --user <user>`, which pins it' +
+    `${presented ? `, or pass --tls-fingerprint ${presented} (or set MIRTH_TLS_FINGERPRINT)` : ', or pass --tls-fingerprint'}` +
+    `${loopback ? '. For this loopback test server, --insecure turns verification off' : ''}.`;
+}
+
+program.parseAsync().catch(async (err: unknown) => {
   // Commander has already printed it and set the exit code.
   if (err instanceof CommanderError) return;
-  process.stderr.write(`error: ${scrub(err instanceof Error ? err.message : String(err))}\n`);
+  process.stderr.write(`error: ${scrub(describeError(err))}\n`);
   const code = (err as { code?: unknown } | null)?.code;
-  if (typeof code === 'string' && UNTRUSTED_CERT_CODES.has(code)) {
-    process.stderr.write(
-      "hint: the server's TLS certificate is not trusted. For a self-signed certificate (Mirth's default), " +
-        'pass --insecure, which turns certificate verification off.\n',
-    );
-  }
-  if (!(err instanceof CliError) && err instanceof Error && process.env.CHANNELVAULT_DEBUG) {
+  const hint = typeof code === 'string' ? await certificateHint(code) : undefined;
+  if (hint) process.stderr.write(`hint: ${hint}\n`);
+  if (!(err instanceof ReasonError) && err instanceof Error && process.env.CHANNELVAULT_DEBUG) {
     process.stderr.write(`${scrub(err.stack ?? '')}\n`);
   }
   process.exitCode = errorExitCode;
 }).finally(async () => {
-  if (unlock) {
+  for (const unlock of unlocks.reverse()) {
     try { await unlock(); }
     catch (err) {
-      process.stderr.write(`error: could not release working-tree lock: ${scrub(err instanceof Error ? err.message : String(err))}\n`);
+      process.stderr.write(`error: could not release a lock: ${scrub(err instanceof Error ? err.message : String(err))}\n`);
       process.exitCode = errorExitCode;
     }
   }
