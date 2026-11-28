@@ -2,6 +2,37 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0-rc.4] — 2026-11-27
+
+Release candidate, published under the npm `next` tag.
+
+### Added
+
+- **Connection profiles.** `~/.channelvault/profiles.json` names each server's host, port, user, TLS pin, installation and env file, with no secrets; `~/.channelvault/credentials` holds the passwords, owner-only. A command takes its connection from exactly one source, in order: `--profile`, the login flags, `MIRTH_PROFILE`, `MIRTH_HOST`, then the profile whose installation matches the tree. So any checkout or worktree, and an agent's fresh shell, reaches the right server without flags, and two servers are told apart by their installation ID. See the README's "Connection profiles".
+- `profile list`, `profile add`, `profile set-password`, `profile check` and `profile repin`. `add`, `set-password` and `repin` run only at a terminal; passwords need 8 characters and are never echoed.
+- **TLS certificate pinning.** A profile pins its server certificate's SHA-256 fingerprint, checked during the handshake: on a mismatch the connection closes before anything (including the login) is sent. `--tls-fingerprint` / `MIRTH_TLS_FINGERPRINT` do the same without a profile. When a certificate is untrusted, the hint now prints the fingerprint it presents and suggests pinning it before `--insecure`.
+- Live commands print one `connection:` line on stderr after verifying the server: the profile, URL, user, installation, how the connection was chosen, where the password came from, the TLS mode and the env file. `diff --json` and `push --plan-only --json` gain `serverId` and `connection`; `status --json` gains `serverId` and, without connecting, which profile a read would use and whether its password is configured.
+- Errors carry a reason code, as `error: [reason] message`.
+- A profile's `dotenv` serves every checkout of its trees when a tree has no `.env` of its own; a different local `.env` is refused rather than guessed between.
+- `AGENTS.md` with the repository's conventions for coding agents.
+
+### Changed
+
+- **Real writes need a typed profile.** `push` (without `--plan-only`), `restore` and `adopt` refuse a profile chosen by the tree's installation; `MIRTH_PROFILE` selects one only when the write is confirmed at a terminal. Printed undo commands use `--profile <name>`.
+- **`adopt` (without `--plan-only`) needs `--profile` or `--host` typed**, since it rebinds the tree; `MIRTH_*` alone is refused with `[connection-not-typed]`. Scripts that adopted with only `MIRTH_*` set must add `--host`.
+- `--port`, `--user` or `--pass` typed without `--host` count as the `MIRTH_HOST` source, with its checks; without `MIRTH_HOST` they are refused.
+- **A typed `--host` no longer borrows `MIRTH_PORT`, `MIRTH_USER` or `MIRTH_PASS` exported for a different `MIRTH_HOST`**: the command stops with `[env-conflict]` instead of sending one server's password to another. Type the matching login flags, or use a profile.
+- `MIRTH_HOST` is refused when the tree, or the server that answers, belongs to a profile, which catches a stale shell variable.
+- `insecure` and plain http are refused in a profile for any host but loopback, and a typed `--insecure` beside a pin is refused.
+- An empty `MIRTH_*` variable counts as unset.
+
+### Fixed
+
+- `pull` refused nothing when the server was another installation than the tree's: a stale `MIRTH_HOST` could rewrite one server's tree as another's, and its next push would then pass the installation check. It now refuses (`[installation-mismatch]`), whichever way the connection was chosen.
+- `diff` against another installation printed a whole-server difference; it now refuses with exit 2.
+- The connection password was never redacted from output. It is now removed from error text, and when it has 8 or more characters, from every line on stdout and stderr.
+- Recovering an interrupted pull whose env file is a profile's no longer needs the original `--dotenv`, and a pull locks a profile env file outside the tree so two worktrees cannot write it at once. Other commands refuse to read that file while a pull elsewhere is replacing it (`[env-busy]`).
+
 ## [0.3.0-rc.3] — 2026-11-27
 
 Release candidate, published under the npm `next` tag.
@@ -90,6 +121,7 @@ First release. Tested against Mirth Connect 4.5.2; the offline round trip is als
 - `backup` / `restore`: the server's own configuration XML saved as `.backup/<server>-<UTC time>.xml`, identified by Mirth's server ID, restored with a preview, an undo backup and a version check. `push` backs up first unless `--no-backup`.
 - `diff` exits 0 when the tree matches the server, 1 when it differs, 2 on error.
 
+[0.3.0-rc.4]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.4
 [0.3.0-rc.3]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.3
 [0.3.0-rc.2]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.2
 [0.3.0-rc.1]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.1

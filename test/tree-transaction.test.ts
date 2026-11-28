@@ -104,3 +104,16 @@ it.each(['channels', 'outside.env', JOURNAL])('recovers a process killed during 
   await expectGeneration(checkpoint === JOURNAL ? 'new' : 'old');
   expect(existsSync(path.join(root, JOURNAL))).toBe(false);
 });
+it('recovers with any of the env files the tree could have used, and names the pending one', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const { realpath } = await import('node:fs/promises');
+  const { pendingEnvFile } = await import('../src/tree/transaction.js');
+  const envFile = await realpath(env);
+  await writeFile(path.join(root, JOURNAL), JSON.stringify({ version: 1, id: randomUUID(), state: 'committed', envFile, entries: [] }));
+  expect(await pendingEnvFile(root)).toBe(envFile);
+  const other = path.join(dir, 'other.env');
+  await expect(recoverTree(root, [other])).rejects.toThrow('different env file');
+  await recoverTree(root, [other, env]);
+  expect(existsSync(path.join(root, JOURNAL))).toBe(false);
+  expect(await pendingEnvFile(root)).toBeNull();
+});

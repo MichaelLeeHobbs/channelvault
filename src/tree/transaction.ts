@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { constants, existsSync } from 'node:fs';
-import { copyFile, lstat, mkdir, readdir, readlink, realpath, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readdir, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import * as path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { writePrivate } from '../backup/index.js';
 import { readJson } from '../json.js';
+import { canonical, present, samePath } from '../paths.js';
 
 export const MANAGED_DIRS = ['server', 'channels', 'codeTemplates', 'channelGroups'];
 
@@ -27,21 +28,6 @@ const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as co
 interface Entry { name: string; hadOld: boolean }
 interface Journal { version: 1; id: string; state: 'prepared' | 'committed'; envFile: string; entries: Entry[] }
 
-async function present(file: string): Promise<boolean> {
-  return lstat(file).then(() => true, (err: NodeJS.ErrnoException) => { if (err.code === 'ENOENT') return false; throw err; });
-}
-
-async function canonical(file: string, depth = 0): Promise<string> {
-  if (depth > 64) throw new Error(`too many links in path: ${file}`);
-  let existing = path.resolve(file);
-  while (!(await present(existing)) && path.dirname(existing) !== existing) existing = path.dirname(existing);
-  const info = await lstat(existing);
-  const base = info.isSymbolicLink()
-    ? await canonical(path.resolve(path.dirname(existing), await readlink(existing)), depth + 1)
-    : await realpath(existing);
-  return path.join(base, path.relative(existing, path.resolve(file)));
-}
-const samePath = (a: string, b: string) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 
 /** Retry transient Windows handle contention; every failed swap still has a rollback. */
 async function move(from: string, to: string): Promise<void> {
@@ -140,16 +126,29 @@ async function rollback(root: string, journal: Journal): Promise<void> {
   }
 }
 
-/** Run under the tree lock, before reading any part of a working tree. */
-export async function recoverTree(root: string, envFile: string): Promise<void> {
+/** The env file an interrupted replacement recorded, so the caller can lock it before recovering; null when none is pending. */
+export async function pendingEnvFile(root: string): Promise<string | null> {
+  const file = path.join(root, JOURNAL);
+  if (!existsSync(file)) return null;
+  const journal = await readJson<Partial<Journal>>(file).catch(() => null);
+  return typeof journal?.envFile === 'string' ? journal.envFile : null;
+}
+
+/**
+ * Run under the tree lock, before reading any part of a working tree. The
+ * journal's env file must be one of `envFiles`: recovery runs before the
+ * connection (and so a profile's env file) is chosen.
+ */
+export async function recoverTree(root: string, envFiles: string | string[]): Promise<void> {
   const file = path.join(root, JOURNAL);
   if (!existsSync(file)) return;
   await assertStage(root);
   const journal = await readJson<Journal>(file);
+  const allowed = await Promise.all((Array.isArray(envFiles) ? envFiles : [envFiles]).map(f => canonical(f)));
   if (journal.version !== 1 || !/^[a-f0-9-]{36}$/.test(journal.id) || !['prepared', 'committed'].includes(journal.state) ||
       !Array.isArray(journal.entries) || journal.entries.some(e => !ITEMS.includes(e.name) || typeof e.hadOld !== 'boolean') ||
       new Set(journal.entries.map(e => e.name)).size !== journal.entries.length ||
-      typeof journal.envFile !== 'string' || !samePath(journal.envFile, await canonical(envFile))) {
+      typeof journal.envFile !== 'string' || !allowed.some(f => samePath(journal.envFile, f))) {
     throw new Error(`invalid transaction journal or different env file: ${file}; use the original --dotenv selection to recover`);
   }
   if (journal.state === 'prepared') await rollback(root, journal);

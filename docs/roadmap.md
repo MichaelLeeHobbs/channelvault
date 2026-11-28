@@ -65,7 +65,8 @@ A team running Mirth can keep every channel, code template and script in git, re
 
 - **Other secret stores.** AWS Secrets Manager, and possibly others, behind the same `{{env:NAME}}` placeholders so trees don't change.
 - **Converting between the XML and live shapes.** Only needed to push a tree built from a backup file.
-- **Login and TLS.** A `--token` login option, a no-echo password prompt, `--cafile`, and a warning when `--insecure` turns verification off.
+- **Connection profiles** shipped in 0.3.0-rc.4 (plan and decisions: [issue #23](https://github.com/MichaelLeeHobbs/channelvault/issues/23)). Deferred there, each with the event that brings it back: a secrets-manager password source, a DPAPI-wrapped credentials line, JSON error documents under `--json`, `pull --json`, `adopt --from`, `--expect-server` on the flags path, plan binding (`--expect-plan`), and a warning on loose ACLs.
+- **Login.** A `--token` login option.
 - **Cleanup list.** `clearManaged` should get its directory list from the explode engine.
 - **More resources.** Alerts, server resources and the configuration map as separately syncable resources.
 

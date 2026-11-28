@@ -21,7 +21,9 @@
  *     `putServerConfiguration()` re-wraps as `{ serverConfiguration: config }`.
  */
 import { CookieJar } from 'tough-cookie';
-import { Agent } from 'undici';
+import { isIP } from 'node:net';
+import { connect as tlsConnect, type TLSSocket } from 'node:tls';
+import { Agent, buildConnector } from 'undici';
 import { redactSecretsInText } from '../secrets/detect.js';
 import { isSecretKey } from '../secrets/index.js';
 import type { ApiError, CanonicalConfig, ClientConfig, MirthClient } from '../types.js';
@@ -53,6 +55,52 @@ function connectionError(url: string, err: unknown): Error & { code?: string } {
   ) as Error & { code?: string };
   error.code = code;
   return error;
+}
+
+/** The SHA-256 fingerprint a TLS socket's peer presented, as 64 lowercase hex digits. */
+function fingerprintOf(socket: TLSSocket): string {
+  return (socket.getPeerCertificate().fingerprint256 ?? '').replace(/:/g, '').toLowerCase();
+}
+
+/**
+ * Connects without CA verification and accepts only the certificate whose
+ * SHA-256 is `pin`. `checkServerIdentity` never runs when
+ * `rejectUnauthorized` is false, so the check has to be here; it runs on the
+ * handshake, before the request (and the login) is written.
+ */
+function pinnedConnector(pin: string): buildConnector.connector {
+  const base = buildConnector({ rejectUnauthorized: false, maxCachedSessions: 0 });
+  return (options, callback) => {
+    base(options, (err, socket) => {
+      if (err) return callback(err, null);
+      const presented = fingerprintOf(socket as TLSSocket);
+      if (presented === pin) return callback(null, socket);
+      socket.destroy();
+      const mismatch = new Error(
+        `the server presented certificate SHA-256 ${presented || '(none)'}, but the pinned fingerprint is ${pin}; nothing was sent`,
+      ) as Error & { code: string; presented: string };
+      mismatch.code = 'TLS_PIN_MISMATCH';
+      mismatch.presented = presented;
+      callback(mismatch, null);
+    });
+  };
+}
+
+/**
+ * The SHA-256 fingerprint of the certificate `host:port` presents, without
+ * verifying it or sending anything over the connection.
+ */
+export function presentedFingerprint(host: string, port: number, timeoutMs = 10_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = tlsConnect({ host, port, rejectUnauthorized: false, ...(isIP(host) ? {} : { servername: host }) });
+    socket.setTimeout(timeoutMs, () => socket.destroy(new Error(`no TLS handshake from ${host}:${port} within ${timeoutMs / 1000} s`)));
+    socket.once('secureConnect', () => {
+      const fp = fingerprintOf(socket);
+      socket.end();
+      resolve(fp);
+    });
+    socket.once('error', reject);
+  });
 }
 
 /** `, to <origin>` for a redirect's Location; only the origin, since a path or query can carry a token. */
@@ -164,7 +212,9 @@ class MirthClientImpl implements MirthClientExt {
     this.baseUrl = `${protocol}://${config.host}:${config.port}/api`;
     this.cookieJar = new CookieJar();
 
-    this.dispatcher = new Agent(config.disableTlsCheck ? { connect: { rejectUnauthorized: false } } : {});
+    this.dispatcher = new Agent(config.tlsFingerprint
+      ? { connect: pinnedConnector(config.tlsFingerprint) }
+      : config.disableTlsCheck ? { connect: { rejectUnauthorized: false } } : {});
   }
 
   isAuthenticated(): boolean {

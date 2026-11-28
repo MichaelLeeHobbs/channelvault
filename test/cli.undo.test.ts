@@ -44,8 +44,14 @@ it.each([false, true])('the complete printed undo restores the map only when the
   expect(args).toContain('--backup-dir');
   expect(args).toContain(path.join(dir, 'undo backups'));
   expect(args).toContain('--no-https');
-  // Carry the original target explicitly, even if the shell's defaults changed.
-  const undo = await runCli([...args, '--yes'], { ...env, MIRTH_HOST: '127.0.0.2', MIRTH_PORT: '1' });
+  // Carry the original target explicitly, even if the shell's defaults changed;
+  // a MIRTH_PASS exported for another MIRTH_HOST is not borrowed for it.
+  const moved = { ...env, MIRTH_HOST: '127.0.0.2', MIRTH_PORT: '1' };
+  const borrowed = await runCli([...args, '--yes'], moved);
+  expect(borrowed.status).toBe(1);
+  expect(borrowed.stderr).toContain('[env-conflict]');
+  expect(mapValue(mirth.config)).toBe(overwrite ? 'replacement' : 'original');
+  const undo = await runCli([...args, '--yes'], { ...moved, MIRTH_HOST: '127.0.0.1' });
   expect(undo.status, undo.stderr).toBe(0);
   expect(undo.stderr).not.toContain('cannot be checked');
   expect(mapValue(mirth.config)).toBe('original');

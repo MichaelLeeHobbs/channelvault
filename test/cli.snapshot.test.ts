@@ -32,7 +32,7 @@ async function snapshot(root: string, rel = ''): Promise<Record<string, string>>
 it.each(['pull', 'push', 'adopt'])('preserves the complete tree and writes no server resources on an empty snapshot during %s', async command => {
   const before = await snapshot(tree);
   mirth.onRequest = req => req.path === '/api/server/configuration' ? { status: 200, body: { serverConfiguration: {} } } : undefined;
-  const result = await runCli([command, tree, '--no-https', ...(command === 'push' ? ['--yes', '--force'] : command === 'adopt' ? ['--yes'] : [])], env);
+  const result = await runCli([command, tree, '--no-https', ...(command === 'push' ? ['--yes', '--force'] : command === 'adopt' ? ['--yes', '--host', '127.0.0.1'] : [])], env);
   expect(result.status).toBe(1);
   expect(result.stderr).toContain('invalid server configuration response');
   expect(await snapshot(tree)).toEqual(before);

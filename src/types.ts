@@ -94,6 +94,8 @@ export interface ClientConfig {
   https?: boolean;
   /** default false; set true for self-signed certs */
   disableTlsCheck?: boolean;
+  /** SHA-256 of the only certificate accepted, 64 lowercase hex digits; replaces CA verification. */
+  tlsFingerprint?: string;
   /**
    * default false. Put the server's response body in error messages. A body
    * can echo the credentials that were sent; it is decoded and has credential
