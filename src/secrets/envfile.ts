@@ -48,8 +48,8 @@ export function formatValue(value: string): string {
   return `${BASE64_PREFIX}${Buffer.from(value, 'utf8').toString('base64')}`;
 }
 
-/** Set `updates` in `file`, replacing existing assignments in place and appending new ones. */
-export async function updateEnvFile(file: string, updates: Record<string, string>): Promise<void> {
+/** Set `updates` in `file`, replacing existing assignments in place and appending new ones; null removes a name. */
+export async function updateEnvFile(file: string, updates: Record<string, string | null>): Promise<void> {
   const names = Object.keys(updates);
   if (names.length === 0) return;
   const existing = existsSync(file) ? await readFile(file, 'utf8') : '';
@@ -74,7 +74,8 @@ export async function updateEnvFile(file: string, updates: Record<string, string
       // Replace the first assignment and drop later duplicates: dotenv uses the
       // last one, so a stale duplicate would stay in effect.
       if (!written.has(m[1]!)) {
-        out.push(`${m[1]}=${formatValue(updates[m[1]!]!)}`);
+        const value = updates[m[1]!]!;
+        if (value !== null) out.push(`${m[1]}=${formatValue(value)}`);
         written.add(m[1]!);
       }
       if (opens) [inQuote, dropping] = [opens, true];
@@ -84,12 +85,13 @@ export async function updateEnvFile(file: string, updates: Record<string, string
     if (opens) inQuote = opens;
   }
   for (const name of names) {
-    if (!written.has(name)) out.push(`${name}=${formatValue(updates[name]!)}`);
+    const value = updates[name]!;
+    if (!written.has(name) && value !== null) out.push(`${name}=${formatValue(value)}`);
   }
-  const text = `${out.join('\n')}\n`;
+  const text = out.length === 0 ? '' : `${out.join('\n')}\n`;
   // Prove the file says what we mean before replacing it.
   const readBack = parseEnv(text);
-  const wrong = names.filter((n) => readBack[n] !== updates[n]);
+  const wrong = names.filter((n) => readBack[n] !== (updates[n] ?? undefined));
   if (wrong.length > 0) throw new Error(`env file update would not read back correctly for ${wrong.join(', ')}; nothing written`);
   // Write beside it and rename over it: a crash mid-write must not truncate
   // what may be the only copy of these secrets. Through a link, replace the

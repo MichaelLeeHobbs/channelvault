@@ -12,12 +12,13 @@
 
 import { spawnSync } from 'node:child_process';
 import { cp, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
+import { isDeepStrictEqual } from 'node:util';
 
 import { Command, CommanderError } from 'commander';
 
@@ -27,7 +28,7 @@ import { createMirthClient, presentedFingerprint, UNTRUSTED_CERT_CODES, type Mir
 import { connectionJson, describeConnection, profileOwning, resolveConnection, urlOf, type Connection, type ConnectionFlags } from './connection.js';
 import {
   credentialsFile, formatFingerprint, isLoopback, loadProfiles, normalizeFingerprint, PROFILE_NAME, profileProblems, profilesFile,
-  readCredentials, ReasonError, saveProfiles, setCredential, type Profile, type Profiles,
+  readCredentials, ReasonError, removeCredential, saveProfiles, setCredential, type Profile, type Profiles,
 } from './profiles.js';
 import { canonical, isWithin, resolvedPath, samePath } from './paths.js';
 import {
@@ -533,7 +534,9 @@ function assertEnvComplete(tree: CanonicalConfig, server: CanonicalConfig, env: 
   if (missing.length > 0) {
     const fix = conn.dotenv && samePath(envFile, conn.dotenv)
       ? `set them in profile ${conn.profile}'s env file, or pass --dotenv <file>`
-      : `pass --dotenv <file>, or ${conn.profile ? `set profile ${conn.profile}'s dotenv` : 'use a connection profile with a dotenv'}`;
+      : conn.dotenv
+        ? `drop --dotenv to use profile ${conn.profile}'s env file ${conn.dotenv}`
+        : `pass --dotenv <file>, or ${conn.profile ? `give profile ${conn.profile} one at a terminal with \`channelvault profile set ${conn.profile} --dotenv <absolute path>\`` : 'use a connection profile with a dotenv'}`;
     const what = `no value for ${missing.join(', ')}, so those secrets can't be compared`;
     if (!existsSync(envFile)) fail(`there is no env file at ${envFile}: ${what}; ${fix}`, 'env-missing');
     fail(`${envFile} has ${what}; add them, or ${fix}`, 'env-incomplete');
@@ -653,7 +656,11 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
  * commit it to.
  */
 function gitWouldCommit(file: string): boolean {
-  const r = spawnSync('git', ['check-ignore', '-q', path.basename(file)], { cwd: path.dirname(file) });
+  // Its folder may not exist yet (a pull creates it); git answers for a missing path from the nearest folder that exists.
+  const target = path.resolve(file);
+  let dir = path.dirname(target);
+  while (!existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+  const r = spawnSync('git', ['check-ignore', '-q', path.relative(dir, target).split(path.sep).join('/')], { cwd: dir });
   return r.status === 1;
 }
 
@@ -1298,7 +1305,13 @@ addExtractFlag(addEnvFlag(addConnectionFlags(
     if (await client.getServerId() !== serverId) fail('the installation changed while pulling; nothing was written');
     return { config, serverId };
   }, { envFile });
+  const envFileExisted = existsSync(envFile);
   await writeTree(root, config, urlOf(conn), flags, envFile, serverId);
+  if (conn.profile && !conn.dotenv && !flags.dotenv && !envFileExisted && existsSync(envFile)) {
+    process.stderr.write(`note: profile ${conn.profile} has no env file of its own, so these values are only in ${envFile}, in this checkout; ` +
+      `other checkouts and worktrees of this tree won't have them. To keep them in one place, run \`channelvault profile set ${conn.profile} --dotenv <absolute path>\` ` +
+      `at a terminal, then move ${envFile} to that path\n`);
+  }
   const s = summarize(config);
   process.stdout.write(`pulled ${s.channels} channels, ${s.codeTemplates} code templates -> ${root}\n`);
 });
@@ -1848,9 +1861,27 @@ async function loginCheck(conn: Connection): Promise<string> {
 }
 
 function existingProfile(profiles: Profiles, name: string): Profile {
-  const profile = profiles[name];
+  const profile = Object.hasOwn(profiles, name) ? profiles[name] : undefined;
   if (!profile) fail(`no profile named ${name} (${Object.keys(profiles).join(', ') || 'none saved'})`, 'profile-unknown');
   return profile;
+}
+
+/** The checks `profile add` and `profile set` make before saving `profile` as `name` among `profiles`. */
+function assertProfileValid(profiles: Profiles, name: string, profile: Profile): void {
+  const problems = profileProblems({ ...profiles, [name]: profile });
+  if (profile.dotenv && existsSync(profile.dotenv) && statSync(profile.dotenv).isDirectory()) {
+    problems.push(`profile ${name}: dotenv ${profile.dotenv} is a folder; name the env file inside it`);
+  } else if (profile.dotenv && gitWouldCommit(profile.dotenv)) {
+    problems.push(`profile ${name}: git does not ignore ${profile.dotenv}, which will hold secret values; add it to .gitignore, or choose a file outside every repository`);
+  }
+  if (problems.length > 0) fail(problems.join('\n'), 'profile-invalid');
+}
+
+/** Fail unless the saved profile is still `expected`: another process may have changed it while this one waited at a prompt. */
+async function profilesUnchanged(name: string, expected: Profile): Promise<Profiles> {
+  const latest = await loadProfiles();
+  if (!isDeepStrictEqual(Object.hasOwn(latest, name) ? latest[name] : undefined, expected)) fail(`profile ${name} was changed meanwhile; nothing was saved`, 'profile-changed');
+  return latest;
 }
 
 const profileCommand = program.command('profile').description(`Manage connection profiles (${path.join('~', '.channelvault', 'profiles.json')}; passwords in its credentials file)`);
@@ -1897,7 +1928,10 @@ profileCommand.command('add')
     needTerminal('profile add');
     if (!PROFILE_NAME.test(name)) fail(`profile names are letters, digits, '.', '_' and '-', starting with a letter or digit: ${name}`, 'profile-invalid');
     const profiles = await loadProfiles();
-    if (profiles[name]) fail(`profile ${name} already exists; change its password with \`channelvault profile set-password ${name}\`, or edit ${profilesFile()}`, 'profile-exists');
+    if (Object.hasOwn(profiles, name)) {
+      fail(`profile ${name} already exists; change it with \`channelvault profile set ${name}\` (env file, user, port) or \`channelvault profile set-password ${name}\`, ` +
+        `or remove it with \`channelvault profile remove ${name}\``, 'profile-exists');
+    }
     const port = Number(flags.port);
     const profile: Profile = { host: flags.host, port, user: flags.user };
     if (flags.https === false) profile.https = false;
@@ -1908,8 +1942,7 @@ profileCommand.command('add')
       if (!pin) fail('--tls-fingerprint must be a SHA-256 certificate fingerprint: 64 hex digits, colons allowed', 'bad-fingerprint');
       profile.tlsFingerprint = pin;
     }
-    const problems = profileProblems({ ...profiles, [name]: profile });
-    if (problems.length > 0) fail(problems.join('\n'), 'profile-invalid');
+    assertProfileValid(profiles, name, profile);
     const conn = connectionOfProfile(name, profile, '');
     process.stdout.write(`Add profile ${name}: ${urlOf(conn)} as ${profile.user}\n`);
     if (conn.https && !conn.insecure) {
@@ -1929,7 +1962,7 @@ profileCommand.command('add')
     profile.serverId = await loginCheck(connectionOfProfile(name, profile, password));
     // Another process may have saved profiles while this one was waiting at the prompts.
     const latest = await loadProfiles();
-    if (latest[name]) fail(`profile ${name} was added meanwhile; nothing was saved`, 'profile-exists');
+    if (Object.hasOwn(latest, name)) fail(`profile ${name} was added meanwhile; nothing was saved`, 'profile-exists');
     await saveProfiles({ ...latest, [name]: profile });
     await setCredential(name, password);
     process.stdout.write(`added profile ${name} (installation ${profile.serverId}); password stored in ${credentialsFile()}\n`);
@@ -1946,6 +1979,83 @@ profileCommand.command('set-password')
     await loginCheck(connectionOfProfile(name, profile, password));
     await setCredential(name, password);
     process.stdout.write(`stored the password for profile ${name}\n`);
+  });
+
+profileCommand.command('set')
+  .description("Change a profile's env file, user or port at a terminal; never its installation or certificate pin")
+  .argument('<name>', 'profile name')
+  .option('--dotenv <path>', "env file for this server's trees, used when a tree has no .env of its own")
+  .option('--user <user>', "username; asks for that user's password and logs in before saving")
+  .option('--port <port>', 'Mirth server port; logs in before saving, so it must reach the same installation and certificate')
+  .action(async (name: string, flags: { dotenv?: string; user?: string; port?: string }) => {
+    needTerminal('profile set');
+    const profiles = await loadProfiles();
+    const profile = existingProfile(profiles, name);
+    if (flags.dotenv === undefined && flags.user === undefined && flags.port === undefined) {
+      fail('nothing to change: pass --dotenv, --user or --port', 'profile-invalid');
+    }
+    const updated: Profile = { ...profile };
+    if (flags.dotenv !== undefined) updated.dotenv = path.resolve(flags.dotenv);
+    if (flags.user !== undefined) updated.user = flags.user;
+    if (flags.port !== undefined) updated.port = Number(flags.port);
+    assertProfileValid(profiles, name, updated);
+    const changes = (['dotenv', 'user', 'port'] as const)
+      .filter(field => updated[field] !== profile[field])
+      .map(field => `${field} ${profile[field] ?? '(none)'} -> ${updated[field]}`);
+    if (changes.length === 0) {
+      process.stdout.write(`profile ${name} already has those settings\n`);
+      return;
+    }
+    process.stdout.write(`Profile ${name}: ${changes.join(', ')}\n`);
+    const loginNeeded = updated.user !== profile.user || updated.port !== profile.port;
+    if (loginNeeded && !profile.serverId) {
+      fail(`profile ${name} has no recorded installation to check a new user or port against; remove it and add it again`, 'profile-invalid');
+    }
+    // Without certificate checks, anything listening on the new port would receive the stored password.
+    const verifiesServer = updated.https !== false && !updated.insecure;
+    let newPassword: string | undefined;
+    if (updated.user !== profile.user || (updated.port !== profile.port && !verifiesServer)) {
+      newPassword = await askPassword(`Password for ${updated.user}: `);
+      await loginCheck(connectionOfProfile(name, updated, newPassword));
+    } else if (updated.port !== profile.port) {
+      const password = (await readCredentials())[name];
+      if (password === undefined) fail(`profile ${name} has no password yet; run \`channelvault profile set-password ${name}\` first`, 'no-password');
+      await loginCheck(connectionOfProfile(name, updated, password));
+    }
+    const latest = await profilesUnchanged(name, profile);
+    assertProfileValid(latest, name, updated);
+    await saveProfiles({ ...latest, [name]: updated });
+    if (newPassword !== undefined) {
+      try {
+        await setCredential(name, newPassword);
+      } catch (err) {
+        await saveProfiles({ ...latest, [name]: profile });
+        throw err;
+      }
+    }
+    process.stdout.write(`updated profile ${name}: ${changes.join(', ')}\n` +
+      (flags.dotenv !== undefined ? `values already in another env file are not moved; move them to ${updated.dotenv} yourself\n` : ''));
+  });
+
+profileCommand.command('remove')
+  .description('Remove a profile and its stored password, at a terminal, after confirming')
+  .argument('<name>', 'profile name')
+  .action(async (name: string) => {
+    needTerminal('profile remove');
+    const profile = existingProfile(await loadProfiles(), name);
+    process.stdout.write(`Profile ${name}: ${urlOf(connectionOfProfile(name, profile, ''))} as ${profile.user}, installation ${profile.serverId ?? '(not recorded)'}\n` +
+      (profile.dotenv ? `Its env file ${profile.dotenv} is kept.\n` : ''));
+    if (!(await confirm(`Remove profile ${name} and its stored password?`))) {
+      process.stdout.write('aborted.\n');
+      return;
+    }
+    const latest = await profilesUnchanged(name, profile);
+    const rest = Object.fromEntries(Object.entries(latest).filter(([n]) => n !== name));
+    const hadPassword = Object.hasOwn(await readCredentials(), name);
+    // The password first: a profile left without one shows in `profile list`; a password left without a profile shows nowhere.
+    await removeCredential(name);
+    await saveProfiles(rest);
+    process.stdout.write(`removed profile ${name}${hadPassword ? ` and its password from ${credentialsFile()}` : ''}\n`);
   });
 
 addJsonFlag(profileCommand.command('check')

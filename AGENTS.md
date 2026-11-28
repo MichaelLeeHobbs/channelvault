@@ -11,10 +11,10 @@ A Node CLI (TypeScript, ESM) that pulls, pushes, diffs, backs up and restores Mi
 - **Pure JavaScript dependencies only.** No native addons, no postinstall builds: the CLI must install anywhere Node runs.
 - **Reuse the shared helpers before writing one.** Check these first, and extend one with a parameter rather than writing a near-copy:
   - `src/json.ts`: `readJson(file)` (names the file in a parse error), `parseJson`.
-  - `src/secrets/envfile.ts`: `readEnvFile(file)` (missing file is `{}`, never the process environment), `updateEnvFile(file, updates)` (rewrites only the lines it touches, atomic, owner-only), `formatValue`.
+  - `src/secrets/envfile.ts`: `readEnvFile(file)` (missing file is `{}`, never the process environment), `updateEnvFile(file, updates)` (rewrites only the lines it touches, atomic, owner-only; a null value removes the name), `formatValue`.
   - `src/backup/index.ts`: `writePrivate(file, text)` (owner-only, atomic rename).
   - `src/paths.ts`: `samePath(a, b)` (case-insensitive on Windows), `isWithin(child, parent)`, `resolvedPath(p)`, `canonical(p)` (follows links, including dangling ones).
-  - `src/profiles.ts`: `configDir()` (honours `CHANNELVAULT_CONFIG_DIR`), `loadProfiles`, `readCredentials`, `setCredential`, `normalizeFingerprint`, `isLoopback`.
+  - `src/profiles.ts`: `configDir()` (honours `CHANNELVAULT_CONFIG_DIR`), `loadProfiles`, `readCredentials`, `setCredential`, `removeCredential`, `normalizeFingerprint`, `isLoopback`.
   - `src/connection.ts`: `resolveConnection(input)` is the only place a connection is chosen; it is pure, so test new rules in `test/connection.select.test.ts`.
   - In `src/cli.ts`: `fail(message, reason?)`, `readMeta(root)`, `selectConnection`, `withClient(conn, fn)`, `envFileFor(root, flags, conn)`, `rememberSecret`, `scrub`.
 - **Errors.** User-facing errors go through `fail(message, reason)`; a reason is a short kebab-case code printed as `error: [reason] message` that agents route on, so keep existing codes stable. Never suggest `--pass`, never echo a file's contents (a JSON parse error can quote a password), and never print the connection password: `rememberSecret` registers values that `scrub` removes.

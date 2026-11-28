@@ -2,11 +2,23 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0-rc.6] — 2026-11-27
+
+Release candidate, published under the npm `next` tag.
 
 ### Security
 
 - **Configuration-map values that Mirth returns as booleans or numbers are now secrets too** ([#30](https://github.com/MichaelLeeHobbs/channelvault/issues/30)). Mirth's JSON answers a stored value such as `true` or `1234` as a JSON boolean or number, and `pull` used to write those into `server/configuration.json` as literals, so a numeric PIN or password landed in git. A key Mirth answers as a number or boolean (`8443`) had the same problem for its value, whatever that value's type, and could not be named in `push --config-map-key`. They now become `{{env:CONFIG_MAP__…}}` placeholders with the value in the env file, `diff` redacts them, and a key push followed by `diff` is clean without a re-pull. Re-pull a tree pulled before this change to move such values out of it, and check your git history for any that were committed.
+
+### Added
+
+- **`profile set <name>`** changes a saved profile's `--dotenv`, `--user` or `--port` without hand-editing `profiles.json` ([#29](https://github.com/MichaelLeeHobbs/channelvault/issues/29)). It runs only at a terminal, checks the env file as `profile add` does, logs in before saving a new user (asking for its password) or port, and never changes `serverId` or the TLS pin.
+- **`profile remove <name>`** removes a profile and its line in the credentials file after you confirm, at a terminal. The profile's env file is kept.
+
+### Changed
+
+- `profile add` and `profile set` refuse a `--dotenv` that git would commit (inside a repository and not ignored, including in a folder that doesn't exist yet) or that is a folder; `[profile-invalid]`.
+- The `[profile-exists]` hint names `profile set` and `profile remove` instead of editing `profiles.json`. `diff`'s `[env-missing]`/`[env-incomplete]` hint names `profile set <name> --dotenv`, and a `pull` with a profile that has no `dotenv` into a tree with no `.env` says so and names the same command.
 
 ## [0.3.0-rc.5] — 2026-11-27
 
@@ -144,6 +156,7 @@ First release. Tested against Mirth Connect 4.5.2; the offline round trip is als
 - `backup` / `restore`: the server's own configuration XML saved as `.backup/<server>-<UTC time>.xml`, identified by Mirth's server ID, restored with a preview, an undo backup and a version check. `push` backs up first unless `--no-backup`.
 - `diff` exits 0 when the tree matches the server, 1 when it differs, 2 on error.
 
+[0.3.0-rc.6]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.6
 [0.3.0-rc.5]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.5
 [0.3.0-rc.4]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.4
 [0.3.0-rc.3]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.3

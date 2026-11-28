@@ -224,6 +224,15 @@ describe('env file', () => {
     expect(await readEnvFile(file)).toEqual({ KEEP: '1', PASS: 'new value', MULTI: 'single', ADDED: 'x' });
   });
 
+  it('removes a name given as null, with its continuation lines and duplicates, keeping the rest', async () => {
+    const file = path.join(dir, '.env');
+    await writeFile(file, '# notes\nGONE="a\nb"\nKEEP=1\nGONE=dup\n');
+    await updateEnvFile(file, { GONE: null, NEVER_SET: null });
+    expect(await readFile(file, 'utf8')).toBe('# notes\nKEEP=1\n');
+    await updateEnvFile(file, { KEEP: null });
+    expect(await readEnvFile(file)).toEqual({});
+  });
+
   it('adds env files to .gitignore once', async () => {
     await writeFile(path.join(dir, '.gitignore'), 'node_modules');
     expect(await ensureEnvIgnored(dir)).toBe(true);

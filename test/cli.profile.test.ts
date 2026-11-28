@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -306,5 +307,150 @@ describe('profile commands', () => {
     expect(list.status).toBe(1);
     expect(list.stderr).toContain('[profiles-invalid]');
     expect(list.stderr).toContain('insecure is refused');
+  });
+});
+
+describe('profile set and profile remove', () => {
+  const savedProfiles = async () => (JSON.parse(await readFile(path.join(config, 'profiles.json'), 'utf8')) as { profiles: Record<string, Profile> }).profiles;
+  const savedCredentials = () => readFile(path.join(config, 'credentials'), 'utf8');
+  const atTerminal = (args: string[]) => startCli(args, env, true);
+
+  it('sets a dotenv without touching the installation, the pin or the password', async () => {
+    const pin = 'ab'.repeat(32);
+    await saveProfile('pinned', { host: 'mirth.example', https: true, tlsFingerprint: pin, serverId: 'installation-1' });
+    const dotenv = path.join(dir, 'secrets', 'pinned.env');
+    const r = await atTerminal(['profile', 'set', 'pinned', '--dotenv', dotenv]).finished;
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain(`updated profile pinned: dotenv (none) -> ${dotenv}`);
+    expect((await savedProfiles()).pinned).toEqual({ ...profiles.pinned, dotenv });
+    expect((await savedProfiles()).gov).toEqual(profiles.gov);
+    expect(await savedCredentials()).toBe(`gov=${PASSWORD}\npinned=${PASSWORD}\n`);
+  });
+
+  it('refuses an empty change, a shared env file, and one git would commit, as profile add does', async () => {
+    const shared = path.join(dir, 'shared.env');
+    await saveProfile('other', { dotenv: shared });
+    const none = await atTerminal(['profile', 'set', 'gov']).finished;
+    expect(none.status).toBe(1);
+    expect(none.stderr).toContain('nothing to change');
+    const clash = await atTerminal(['profile', 'set', 'gov', '--dotenv', shared]).finished;
+    expect(clash.status).toBe(1);
+    expect(clash.stderr).toContain('[profile-invalid]');
+    expect(clash.stderr).toContain('share the env file');
+
+    const repo = path.join(dir, 'repo');
+    await mkdir(repo);
+    expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
+    const envInRepo = path.join(repo, 'gov.env');
+    const committable = await atTerminal(['profile', 'set', 'gov', '--dotenv', envInRepo]).finished;
+    expect(committable.status).toBe(1);
+    expect(committable.stderr).toContain('git does not ignore');
+    const add = await atTerminal(['profile', 'add', 'x', '--host', '127.0.0.1', '--port', '1', '--user', 'u', '--no-https', '--dotenv', envInRepo]).finished;
+    expect(add.status).toBe(1);
+    expect(add.stderr).toContain('git does not ignore');
+    const notYetCreated = await atTerminal(['profile', 'set', 'gov', '--dotenv', path.join(repo, 'secrets', 'gov.env')]).finished;
+    expect(notYetCreated.status).toBe(1);
+    expect(notYetCreated.stderr).toContain('git does not ignore');
+    const folder = await atTerminal(['profile', 'set', 'gov', '--dotenv', dir]).finished;
+    expect(folder.status).toBe(1);
+    expect(folder.stderr).toContain('is a folder');
+    expect(await savedProfiles()).toEqual(profiles);
+
+    await writeFile(path.join(repo, '.gitignore'), '*.env\n');
+    const ignored = await atTerminal(['profile', 'set', 'gov', '--dotenv', envInRepo]).finished;
+    expect(ignored.status, ignored.stderr).toBe(0);
+    expect((await savedProfiles()).gov!.dotenv).toBe(envInRepo);
+  });
+
+  it('changes the port only when it reaches the same installation, asking again for the password over plain http', async () => {
+    const other = await startFakeMirth({ '@version': '4.5.2', channels: { channel: [] } });
+    try {
+      const moving = atTerminal(['profile', 'set', 'gov', '--port', String(other.port)]);
+      await moving.waitFor('Password for u');
+      moving.child.stdin.end(`${PASSWORD}\n`);
+      const moved = await moving.finished;
+      expect(moved.status).toBe(1);
+      expect(moved.stderr).toContain('[server-mismatch]');
+      expect(await savedProfiles()).toEqual(profiles);
+
+      other.serverId = mirth.serverId;
+      const sameInstallation = atTerminal(['profile', 'set', 'gov', '--port', String(other.port)]);
+      await sameInstallation.waitFor('Password for u');
+      sameInstallation.child.stdin.end(`${PASSWORD}\n`);
+      const r = await sameInstallation.finished;
+      expect(r.status, r.stderr).toBe(0);
+      expect((await savedProfiles()).gov).toEqual({ ...profiles.gov, port: other.port });
+      expect(await savedCredentials()).toBe(`gov=${PASSWORD}\n`);
+    } finally {
+      await other.close();
+    }
+    const same = await atTerminal(['profile', 'set', 'gov', '--port', String(other.port)]).finished;
+    expect(same.stdout).toContain('already has those settings');
+  });
+
+  it('finds no profile or password for a name Object.prototype has', async () => {
+    const r = await atTerminal(['profile', 'remove', 'constructor']).finished;
+    expect(r.stderr).toContain('[profile-unknown]');
+  });
+
+  it('changes the user after logging in with its password, and stores that password', async () => {
+    const running = atTerminal(['profile', 'set', 'gov', '--user', 'deploy']);
+    await running.waitFor('Password for deploy');
+    running.child.stdin.end('deploy-password-77\n');
+    const r = await running.finished;
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).not.toContain('deploy-password-77');
+    expect((await savedProfiles()).gov).toEqual({ ...profiles.gov, user: 'deploy' });
+    expect(await savedCredentials()).toBe('gov=deploy-password-77\n');
+  });
+
+  it('removes a profile and its password line after confirming, keeping the others', async () => {
+    await saveProfile('other');
+    const declined = atTerminal(['profile', 'remove', 'gov']);
+    await declined.waitFor('Remove profile gov');
+    declined.child.stdin.end('n\n');
+    expect((await declined.finished).stdout).toContain('aborted');
+    expect(Object.keys(await savedProfiles())).toEqual(['gov', 'other']);
+
+    const running = atTerminal(['profile', 'remove', 'gov']);
+    await running.waitFor('Remove profile gov');
+    running.child.stdin.end('y\n');
+    const r = await running.finished;
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout + r.stderr).not.toContain(PASSWORD);
+    expect(await savedProfiles()).toEqual({ other: profiles.other });
+    expect(await savedCredentials()).toBe(`other=${PASSWORD}\n`);
+    const unknown = await atTerminal(['profile', 'remove', 'gov']).finished;
+    expect(unknown.stderr).toContain('[profile-unknown]');
+  });
+
+  it('runs only at a terminal', async () => {
+    for (const args of [['profile', 'set', 'gov', '--dotenv', path.join(dir, 'x.env')], ['profile', 'remove', 'gov']]) {
+      const r = await run(args);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('[no-terminal]');
+    }
+    expect(await savedProfiles()).toEqual(profiles);
+  });
+
+  it('points profile add for an existing name at profile set and remove, not at the JSON file', async () => {
+    const r = await atTerminal(['profile', 'add', 'gov', '--host', '127.0.0.1', '--port', '1', '--user', 'u', '--no-https']).finished;
+    expect(r.stderr).toContain('[profile-exists]');
+    expect(r.stderr).toContain('channelvault profile set gov');
+    expect(r.stderr).toContain('channelvault profile remove gov');
+    expect(r.stderr).not.toContain('profiles.json');
+  });
+
+  it('names profile set --dotenv when a pull puts secrets in a new env file inside the checkout', async () => {
+    const first = await pulled();
+    expect(first.stderr).toContain('profile gov has no env file of its own');
+    expect(first.stderr).toContain('channelvault profile set gov --dotenv');
+    const again = await pulled();
+    expect(again.stderr).not.toContain('profile set gov --dotenv');
+
+    await saveProfile('gov', { dotenv: path.join(dir, 'gov.env') });
+    const withDotenv = await run(['pull', path.join(dir, 'tree2'), '--profile', 'gov']);
+    expect(withDotenv.status, withDotenv.stderr).toBe(0);
+    expect(withDotenv.stderr).not.toContain('profile set');
   });
 });
