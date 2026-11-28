@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { lstat, readlink, realpath } from 'node:fs/promises';
 import * as path from 'node:path';
 
@@ -20,6 +20,14 @@ export async function resolvedPath(p: string): Promise<string> {
   let existing = abs;
   while (!existsSync(existing) && path.dirname(existing) !== existing) existing = path.dirname(existing);
   return path.join(await realpath(existing), path.relative(existing, abs));
+}
+
+/** {@link resolvedPath} for synchronous callers; the native call also expands Windows 8.3 short names. */
+export function resolvedPathSync(p: string): string {
+  const abs = path.resolve(p);
+  let existing = abs;
+  while (!existsSync(existing) && path.dirname(existing) !== existing) existing = path.dirname(existing);
+  return path.join(realpathSync.native(existing), path.relative(existing, abs));
 }
 
 export async function present(file: string): Promise<boolean> {

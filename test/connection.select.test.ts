@@ -68,6 +68,18 @@ describe('each source is used whole', () => {
     expect(select({ flags: { host: 'ENV.example' }, env: envLogin })).toMatchObject({ password: 'env-password' });
   });
 
+  it('treats login flags without --host as MIRTH_HOST, with its guards', () => {
+    expect(reason({ flags: { user: 'admin' }, env: envLogin, treeServerId: 'gov-id' })).toBe('env-shadowed');
+    expect(select({ flags: { pass: 'typed' }, env: envLogin })).toMatchObject({ source: 'env', passwordSource: '--pass' });
+    expect(reason({ flags: { user: 'admin' } })).toBe('no-connection');
+    expect(reason({ flags: { user: 'admin' }, env: { MIRTH_PROFILE: 'gov' } })).toBe('flag-conflict');
+  });
+
+  it('does not borrow MIRTH_TLS_FINGERPRINT for a typed --host of another server', () => {
+    const conn = select({ flags: { host: 'other.example', port: '1', user: 'u', pass: 'p' }, env: { ...envLogin, MIRTH_TLS_FINGERPRINT: 'ab'.repeat(32) } });
+    expect(conn.tlsFingerprint).toBeUndefined();
+  });
+
   it('does not let MIRTH_HOST stand in for a profile that owns the tree', () => {
     expect(reason({ env: envLogin, treeServerId: 'gov-id' })).toBe('env-shadowed');
     expect(select({ env: envLogin, treeServerId: 'not-a-profile' })).toMatchObject({ source: 'env' });
@@ -98,6 +110,14 @@ describe('writes need a typed profile (W2)', () => {
   it('lets MIRTH_PROFILE select a write only when it is confirmed at a terminal', () => {
     expect(select({ env: { MIRTH_PROFILE: 'gov' }, write: true })).toMatchObject({ source: 'env-profile' });
     expect(reason({ env: { MIRTH_PROFILE: 'gov' }, write: true, yes: true })).toBe('profile-not-typed');
+  });
+
+  it('lets only a typed profile or --host target a write that rebinds a tree (adopt)', () => {
+    expect(reason({ env: envLogin, write: true, explicit: true })).toBe('connection-not-typed');
+    expect(reason({ env: { MIRTH_PROFILE: 'gov' }, write: true, explicit: true })).toBe('connection-not-typed');
+    expect(select({ flags: { profile: 'gov' }, write: true, explicit: true })).toMatchObject({ source: 'profile-flag' });
+    expect(select({ flags: { host: 'env.example' }, env: envLogin, write: true, explicit: true })).toMatchObject({ source: 'flags' });
+    expect(select({ env: envLogin, explicit: true })).toMatchObject({ source: 'env' });
   });
 
   it('accepts a typed profile, login flags and MIRTH_HOST for writes', () => {

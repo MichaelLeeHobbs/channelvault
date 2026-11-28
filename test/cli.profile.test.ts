@@ -1,4 +1,5 @@
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -153,6 +154,13 @@ describe('writing with a profile (W2)', () => {
     expect(r.stderr).toContain('[no-connection]');
     const typed = await run(['adopt', tree, '--plan-only', '--profile', 'gov']);
     expect(typed.status, typed.stderr).toBe(0);
+    await rm(path.join(config, 'profiles.json'));
+    const login = { MIRTH_HOST: '127.0.0.1', MIRTH_PORT: String(mirth.port), MIRTH_USER: 'u', MIRTH_PASS: 'p' };
+    const fromEnv = await run(['adopt', tree, '--yes', '--no-https'], login);
+    expect(fromEnv.status).toBe(1);
+    expect(fromEnv.stderr).toContain('[connection-not-typed]');
+    const withHost = await run(['adopt', tree, '--yes', '--no-https', '--host', '127.0.0.1'], login);
+    expect(withHost.status, withHost.stderr).toBe(0);
   });
 });
 
@@ -215,6 +223,30 @@ describe("a profile's env file", () => {
     expect(ambiguous.stderr).toContain('[env-ambiguous]');
     const chosen = await run(['diff', worktree, '--dotenv', shared]);
     expect(chosen.status, chosen.stderr).toBe(0);
+  });
+
+  it('refuses to read it while another checkout is replacing it', async () => {
+    const shared = path.join(dir, 'secrets', 'gov.env');
+    await saveProfile('gov', { dotenv: shared });
+    await pulled();
+    const copy = `${shared}.channelvault-${randomUUID()}.next`;
+    await writeFile(copy, 'X=1\n');
+    const busy = await run(['diff', tree]);
+    expect(busy.status).toBe(2);
+    expect(busy.stderr).toContain('[env-busy]');
+    await rm(copy);
+    expect((await run(['diff', tree])).status).toBe(0);
+  });
+
+  it('retries a pull interrupted while replacing it in one run', async () => {
+    const shared = path.join(dir, 'secrets', 'gov.env');
+    await saveProfile('gov', { dotenv: shared });
+    await pulled();
+    // What an interrupted pull leaves once its swap completed: a committed journal naming the env file.
+    await writeFile(path.join(tree, '.channelvault-transaction.json'), JSON.stringify({ version: 1, id: randomUUID(), state: 'committed', envFile: await realpath(shared), entries: [] }));
+    const retry = await run(['pull', tree, '--profile', 'gov']);
+    expect(retry.status, retry.stderr).toBe(0);
+    expect(existsSync(path.join(tree, '.channelvault-transaction.json'))).toBe(false);
   });
 });
 

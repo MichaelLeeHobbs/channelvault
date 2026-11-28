@@ -56,6 +56,8 @@ export interface SelectionInput {
   write?: boolean;
   /** --yes: no prompt will name the profile and host before the write. */
   yes?: boolean;
+  /** A write that only a typed --profile or --host may target (adopt, which rebinds a tree). */
+  explicit?: boolean;
 }
 
 function refuse(message: string, reason: string): never {
@@ -125,7 +127,7 @@ function fromFlagsAndEnv(input: SelectionInput, source: 'flags' | 'env'): Connec
   if (password === undefined) missing('pass', 'MIRTH_PASS');
   const port = Number(portStr);
   if (!Number.isInteger(port) || port < 1 || port > 65535) refuse(`invalid port: ${portStr}`, 'bad-port');
-  const rawPin = flags.tlsFingerprint ?? env.MIRTH_TLS_FINGERPRINT;
+  const rawPin = flags.tlsFingerprint ?? (foreign ? undefined : env.MIRTH_TLS_FINGERPRINT);
   const tlsFingerprint = rawPin === undefined ? undefined : normalizeFingerprint(rawPin);
   if (rawPin !== undefined && !tlsFingerprint) refuse('--tls-fingerprint (or MIRTH_TLS_FINGERPRINT) must be a SHA-256 certificate fingerprint: 64 hex digits, colons allowed', 'bad-fingerprint');
   if (tlsFingerprint && flags.insecure) refuse('--insecure turns off the certificate check that --tls-fingerprint (or MIRTH_TLS_FINGERPRINT) pins; drop --insecure', 'flag-conflict');
@@ -165,7 +167,7 @@ export function resolveConnection(given: SelectionInput): Connection {
   let conn: Connection;
   if (flags.profile !== undefined) {
     conn = fromProfile(flags.profile, input, 'profile-flag');
-  } else if (loginTyped) {
+  } else if (flags.host !== undefined) {
     conn = fromFlagsAndEnv(input, 'flags');
   } else if (env.MIRTH_PROFILE) {
     conn = fromProfile(env.MIRTH_PROFILE, input, 'env-profile');
@@ -174,7 +176,10 @@ export function resolveConnection(given: SelectionInput): Connection {
     if (owner.length > 0) {
       refuse(`MIRTH_HOST is set, but this tree belongs to profile ${owner.join(' or ')}; use --profile ${owner[0]}, or unset MIRTH_HOST`, 'env-shadowed');
     }
+    // Login flags typed without --host still reach MIRTH_HOST's server, so they get the same guards.
     conn = fromFlagsAndEnv(input, 'env');
+  } else if (loginTyped) {
+    refuse(`--port, --user and --pass need --host (or use --profile <name>; ${profileList(profiles)})`, 'no-connection');
   } else {
     const owner = input.treeServerId ? profilesFor(profiles, input.treeServerId) : [];
     if (owner.length > 1) refuse(`profiles ${owner.join(', ')} all name this tree's installation (${input.treeServerId}); pass --profile`, 'profile-ambiguous');
@@ -188,6 +193,9 @@ export function resolveConnection(given: SelectionInput): Connection {
   }
   if (input.write && conn.source === 'env-profile' && input.yes) {
     refuse(`with --yes, writing to a server needs the profile typed: add --profile ${conn.profile} (MIRTH_PROFILE selects a write only when you confirm it at a terminal)`, 'profile-not-typed');
+  }
+  if (input.write && input.explicit && conn.source !== 'profile-flag' && conn.source !== 'flags') {
+    refuse('this command needs its server typed: pass --profile <name>, or --host with the login (environment variables can be stale)', 'connection-not-typed');
   }
   return conn;
 }

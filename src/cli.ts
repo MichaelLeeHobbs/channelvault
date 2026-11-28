@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { cp, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -124,7 +124,7 @@ let loadedProfiles: Profiles = {};
  * is the tree whose committed serverId can select a profile and must match an
  * explicit one; `write` applies the typed-profile rule for real writes.
  */
-async function selectConnection(root: string | undefined, flags: ConnectionFlags & { yes?: boolean }, opts: { write?: boolean } = {}): Promise<Connection> {
+async function selectConnection(root: string | undefined, flags: ConnectionFlags & { yes?: boolean }, opts: { write?: boolean; explicit?: boolean } = {}): Promise<Connection> {
   loadedProfiles = await loadProfiles();
   const meta = root ? await readMeta(root) : null;
   const conn = resolveConnection({
@@ -135,6 +135,7 @@ async function selectConnection(root: string | undefined, flags: ConnectionFlags
     ...(meta?.serverId ? { treeServerId: meta.serverId } : {}),
     write: opts.write === true,
     yes: flags.yes === true,
+    explicit: opts.explicit === true,
   });
   rememberSecret(conn.password, { stdout: true });
   activeConnection = conn;
@@ -411,8 +412,26 @@ async function envFileFor(root: string, flags: EnvFlags, conn?: Connection): Pro
   if (flags.dotenv) return path.resolve(flags.dotenv);
   const local = path.join(root, '.env');
   if (!conn?.dotenv) return local;
-  if (!existsSync(local) || samePath(await canonical(local), await canonical(conn.dotenv))) return conn.dotenv;
+  if (!existsSync(local) || samePath(await canonical(local), await canonical(conn.dotenv))) {
+    await assertNoSwapPending(conn.dotenv);
+    return conn.dotenv;
+  }
   fail(`both ${local} and profile ${conn.profile}'s env file ${conn.dotenv} exist; pass --dotenv to choose one, or remove the one that is stale`, 'env-ambiguous');
+}
+
+/**
+ * A pull in another checkout replaces a profile's env file by renaming copies
+ * beside it (`<file>.channelvault-<id>.next` / `.previous`); while they exist the
+ * file may be absent or about to change.
+ */
+async function assertNoSwapPending(file: string): Promise<void> {
+  const dir = path.dirname(file);
+  if (!existsSync(dir)) return;
+  const prefix = `${path.basename(file)}.channelvault-`;
+  const pending = (await readdir(dir)).filter(n => n.startsWith(prefix) && /\.(next|previous)$/.test(n));
+  if (pending.length > 0) {
+    fail(`${file} is being replaced by a pull in another checkout (${pending.join(', ')} beside it); retry when it finishes, or rerun that checkout's command to finish an interrupted one`, 'env-busy');
+  }
 }
 
 /** Every env file an interrupted replacement in `root` may legitimately name. */
@@ -475,8 +494,12 @@ function rememberSecrets(tree: CanonicalConfig, env: Record<string, string | und
 
 for (const stream of [process.stdout, process.stderr]) {
   const write = stream.write.bind(stream) as (chunk: unknown, ...rest: unknown[]) => boolean;
-  stream.write = ((chunk: unknown, ...rest: unknown[]) =>
-    write(typeof chunk === 'string' && everywhereSecrets.size > 0 ? scrub(chunk, everywhereSecrets) : chunk, ...rest)) as typeof stream.write;
+  stream.write = ((chunk: unknown, ...rest: unknown[]) => {
+    if (everywhereSecrets.size === 0) return write(chunk, ...rest);
+    if (typeof chunk === 'string') return write(scrub(chunk, everywhereSecrets), ...rest);
+    if (Buffer.isBuffer(chunk)) return write(Buffer.from(scrub(chunk.toString('utf8'), everywhereSecrets), 'utf8'), ...rest);
+    return write(chunk, ...rest);
+  }) as typeof stream.write;
 }
 
 /**
@@ -1160,7 +1183,7 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
   if (flags.json && !flags.planOnly) fail('--json needs --plan-only');
   if (!flags.yes && !flags.planOnly && !process.stdin.isTTY) fail('no terminal to confirm on; review with `adopt --plan-only` and pass --yes');
   // Adopting rebinds the tree, so its current serverId neither selects nor has to match the profile.
-  const conn = await selectConnection(undefined, flags, { write: !flags.planOnly });
+  const conn = await selectConnection(undefined, flags, { write: !flags.planOnly, explicit: true });
   const envFile = await envFileFor(root, flags, conn);
   const previous = await preflightTree(root, envFile);
   const stored = await engine.implode({ root });
@@ -1847,10 +1870,14 @@ profileCommand.command('repin')
 // --- locks, recovery, errors -------------------------------------------------------
 
 const unlocks: Array<() => Promise<void>> = [];
+const locked: string[] = [];
 
-/** Lock an env file outside the tree, the same way the tree is locked. */
+/** Lock an env file outside the tree, the same way the tree is locked; once per file, since recovery may already hold it. */
 async function lockAlso(file: string): Promise<void> {
+  const key = await canonical(file);
+  if (locked.some(l => samePath(l, key))) return;
   unlocks.push(await lockTree(path.resolve(file)));
+  locked.push(key);
 }
 
 program.hook('preAction', async (_program, command) => {

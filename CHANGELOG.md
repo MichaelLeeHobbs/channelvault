@@ -19,6 +19,8 @@ Release candidate, published under the npm `next` tag.
 ### Changed
 
 - **Real writes need a typed profile.** `push` (without `--plan-only`), `restore` and `adopt` refuse a profile chosen by the tree's installation; `MIRTH_PROFILE` selects one only when the write is confirmed at a terminal. Printed undo commands use `--profile <name>`.
+- **`adopt` (without `--plan-only`) needs `--profile` or `--host` typed**, since it rebinds the tree; `MIRTH_*` alone is refused with `[connection-not-typed]`. Scripts that adopted with only `MIRTH_*` set must add `--host`.
+- `--port`, `--user` or `--pass` typed without `--host` count as the `MIRTH_HOST` source, with its checks; without `MIRTH_HOST` they are refused.
 - **A typed `--host` no longer borrows `MIRTH_PORT`, `MIRTH_USER` or `MIRTH_PASS` exported for a different `MIRTH_HOST`**: the command stops with `[env-conflict]` instead of sending one server's password to another. Type the matching login flags, or use a profile.
 - `MIRTH_HOST` is refused when the tree, or the server that answers, belongs to a profile, which catches a stale shell variable.
 - `insecure` and plain http are refused in a profile for any host but loopback, and a typed `--insecure` beside a pin is refused.
@@ -29,7 +31,7 @@ Release candidate, published under the npm `next` tag.
 - `pull` refused nothing when the server was another installation than the tree's: a stale `MIRTH_HOST` could rewrite one server's tree as another's, and its next push would then pass the installation check. It now refuses (`[installation-mismatch]`), whichever way the connection was chosen.
 - `diff` against another installation printed a whole-server difference; it now refuses with exit 2.
 - The connection password was never redacted from output. It is now removed from error text, and when it has 8 or more characters, from every line on stdout and stderr.
-- Recovering an interrupted pull whose env file is a profile's no longer needs the original `--dotenv`, and a pull locks a profile env file outside the tree so two worktrees cannot write it at once.
+- Recovering an interrupted pull whose env file is a profile's no longer needs the original `--dotenv`, and a pull locks a profile env file outside the tree so two worktrees cannot write it at once. Other commands refuse to read that file while a pull elsewhere is replacing it (`[env-busy]`).
 
 ## [0.3.0-rc.3] — 2026-11-27
 

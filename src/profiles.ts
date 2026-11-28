@@ -11,7 +11,7 @@ import * as path from 'node:path';
 
 import { writePrivate } from './backup/index.js';
 import { readJson } from './json.js';
-import { samePath } from './paths.js';
+import { resolvedPathSync, samePath } from './paths.js';
 import { readEnvFile, updateEnvFile } from './secrets/envfile.js';
 
 /** An error with a stable reason code, printed as `error: [reason] message`. */
@@ -111,7 +111,7 @@ export function profileProblems(profiles: unknown): string[] {
     }
     if (p.dotenv !== undefined) {
       if (typeof p.dotenv !== 'string' || !path.isAbsolute(p.dotenv)) problems.push(`${at}: dotenv must be an absolute path`);
-      else dotenvs.push([name, path.resolve(p.dotenv)]);
+      else dotenvs.push([name, resolvedPathSync(p.dotenv)]);
     }
     if (typeof p.host === 'string' && !isLoopback(p.host)) {
       if (p.https === false) problems.push(`${at}: https cannot be false for ${p.host}; plain http sends the password readable on the network (only loopback hosts may use it)`);

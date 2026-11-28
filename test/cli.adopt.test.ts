@@ -52,11 +52,11 @@ it('adopts a reviewed target without writes or secret changes, then pushes and c
   mirth.config.channels = { channel: [...channelsOf(mirth.config), { id: 'c9', name: 'Target Only', revision: 3 }] };
   const beforeMeta = await readFile(file(), 'utf8');
   const beforeEnv = await readFile(path.join(tree, '.env'), 'utf8');
-  const preview = await run('adopt', tree, '--plan-only', '--json');
+  const preview = await run('adopt', tree, '--host', '127.0.0.1', '--plan-only', '--json');
   expect(preview.status, preview.stderr).toBe(0);
   expect(JSON.parse(preview.stdout)).toMatchObject({ mode: 'adopt', wouldStop: [], serverOnly: ['channel "Target Only"'] });
   expect(await readFile(file(), 'utf8')).toBe(beforeMeta);
-  const adopted = await run('adopt', tree, '--yes');
+  const adopted = await run('adopt', tree, '--host', '127.0.0.1', '--yes');
   expect(adopted.status, adopted.stderr).toBe(0);
   expect(mirth.writes).toEqual([]);
   expect(await readFile(script(), 'utf8')).toBe('localEdit();');
@@ -77,7 +77,7 @@ it('protects independent edits made after adoption', async () => {
   await writeFile(script(), 'localEdit();');
   mirth.serverId = randomUUID();
   channelsOf(mirth.config)[0]!.revision = 2;
-  expect((await run('adopt', tree, '--yes')).status).toBe(0);
+  expect((await run('adopt', tree, '--host', '127.0.0.1', '--yes')).status).toBe(0);
   channelsOf(mirth.config)[0]!.revision = 3;
   channelsOf(mirth.config)[0]!.deployScript = 'peerEdit();';
   const result = await push();
@@ -95,7 +95,7 @@ it('refuses an unknown legacy baseline until it is explicitly adopted', async ()
   expect(result.status).toBe(1);
   expect(result.stderr).toContain('unknown installation');
   expect(mirth.writes).toEqual([]);
-  expect((await run('adopt', tree, '--yes')).status).toBe(0);
+  expect((await run('adopt', tree, '--host', '127.0.0.1', '--yes')).status).toBe(0);
   expect((await push()).status).toBe(0);
 });
 
@@ -109,7 +109,7 @@ it('uses the installation ID rather than the stored URL', async () => {
 
 it('refuses adoption when the target changes during confirmation', async () => {
   const before = await readFile(file(), 'utf8');
-  const running = startCli(['adopt', tree, '--no-https'], env, true);
+  const running = startCli(['adopt', tree, '--no-https', '--host', '127.0.0.1'], env, true);
   try {
     await running.waitFor('Accept this baseline?');
     channelsOf(mirth.config)[0]!.deployScript = 'peerEdit();';
@@ -124,7 +124,7 @@ it('refuses adoption when the target changes during confirmation', async () => {
 
 it('preserves an edit made to the local tree while adoption is being confirmed', async () => {
   const before = await readFile(file(), 'utf8');
-  const running = startCli(['adopt', tree, '--no-https'], env, true);
+  const running = startCli(['adopt', tree, '--no-https', '--host', '127.0.0.1'], env, true);
   try {
     await running.waitFor('Accept this baseline?');
     await writeFile(script(), 'newLocalEdit();');
