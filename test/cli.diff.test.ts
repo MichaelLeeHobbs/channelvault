@@ -2,7 +2,7 @@
  * Differences between servers that are representation, not content: what a
  * tree pulled from one installation must not report against another.
  */
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -100,5 +100,64 @@ describe('a code template holding a character XML 1.0 forbids', () => {
     expect(result.stderr).toContain('Lib › trim › code: line 1, column 28 of the value (U+FFFE)');
     expect(result.stderr).toContain('codeTemplates/Lib/trim.js:1:28 (U+FFFE)');
     expect(mirth.writes).toEqual([]);
+  });
+});
+
+describe('diff without the values behind the tree\'s placeholders', () => {
+  let secretTree: string;
+  beforeEach(async () => {
+    (mirth.config['channels'] as { channel: Obj[] }).channel[0]!['password'] = 'hunter2-secret';
+    secretTree = path.join(dir, 'secret-tree');
+    const pull = await runCli(['pull', secretTree, '--no-https'], env);
+    expect(pull.status, pull.stderr).toBe(0);
+  });
+
+  it('compares cleanly when the env file holds every value', async () => {
+    const diff = await run('diff', secretTree, '--json');
+    expect(diff.status, diff.stderr).toBe(0);
+    expect(JSON.parse(diff.stdout)).toMatchObject({ clean: true, secretDrift: [] });
+  });
+
+  it('exits 2 with [env-missing], naming the file it looked for, instead of reporting every secret as drift', async () => {
+    await rm(path.join(secretTree, '.env'));
+    const diff = await run('diff', secretTree, '--json');
+    expect(diff.status).toBe(2);
+    expect(diff.stderr).toContain('[env-missing]');
+    expect(diff.stderr).toContain(path.join(secretTree, '.env'));
+    expect(diff.stderr).toContain('--dotenv');
+    expect(diff.stdout).not.toContain('secretDrift');
+  });
+
+  it('exits 2 with [env-incomplete], naming the missing variables, when the env file lacks some', async () => {
+    await writeFile(path.join(secretTree, '.env'), 'UNRELATED=1\n');
+    const diff = await run('diff', secretTree);
+    expect(diff.status).toBe(2);
+    expect(diff.stderr).toContain('[env-incomplete]');
+    expect(diff.stderr).toContain('ALPHA__PASSWORD');
+    expect(diff.stderr).not.toContain('hunter2-secret');
+  });
+
+  // An agent adds a channel with a placeholder; a person fills in its value later.
+  it('still diffs a new channel whose placeholder has no value yet', async () => {
+    const channelDir = path.join(secretTree, 'channels', 'Alpha');
+    const newDir = path.join(secretTree, 'channels', 'Beta');
+    await cp(channelDir, newDir, { recursive: true });
+    const file = path.join(newDir, 'channel.json');
+    const channel = JSON.parse(await readFile(file, 'utf8')) as Obj;
+    Object.assign(channel, { id: 'c2', name: 'Beta', password: '{{env:BETA__PASSWORD}}' });
+    await writeFile(file, JSON.stringify(channel, null, 2));
+
+    const diff = await run('diff', secretTree, '--json');
+    expect(diff.status, diff.stderr).toBe(1);
+    const result = JSON.parse(diff.stdout) as { files: Array<{ change: string }>; secretDrift: string[]; notes: string[] };
+    expect(result.files.some((f) => f.change === 'only-in-tree')).toBe(true);
+    expect(result.secretDrift).toEqual([]);
+    expect(result.notes.join('\n')).toContain('no value yet for BETA__PASSWORD');
+  });
+
+  it('accepts values supplied by the process environment instead of a file', async () => {
+    await rm(path.join(secretTree, '.env'));
+    const diff = await runCli(['diff', secretTree, '--no-https'], { ...env, ALPHA__PASSWORD: 'hunter2-secret' });
+    expect(diff.status, diff.stderr).toBe(0);
   });
 });

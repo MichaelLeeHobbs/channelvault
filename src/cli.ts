@@ -50,7 +50,7 @@ import {
   type Scope,
 } from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
-import { mapLeaves, redactKnownSecrets, render, templatize } from './secrets/index.js';
+import { placeholderNames, placeholderUse, redactKnownSecrets, render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
 import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
 import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_KEEP, defaultBackupDir, LEGACY_BACKUP_DIR, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
@@ -486,10 +486,28 @@ function rememberSecret(value: string | undefined, opts: { stdout?: boolean } = 
 }
 
 function rememberSecrets(tree: CanonicalConfig, env: Record<string, string | undefined>): void {
-  mapLeaves(tree, (value) => {
-    for (const m of value.matchAll(/\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g)) rememberSecret(env[m[1]!]);
-    return value;
-  });
+  for (const name of placeholderNames(tree)) rememberSecret(env[name]);
+}
+
+/**
+ * Fail when a placeholder compared with the server has no value. Without it
+ * the secret would compare as changed, which reads as drift rather than as a
+ * checkout that can't compare secrets. Returns the names that have no value
+ * yet but are used only by resources the server doesn't have.
+ */
+function assertEnvComplete(tree: CanonicalConfig, server: CanonicalConfig, env: Record<string, string | undefined>, envFile: string, conn: Connection): string[] {
+  const { compared, treeOnly } = placeholderUse(tree, server);
+  const unset = (names: Set<string>) => [...names].filter((name) => env[name] === undefined).sort();
+  const missing = unset(compared);
+  if (missing.length > 0) {
+    const fix = conn.dotenv && samePath(envFile, conn.dotenv)
+      ? `set them in profile ${conn.profile}'s env file, or pass --dotenv <file>`
+      : `pass --dotenv <file>, or ${conn.profile ? `set profile ${conn.profile}'s dotenv` : 'use a connection profile with a dotenv'}`;
+    const what = `no value for ${missing.join(', ')}, so those secrets can't be compared`;
+    if (!existsSync(envFile)) fail(`there is no env file at ${envFile}: ${what}; ${fix}`, 'env-missing');
+    fail(`${envFile} has ${what}; add them, or ${fix}`, 'env-incomplete');
+  }
+  return unset(treeOnly);
 }
 
 for (const stream of [process.stdout, process.stderr]) {
@@ -1508,12 +1526,15 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
     return { fetched: await client.getServerConfiguration(), serverId };
   }, { envFile, quiet: flags.json });
   const tree = await engine.implode({ root });
+  const env = await loadEnv(envFile);
+  const unsetTreeOnly = assertEnvComplete(tree, fetched, env, envFile, conn);
   // Compare like with like: the server's credentials become the placeholders
   // the tree holds. Values that differ from the env file are named, never shown.
-  const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, await loadEnv(envFile));
+  const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, env);
   const messages: string[] = [
     ...Object.keys(envUpdates).map((name) => `${name} differs between the server and the env file`),
     ...notes,
+    ...(unsetTreeOnly.length > 0 ? [`no value yet for ${unsetTreeOnly.join(', ')}, used only by resources the server doesn't have`] : []),
     ...await xmlProblems(root, tree),
   ];
   // Redact both sides the same way, so neither can print a secret and a raw

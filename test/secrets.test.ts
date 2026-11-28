@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { parse } from 'dotenv';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { redactKnownSecrets, render, templatize } from '../src/secrets/index.js';
+import { placeholderNames, placeholderUse, redactKnownSecrets, render, templatize } from '../src/secrets/index.js';
 import { ensureEnvIgnored, formatValue, readEnvFile, updateEnvFile } from '../src/secrets/envfile.js';
 import { XmlConfigAdapter } from '../src/xml/index.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
@@ -331,4 +331,27 @@ it('ignores a custom env file name inside the tree', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+describe('placeholderNames', () => {
+  it('collects every name once, from any depth and several per string', () => {
+    const names = placeholderNames({
+      channels: { channel: [{ id: 'c1', password: '{{env:A}}', url: 'https://{{env:USER}}:{{env:A}}@h/{{env:B}}' }] },
+      plain: 'no placeholders, {{env:}} or {{env:1BAD}}',
+    } as never);
+    expect([...names].sort()).toEqual(['A', 'B', 'USER']);
+  });
+});
+
+describe('placeholderUse', () => {
+  it('separates names the server holds a value for from names only in tree-only resources', () => {
+    const tree = { channels: { channel: [
+      { id: 'c1', password: '{{env:A}}', url: 'x{{env:SHARED}}' },
+      { id: 'c2', password: '{{env:NEW}}', url: '{{env:SHARED}}' },
+    ] } } as never;
+    const server = { channels: { channel: [{ id: 'c1', password: 'pw', url: 'u' }] } } as never;
+    const { compared, treeOnly } = placeholderUse(tree, server);
+    expect([...compared].sort()).toEqual(['A', 'SHARED']);
+    expect([...treeOnly]).toEqual(['NEW']);
+  });
 });
