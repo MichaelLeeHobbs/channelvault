@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { parse } from 'dotenv';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { redactKnownSecrets, render, templatize } from '../src/secrets/index.js';
+import { placeholderNames, redactKnownSecrets, render, templatize } from '../src/secrets/index.js';
 import { ensureEnvIgnored, formatValue, readEnvFile, updateEnvFile } from '../src/secrets/envfile.js';
 import { XmlConfigAdapter } from '../src/xml/index.js';
 import type { CanonicalConfig, Json } from '../src/types.js';
@@ -331,4 +331,14 @@ it('ignores a custom env file name inside the tree', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+describe('placeholderNames', () => {
+  it('collects every name once, from any depth and several per string', () => {
+    const names = placeholderNames({
+      channels: { channel: [{ id: 'c1', password: '{{env:A}}', url: 'https://{{env:USER}}:{{env:A}}@h/{{env:B}}' }] },
+      plain: 'no placeholders, {{env:}} or {{env:1BAD}}',
+    } as never);
+    expect([...names].sort()).toEqual(['A', 'B', 'USER']);
+  });
 });

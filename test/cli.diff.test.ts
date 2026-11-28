@@ -102,3 +102,45 @@ describe('a code template holding a character XML 1.0 forbids', () => {
     expect(mirth.writes).toEqual([]);
   });
 });
+
+describe('diff without the values behind the tree\'s placeholders', () => {
+  let secretTree: string;
+  beforeEach(async () => {
+    (mirth.config['channels'] as { channel: Obj[] }).channel[0]!['password'] = 'hunter2-secret';
+    secretTree = path.join(dir, 'secret-tree');
+    const pull = await runCli(['pull', secretTree, '--no-https'], env);
+    expect(pull.status, pull.stderr).toBe(0);
+  });
+
+  it('compares cleanly when the env file holds every value', async () => {
+    const diff = await run('diff', secretTree, '--json');
+    expect(diff.status, diff.stderr).toBe(0);
+    expect(JSON.parse(diff.stdout)).toMatchObject({ clean: true, secretDrift: [] });
+  });
+
+  // A missing env file used to report every secret as drift (exit 1).
+  it('exits 2 with [env-missing], naming the file it looked for, when there is no env file', async () => {
+    await rm(path.join(secretTree, '.env'));
+    const diff = await run('diff', secretTree, '--json');
+    expect(diff.status).toBe(2);
+    expect(diff.stderr).toContain('[env-missing]');
+    expect(diff.stderr).toContain(path.join(secretTree, '.env'));
+    expect(diff.stderr).toContain('--dotenv');
+    expect(diff.stdout).not.toContain('secretDrift');
+  });
+
+  it('exits 2 with [env-incomplete], naming the missing variables, when the env file lacks some', async () => {
+    await writeFile(path.join(secretTree, '.env'), 'UNRELATED=1\n');
+    const diff = await run('diff', secretTree);
+    expect(diff.status).toBe(2);
+    expect(diff.stderr).toContain('[env-incomplete]');
+    expect(diff.stderr).toContain('ALPHA__PASSWORD');
+    expect(diff.stderr).not.toContain('hunter2-secret');
+  });
+
+  it('accepts values supplied by the process environment instead of a file', async () => {
+    await rm(path.join(secretTree, '.env'));
+    const diff = await runCli(['diff', secretTree, '--no-https'], { ...env, ALPHA__PASSWORD: 'hunter2-secret' });
+    expect(diff.status, diff.stderr).toBe(0);
+  });
+});

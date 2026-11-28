@@ -50,7 +50,7 @@ import {
   type Scope,
 } from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
-import { mapLeaves, redactKnownSecrets, render, templatize } from './secrets/index.js';
+import { placeholderNames, redactKnownSecrets, render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
 import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
 import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_KEEP, defaultBackupDir, LEGACY_BACKUP_DIR, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
@@ -486,10 +486,22 @@ function rememberSecret(value: string | undefined, opts: { stdout?: boolean } = 
 }
 
 function rememberSecrets(tree: CanonicalConfig, env: Record<string, string | undefined>): void {
-  mapLeaves(tree, (value) => {
-    for (const m of value.matchAll(/\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g)) rememberSecret(env[m[1]!]);
-    return value;
-  });
+  for (const name of placeholderNames(tree)) rememberSecret(env[name]);
+}
+
+/**
+ * Fail when the tree's placeholders can't all be filled. Without their values
+ * every secret would compare as changed, which reads as drift rather than as
+ * a checkout that can't compare secrets.
+ */
+function assertEnvComplete(tree: CanonicalConfig, env: Record<string, string | undefined>, envFile: string): void {
+  const missing = [...placeholderNames(tree)].filter((name) => env[name] === undefined).sort();
+  if (missing.length === 0) return;
+  const fix = 'pass --dotenv <file>, or set the connection profile\'s dotenv';
+  if (!existsSync(envFile)) {
+    fail(`the tree uses ${missing.length} placeholder(s) but there is no env file at ${envFile}, so secrets can't be compared; ${fix}`, 'env-missing');
+  }
+  fail(`${envFile} has no value for ${missing.join(', ')}, so those secrets can't be compared; add them, or ${fix}`, 'env-incomplete');
 }
 
 for (const stream of [process.stdout, process.stderr]) {
@@ -1499,6 +1511,9 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
 
   const conn = await selectConnection(root, flags);
   const envFile = await envFileFor(root, flags, conn);
+  const tree = await engine.implode({ root });
+  const env = await loadEnv(envFile);
+  assertEnvComplete(tree, env, envFile);
   const treeServerId = (await readMeta(root))?.serverId;
   const { fetched, serverId } = await withClient(conn, async (client, serverId) => {
     // Against another installation every resource would read as a difference.
@@ -1507,10 +1522,9 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
     }
     return { fetched: await client.getServerConfiguration(), serverId };
   }, { envFile, quiet: flags.json });
-  const tree = await engine.implode({ root });
   // Compare like with like: the server's credentials become the placeholders
   // the tree holds. Values that differ from the env file are named, never shown.
-  const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, await loadEnv(envFile));
+  const { config: templatedRemote, envUpdates, notes } = templatize(fetched, tree, env);
   const messages: string[] = [
     ...Object.keys(envUpdates).map((name) => `${name} differs between the server and the env file`),
     ...notes,

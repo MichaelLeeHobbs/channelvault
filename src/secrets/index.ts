@@ -34,6 +34,16 @@ export function hasPlaceholder(value: string): boolean {
   return PLACEHOLDER.test(value);
 }
 
+/** Every placeholder name the config uses. */
+export function placeholderNames(config: CanonicalConfig): Set<string> {
+  const names = new Set<string>();
+  mapLeaves(config, (value) => {
+    for (const m of value.matchAll(PLACEHOLDER)) names.add(m[1]!);
+    return value;
+  });
+  return names;
+}
+
 /** Fill every placeholder in `value`; names with no value are collected in `missing`. */
 function fill(value: string, env: Env, missing: Set<string>): string {
   return value.replace(PLACEHOLDER, (whole, name: string) => {
