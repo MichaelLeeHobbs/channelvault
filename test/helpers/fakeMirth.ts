@@ -92,6 +92,10 @@ export async function startFakeMirth(config: CanonicalConfig): Promise<FakeMirth
         state.config = incoming;
         return json(200, {});
       }
+      if (req.method === 'PUT' && url.pathname === '/api/server/configurationMap') {
+        state.config['configurationMap'] = (JSON.parse(body) as { map: Json }).map;
+        return json(200, {});
+      }
       if (req.method === 'PUT' && url.pathname === '/api/server/globalScripts') {
         state.config['globalScripts'] = (JSON.parse(body) as { map: Json }).map;
         return json(200, { boolean: true });
