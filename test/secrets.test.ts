@@ -355,3 +355,33 @@ describe('placeholderUse', () => {
     expect([...treeOnly]).toEqual(['NEW']);
   });
 });
+
+describe('configuration-map values Mirth answers as booleans or numbers', () => {
+  const P = 'com.mirth.connect.util.ConfigurationProperty';
+  const config = (flag: Json, pin: Json): CanonicalConfig =>
+    ({
+      serverSettings: { smtpPort: 25, smtpAuth: true },
+      configurationMap: { entry: [{ string: 'FLAG', [P]: { value: flag, comment: null } }, { string: 'PIN', [P]: { value: pin, comment: null } }] },
+    }) as never;
+
+  it('templatizes them into the env file as text, leaving other numbers and booleans alone', () => {
+    const { config: out, envUpdates } = templatize(config(true, 1234), null, {});
+    expect(out['configurationMap']).toEqual(config('{{env:CONFIG_MAP__FLAG}}', '{{env:CONFIG_MAP__PIN}}')['configurationMap']);
+    expect(out['serverSettings']).toEqual({ smtpPort: 25, smtpAuth: true });
+    expect(envUpdates).toEqual({ CONFIG_MAP__FLAG: 'true', CONFIG_MAP__PIN: '1234' });
+  });
+
+  it('keeps the placeholder when the server answers with the same value as a boolean or number', () => {
+    const tree = config('{{env:CONFIG_MAP__FLAG}}', '{{env:CONFIG_MAP__PIN}}');
+    const { config: out, envUpdates } = templatize(config(false, 1234), tree, { CONFIG_MAP__FLAG: 'false', CONFIG_MAP__PIN: '1234' });
+    expect(out).toEqual(tree);
+    expect(envUpdates).toEqual({});
+  });
+
+  it('redacts them for display, and counts them as server values', () => {
+    expect(redactKnownSecrets(config(true, 1234))['configurationMap']).toEqual(config('<redacted>', '<redacted>')['configurationMap']);
+    const { compared, treeOnly } = placeholderUse(config('{{env:A}}', '{{env:B}}'), config(true, 0));
+    expect([...compared].sort()).toEqual(['A', 'B']);
+    expect([...treeOnly]).toEqual([]);
+  });
+});

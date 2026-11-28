@@ -138,11 +138,21 @@ export interface Leaf {
   configMapKey?: string;
 }
 
-/** Visit every string leaf, allowing the visitor to replace it. */
+/**
+ * Visit every string leaf, allowing the visitor to replace it. A
+ * configuration-map entry's value is visited as a string whatever its JSON
+ * type: Mirth stores it as text but its JSON answers `true` or `1234` as a
+ * boolean or number. Such a value keeps its type unless the visitor changes it.
+ */
 export function mapLeaves(config: CanonicalConfig, visit: (value: string, leaf: Leaf) => string): CanonicalConfig {
   const walk = (node: Json, key: string, path: Segment[], labels: string[], section: string, cmKey?: string): Json => {
     if (typeof node === 'string') {
       return visit(node, { location: path.join('/'), key, labels, section, configMapKey: cmKey });
+    }
+    if ((typeof node === 'number' || typeof node === 'boolean') && cmKey !== undefined && key === 'value') {
+      const text = String(node);
+      const out = visit(text, { location: path.join('/'), key, labels, section, configMapKey: cmKey });
+      return out === text ? node : out;
     }
     if (Array.isArray(node)) {
       return node.map((el, i) => walk(el, key, [...path.slice(0, -1), `${path[path.length - 1]}${elementSegment(el, i)}`], labels, section, cmKey));
