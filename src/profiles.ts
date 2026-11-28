@@ -182,3 +182,7 @@ export async function setCredential(name: string, password: string): Promise<voi
   await ensureConfigDir();
   await updateEnvFile(credentialsFile(), { [name]: password });
 }
+
+export async function removeCredential(name: string): Promise<void> {
+  if (existsSync(credentialsFile())) await updateEnvFile(credentialsFile(), { [name]: null });
+}
