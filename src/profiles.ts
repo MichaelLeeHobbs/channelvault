@@ -175,7 +175,8 @@ export async function saveProfiles(profiles: Profiles): Promise<void> {
 
 /** Read with the env-file parser, so nothing in the process environment can stand in for a password. */
 export async function readCredentials(): Promise<Record<string, string>> {
-  return readEnvFile(credentialsFile());
+  // Profile names such as `constructor` must not find Object.prototype members.
+  return Object.assign(Object.create(null) as Record<string, string>, await readEnvFile(credentialsFile()));
 }
 
 export async function setCredential(name: string, password: string): Promise<void> {

@@ -15,7 +15,7 @@ All notable changes to `@ubercode/channelvault` are documented here. The format 
 
 ### Changed
 
-- `profile add` and `profile set` refuse a `--dotenv` that git would commit (inside a repository and not ignored); `[profile-invalid]`.
+- `profile add` and `profile set` refuse a `--dotenv` that git would commit (inside a repository and not ignored, including in a folder that doesn't exist yet) or that is a folder; `[profile-invalid]`.
 - The `[profile-exists]` hint names `profile set` and `profile remove` instead of editing `profiles.json`. `diff`'s `[env-missing]`/`[env-incomplete]` hint names `profile set <name> --dotenv`, and a `pull` with a profile that has no `dotenv` into a tree with no `.env` says so and names the same command.
 
 ## [0.3.0-rc.5] — 2026-11-27

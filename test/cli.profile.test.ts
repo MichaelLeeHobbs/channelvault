@@ -348,6 +348,12 @@ describe('profile set and profile remove', () => {
     const add = await atTerminal(['profile', 'add', 'x', '--host', '127.0.0.1', '--port', '1', '--user', 'u', '--no-https', '--dotenv', envInRepo]).finished;
     expect(add.status).toBe(1);
     expect(add.stderr).toContain('git does not ignore');
+    const notYetCreated = await atTerminal(['profile', 'set', 'gov', '--dotenv', path.join(repo, 'secrets', 'gov.env')]).finished;
+    expect(notYetCreated.status).toBe(1);
+    expect(notYetCreated.stderr).toContain('git does not ignore');
+    const folder = await atTerminal(['profile', 'set', 'gov', '--dotenv', dir]).finished;
+    expect(folder.status).toBe(1);
+    expect(folder.stderr).toContain('is a folder');
     expect(await savedProfiles()).toEqual(profiles);
 
     await writeFile(path.join(repo, '.gitignore'), '*.env\n');
@@ -356,18 +362,35 @@ describe('profile set and profile remove', () => {
     expect((await savedProfiles()).gov!.dotenv).toBe(envInRepo);
   });
 
-  it('changes the port only when it reaches the same installation', async () => {
+  it('changes the port only when it reaches the same installation, asking again for the password over plain http', async () => {
     const other = await startFakeMirth({ '@version': '4.5.2', channels: { channel: [] } });
     try {
-      const moved = await atTerminal(['profile', 'set', 'gov', '--port', String(other.port)]).finished;
+      const moving = atTerminal(['profile', 'set', 'gov', '--port', String(other.port)]);
+      await moving.waitFor('Password for u');
+      moving.child.stdin.end(`${PASSWORD}\n`);
+      const moved = await moving.finished;
       expect(moved.status).toBe(1);
       expect(moved.stderr).toContain('[server-mismatch]');
       expect(await savedProfiles()).toEqual(profiles);
+
+      other.serverId = mirth.serverId;
+      const sameInstallation = atTerminal(['profile', 'set', 'gov', '--port', String(other.port)]);
+      await sameInstallation.waitFor('Password for u');
+      sameInstallation.child.stdin.end(`${PASSWORD}\n`);
+      const r = await sameInstallation.finished;
+      expect(r.status, r.stderr).toBe(0);
+      expect((await savedProfiles()).gov).toEqual({ ...profiles.gov, port: other.port });
+      expect(await savedCredentials()).toBe(`gov=${PASSWORD}\n`);
     } finally {
       await other.close();
     }
-    const same = await atTerminal(['profile', 'set', 'gov', '--port', String(mirth.port)]).finished;
+    const same = await atTerminal(['profile', 'set', 'gov', '--port', String(other.port)]).finished;
     expect(same.stdout).toContain('already has those settings');
+  });
+
+  it('finds no profile or password for a name Object.prototype has', async () => {
+    const r = await atTerminal(['profile', 'remove', 'constructor']).finished;
+    expect(r.stderr).toContain('[profile-unknown]');
   });
 
   it('changes the user after logging in with its password, and stores that password', async () => {

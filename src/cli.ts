@@ -12,7 +12,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { cp, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
@@ -534,7 +534,9 @@ function assertEnvComplete(tree: CanonicalConfig, server: CanonicalConfig, env: 
   if (missing.length > 0) {
     const fix = conn.dotenv && samePath(envFile, conn.dotenv)
       ? `set them in profile ${conn.profile}'s env file, or pass --dotenv <file>`
-      : `pass --dotenv <file>, or ${conn.profile ? `give profile ${conn.profile} one at a terminal with \`channelvault profile set ${conn.profile} --dotenv <absolute path>\`` : 'use a connection profile with a dotenv'}`;
+      : conn.dotenv
+        ? `drop --dotenv to use profile ${conn.profile}'s env file ${conn.dotenv}`
+        : `pass --dotenv <file>, or ${conn.profile ? `give profile ${conn.profile} one at a terminal with \`channelvault profile set ${conn.profile} --dotenv <absolute path>\`` : 'use a connection profile with a dotenv'}`;
     const what = `no value for ${missing.join(', ')}, so those secrets can't be compared`;
     if (!existsSync(envFile)) fail(`there is no env file at ${envFile}: ${what}; ${fix}`, 'env-missing');
     fail(`${envFile} has ${what}; add them, or ${fix}`, 'env-incomplete');
@@ -654,7 +656,11 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
  * commit it to.
  */
 function gitWouldCommit(file: string): boolean {
-  const r = spawnSync('git', ['check-ignore', '-q', path.basename(file)], { cwd: path.dirname(file) });
+  // Its folder may not exist yet (a pull creates it); git answers for a missing path from the nearest folder that exists.
+  const target = path.resolve(file);
+  let dir = path.dirname(target);
+  while (!existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+  const r = spawnSync('git', ['check-ignore', '-q', path.relative(dir, target).split(path.sep).join('/')], { cwd: dir });
   return r.status === 1;
 }
 
@@ -1863,7 +1869,9 @@ function existingProfile(profiles: Profiles, name: string): Profile {
 /** The checks `profile add` and `profile set` make before saving `profile` as `name` among `profiles`. */
 function assertProfileValid(profiles: Profiles, name: string, profile: Profile): void {
   const problems = profileProblems({ ...profiles, [name]: profile });
-  if (profile.dotenv && gitWouldCommit(profile.dotenv)) {
+  if (profile.dotenv && existsSync(profile.dotenv) && statSync(profile.dotenv).isDirectory()) {
+    problems.push(`profile ${name}: dotenv ${profile.dotenv} is a folder; name the env file inside it`);
+  } else if (profile.dotenv && gitWouldCommit(profile.dotenv)) {
     problems.push(`profile ${name}: git does not ignore ${profile.dotenv}, which will hold secret values; add it to .gitignore, or choose a file outside every repository`);
   }
   if (problems.length > 0) fail(problems.join('\n'), 'profile-invalid');
@@ -1954,7 +1962,7 @@ profileCommand.command('add')
     profile.serverId = await loginCheck(connectionOfProfile(name, profile, password));
     // Another process may have saved profiles while this one was waiting at the prompts.
     const latest = await loadProfiles();
-    if (latest[name]) fail(`profile ${name} was added meanwhile; nothing was saved`, 'profile-exists');
+    if (Object.hasOwn(latest, name)) fail(`profile ${name} was added meanwhile; nothing was saved`, 'profile-exists');
     await saveProfiles({ ...latest, [name]: profile });
     await setCredential(name, password);
     process.stdout.write(`added profile ${name} (installation ${profile.serverId}); password stored in ${credentialsFile()}\n`);
@@ -2003,8 +2011,10 @@ profileCommand.command('set')
     if (loginNeeded && !profile.serverId) {
       fail(`profile ${name} has no recorded installation to check a new user or port against; remove it and add it again`, 'profile-invalid');
     }
+    // Without certificate checks, anything listening on the new port would receive the stored password.
+    const verifiesServer = updated.https !== false && !updated.insecure;
     let newPassword: string | undefined;
-    if (updated.user !== profile.user) {
+    if (updated.user !== profile.user || (updated.port !== profile.port && !verifiesServer)) {
       newPassword = await askPassword(`Password for ${updated.user}: `);
       await loginCheck(connectionOfProfile(name, updated, newPassword));
     } else if (updated.port !== profile.port) {
@@ -2015,8 +2025,16 @@ profileCommand.command('set')
     const latest = await profilesUnchanged(name, profile);
     assertProfileValid(latest, name, updated);
     await saveProfiles({ ...latest, [name]: updated });
-    if (newPassword !== undefined) await setCredential(name, newPassword);
-    process.stdout.write(`updated profile ${name}: ${changes.join(', ')}\n`);
+    if (newPassword !== undefined) {
+      try {
+        await setCredential(name, newPassword);
+      } catch (err) {
+        await saveProfiles({ ...latest, [name]: profile });
+        throw err;
+      }
+    }
+    process.stdout.write(`updated profile ${name}: ${changes.join(', ')}\n` +
+      (flags.dotenv !== undefined ? `values already in another env file are not moved; move them to ${updated.dotenv} yourself\n` : ''));
   });
 
 profileCommand.command('remove')
@@ -2033,10 +2051,11 @@ profileCommand.command('remove')
     }
     const latest = await profilesUnchanged(name, profile);
     const rest = Object.fromEntries(Object.entries(latest).filter(([n]) => n !== name));
+    const hadPassword = Object.hasOwn(await readCredentials(), name);
     // The password first: a profile left without one shows in `profile list`; a password left without a profile shows nowhere.
     await removeCredential(name);
     await saveProfiles(rest);
-    process.stdout.write(`removed profile ${name} and its password from ${credentialsFile()}\n`);
+    process.stdout.write(`removed profile ${name}${hadPassword ? ` and its password from ${credentialsFile()}` : ''}\n`);
   });
 
 addJsonFlag(profileCommand.command('check')
