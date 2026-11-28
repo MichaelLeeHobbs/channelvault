@@ -2,7 +2,18 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0-rc.5] — 2026-11-27
+
+Release candidate, published under the npm `next` tag.
+
+### Added
+
+- **`push --config-map-key <name>`** (repeatable) pushes named configuration-map keys without `--whole-server` ([#24](https://github.com/MichaelLeeHobbs/channelvault/issues/24)). Alone it pushes only those keys; with `--channel`, `--library` or `--global-scripts` it pushes them too. The plan lists each key, never its value. The push backs up first (the undo includes `--overwrite-config-map`), reads the server's map again right before the save, keeps every other key as the server holds it, saves the keys before any channel, and checks the map afterwards. A named key edited, created or deleted on the server since the last pull is refused unless `--force`; removing a key needs `--allow-deletes`.
+- `pull`, `adopt` and `push --whole-server --overwrite-config-map` record a hash of each configuration-map key per installation in `~/.channelvault/config-map-baselines/` (owner-only, outside the tree; never the value). Without one on this machine a key push is refused until a pull or adopt (or `--force`).
+
+### Changed
+
+- `diff` and a plain scoped `push` compare the configuration map by key: Mirth returns it in its own order, so a key added anywhere but last no longer reads as a difference after it is pushed.
 
 ### Fixed
 
@@ -127,6 +138,7 @@ First release. Tested against Mirth Connect 4.5.2; the offline round trip is als
 - `backup` / `restore`: the server's own configuration XML saved as `.backup/<server>-<UTC time>.xml`, identified by Mirth's server ID, restored with a preview, an undo backup and a version check. `push` backs up first unless `--no-backup`.
 - `diff` exits 0 when the tree matches the server, 1 when it differs, 2 on error.
 
+[0.3.0-rc.5]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.5
 [0.3.0-rc.4]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.4
 [0.3.0-rc.3]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.3
 [0.3.0-rc.2]: https://github.com/MichaelLeeHobbs/channelvault/releases/tag/v0.3.0-rc.2

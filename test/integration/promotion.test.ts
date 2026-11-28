@@ -169,6 +169,54 @@ describe.skipIf(!enabled)('two disposable Mirth 4.5.2 servers', () => {
     expect((await target.getServerConfiguration()).configurationMap).toEqual(before);
   }, 120_000);
 
+  it('pushes named configuration-map keys and leaves the other keys as they were', async () => {
+    const root = path.join(work, 'map-keys');
+    const pulled = await runCli(['pull', root, '--insecure'], env(targetPort));
+    expect(pulled.status, pulled.stderr).toBe(0);
+    const entriesOf = (map: Json | undefined): Obj[] => {
+      const e = (map as Obj | undefined)?.['entry'];
+      return (Array.isArray(e) ? e : e ? [e] : []) as Obj[];
+    };
+    const keyOf = (e: Obj) => String(Array.isArray(e['string']) ? e['string'][0] : e['string']);
+    const before = entriesOf((await target.getServerConfiguration()).configurationMap);
+
+    const file = path.join(root, 'server', 'configuration.json');
+    const config = JSON.parse(await readFile(file, 'utf8'));
+    const treeEntries = entriesOf(config.configurationMap);
+    const baseUrl = treeEntries.find(e => keyOf(e) === 'api.baseUrl')!;
+    const name = /\{\{env:([A-Za-z0-9_]+)\}\}/.exec(String((baseUrl['com.mirth.connect.util.ConfigurationProperty'] as Obj)['value']))![1]!;
+    config.configurationMap.entry = [...treeEntries, {
+      string: 'HL7_TEXT_LEGACY',
+      'com.mirth.connect.util.ConfigurationProperty': { value: '{{env:CONFIG_MAP__HL7_TEXT_LEGACY}}', comment: 'kill switch' },
+    }];
+    await writeFile(file, JSON.stringify(config, null, 2));
+    await updateEnvFile(path.join(root, '.env'), { [name]: 'https://api.example.org/v2', CONFIG_MAP__HL7_TEXT_LEGACY: 'true' });
+
+    const args = ['push', root, '--insecure', '--yes', '--config-map-key', 'api.baseUrl', '--config-map-key', 'HL7_TEXT_LEGACY', '--backup-dir', path.join(work, 'map-key-backups')];
+    const pushed = await runCli(args, env(targetPort));
+    expect(pushed.status, pushed.stdout + pushed.stderr).toBe(0);
+    expect(pushed.stdout).not.toContain('api.example.org/v2');
+
+    const after = entriesOf((await target.getServerConfiguration()).configurationMap);
+    const property = (key: string) => after.find(e => keyOf(e) === key)?.['com.mirth.connect.util.ConfigurationProperty'];
+    expect(property('api.baseUrl')).toMatchObject({ value: 'https://api.example.org/v2' });
+    // Mirth's JSON answers the stored string "true" as a boolean.
+    expect(String((property('HL7_TEXT_LEGACY') as Obj)['value'])).toBe('true');
+    expect(property('HL7_TEXT_LEGACY')).toMatchObject({ comment: 'kill switch' });
+    for (const e of before.filter(e => keyOf(e) !== 'api.baseUrl')) {
+      expect(after.find(a => keyOf(a) === keyOf(e))).toEqual(e);
+    }
+
+    const repeat = await runCli(args, env(targetPort));
+    expect(repeat.status, repeat.stderr).toBe(0);
+    expect(repeat.stdout).toContain('configuration-map keys already as in the tree');
+    // Mirth holds the map in hash order, so the added key reads back elsewhere; a pull takes the server's order.
+    const repulled = await runCli(['pull', root, '--insecure'], env(targetPort));
+    expect(repulled.status, repulled.stderr).toBe(0);
+    const diff = await runCli(['diff', root, '--insecure'], env(targetPort));
+    expect(diff.status, diff.stdout + diff.stderr).toBe(0);
+  }, 120_000);
+
   it('backs up the server and restores it after a channel is deleted', async () => {
     const backupDir = path.join(work, 'source-backups');
     const backedUp = await runCli(['backup', '--insecure', '--backup-dir', backupDir], env(sourcePort));

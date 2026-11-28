@@ -11,6 +11,7 @@
 import { createHash } from 'node:crypto';
 
 import type { CanonicalConfig, Json } from '../types.js';
+import { sameConfigMap } from './configMap.js';
 
 type Obj = Record<string, Json>;
 
@@ -544,7 +545,7 @@ export function planPush(
 
   const notPushed = everything
     ? [...new Set([...Object.keys(local), ...Object.keys(remote)])]
-        .filter((k) => !HANDLED.has(k) && !k.startsWith('@') && !same(local[k], remote[k]))
+        .filter((k) => !HANDLED.has(k) && !k.startsWith('@') && !(k === 'configurationMap' ? sameConfigMap(local, remote) : same(local[k], remote[k])))
         .sort()
     : [];
 

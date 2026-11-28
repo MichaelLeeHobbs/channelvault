@@ -150,6 +150,7 @@ export interface MirthClientExt extends MirthClient {
   putCodeTemplateLibraries(libraries: Record<string, unknown>[]): Promise<void>;
   /** PUT /server/globalScripts, from the `globalScripts` value of a server configuration. */
   putGlobalScripts(globalScripts: unknown): Promise<void>;
+  putConfigurationMap(map: unknown): Promise<void>;
   /** POST /channels/{id}/_deploy; throws if deployment fails. */
   deployChannel(id: string): Promise<void>;
   /** Ids of the channels currently deployed (GET /channels/statuses). */
@@ -415,6 +416,11 @@ class MirthClientImpl implements MirthClientExt {
 
   async putCodeTemplateLibraries(libraries: Record<string, unknown>[]): Promise<void> {
     await this.sendJson('PUT', '/codeTemplateLibraries', { list: { codeTemplateLibrary: libraries } }, { override: true });
+  }
+
+  /** PUT /server/configurationMap: replaces the whole map. */
+  async putConfigurationMap(map: unknown): Promise<void> {
+    await this.sendJson('PUT', '/server/configurationMap', { map });
   }
 
   async putGlobalScripts(globalScripts: unknown): Promise<void> {

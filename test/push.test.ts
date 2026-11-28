@@ -214,7 +214,7 @@ describe('planPush', () => {
   it('names differing sections it does not push', () => {
     const local = server();
     local['channelGroups'] = { channelGroup: { id: 'g1', name: 'Renamed', channels: '' } };
-    local['configurationMap'] = { entry: [] };
+    local['configurationMap'] = { entry: [{ string: 'K', 'com.mirth.connect.util.ConfigurationProperty': { value: 'v', comment: null } }] };
     expect(planPush(local, server()).notPushed).toEqual(['channelGroups', 'configurationMap']);
   });
 

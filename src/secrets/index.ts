@@ -23,7 +23,7 @@ const PLACEHOLDER = /\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}/g;
 const SECRET_KEY = /(password|passwd|passphrase|passcode|secret|token|pw|pwd|(?:api|access|secret|private)[_-]?key)$/i;
 
 /** Mirth's configuration-map entry value holder (XML and live shapes). */
-const CONFIG_PROPERTY = 'com.mirth.connect.util.ConfigurationProperty';
+export const CONFIG_PROPERTY = 'com.mirth.connect.util.ConfigurationProperty';
 
 export function placeholder(name: string): string {
   return `{{env:${name}}}`;
@@ -121,7 +121,7 @@ function elementSegment(el: Json, index: number): Segment {
   return `[${index}]`;
 }
 
-function configMapKeyOf(entry: Record<string, Json>): string | undefined {
+export function configMapKeyOf(entry: Record<string, Json>): string | undefined {
   const key = entry['string'];
   if (typeof key === 'string') return key;
   return Array.isArray(key) && typeof key[0] === 'string' ? key[0] : undefined;

@@ -50,7 +50,23 @@ import {
   type Scope,
 } from './push/index.js';
 import { applyPlan, deployChannels, refreshRevisions } from './push/apply.js';
-import { placeholderNames, placeholderUse, redactKnownSecrets, render, templatize } from './secrets/index.js';
+import {
+  baselineAfterPush,
+  configMapBaseline,
+  configMapMoved,
+  configMapOf,
+  mergeConfigMap,
+  otherDifferingKeys,
+  planConfigMap,
+  sameEntry,
+  UnknownConfigMapKey,
+  withSortedConfigMap,
+  type ConfigMapBaseline,
+  type ConfigMapChange,
+  type ConfigMapPlan,
+} from './push/configMap.js';
+import { readConfigMapBaseline, writeConfigMapBaseline } from './configMapBaselines.js';
+import { configMapKeyOf, placeholderNames, placeholderUse, redactKnownSecrets, render, templatize } from './secrets/index.js';
 import { backupEnvFile, ensureEnvIgnored, readEnvFile, updateEnvFile } from './secrets/envfile.js';
 import { findEchoes, formatFindings, scanSecrets, type AllowEntry } from './secrets/detect.js';
 import { backupName, backupsOf, compareVersions, configuredName, DEFAULT_KEEP, defaultBackupDir, LEGACY_BACKUP_DIR, MANIFEST, numericVersion, originOf, originsIn, saveBackup, writePrivate } from './backup/index.js';
@@ -353,6 +369,20 @@ interface SyncMeta {
   serverId?: string;
 }
 
+/**
+ * Record the server's map for later key pushes. A pull or adopt has done its
+ * job without it (a read-only home, say), so a failure is a note: key pushes
+ * then refuse for want of a baseline.
+ */
+async function recordConfigMapBaseline(serverId: string | undefined, baseline: ConfigMapBaseline): Promise<void> {
+  if (!serverId) return;
+  try {
+    await writeConfigMapBaseline(serverId, baseline);
+  } catch (err) {
+    process.stderr.write(`note: could not record the configuration-map baseline (${err instanceof Error ? err.message : String(err)}); pushing configuration-map keys will need a pull that can\n`);
+  }
+}
+
 /** The tree's channelvault.json; null when it has none. */
 async function readMeta(root: string): Promise<SyncMeta | null> {
   const metaPath = path.join(root, 'channelvault.json');
@@ -601,6 +631,8 @@ async function writeTree(root: string, fetched: CanonicalConfig, source: string,
       await updateEnvFile(stagedEnv, envUpdates);
     }
   });
+  // Only a live pull knows the installation; an XML backup's map may be long stale.
+  await recordConfigMapBaseline(serverId, configMapBaseline(fetched));
   if (scan.findings.length > 0) process.stdout.write(`extracted ${scan.findings.length} secret(s) found in values\n`);
   const updated = Object.keys(envUpdates).length;
   if (updated > 0) process.stdout.write(`stored ${updated} secret value(s) in ${envFile}\n`);
@@ -763,13 +795,22 @@ function printNameChange(incoming: CanonicalConfig, current: CanonicalConfig): v
   if (to !== from) process.stdout.write(`server name changes: ${from || '(none)'} -> ${to || '(none)'}\n`);
 }
 
-function printChanges(plan: Plan): void {
-  const kindLabel: Record<Change['kind'], string> = { channel: 'channel', library: 'library', codeTemplate: 'code template', globalScripts: '' };
+/** A plan as shown and reported: resource changes plus configuration-map keys. */
+type ShownPlan = Omit<Plan, 'changes'> & { changes: Array<Change | ConfigMapChange> };
+
+function withConfigMap(plan: Plan, map: ConfigMapPlan): ShownPlan {
+  return { ...plan, changes: [...map.changes, ...plan.changes], conflicts: [...map.conflicts, ...plan.conflicts] };
+}
+
+function printChanges(plan: ShownPlan): void {
+  const kindLabel: Record<ShownPlan['changes'][number]['kind'], string> = {
+    channel: 'channel', library: 'library', codeTemplate: 'code template', globalScripts: '', configMapKey: 'configuration-map key',
+  };
   for (const c of plan.changes) process.stdout.write(`  ${c.op.padEnd(6)}  ${`${kindLabel[c.kind]} ${c.label}`.trim()}\n`);
 }
 
 /** Refuse conflicts and deletions unless the user opted in. */
-function planProblems(plan: Plan, flags: { allowDeletes?: boolean; force?: boolean }): string[] {
+function planProblems(plan: ShownPlan, flags: { allowDeletes?: boolean; force?: boolean }): string[] {
   const problems: string[] = [];
   if (plan.conflicts.length > 0 && !flags.force) {
     problems.push(
@@ -779,7 +820,7 @@ function planProblems(plan: Plan, flags: { allowDeletes?: boolean; force?: boole
   }
   const deletes = plan.changes.filter((c) => c.op === 'delete').length;
   if (deletes > 0 && !flags.allowDeletes) {
-    problems.push(`the plan deletes ${deletes} resource(s) from the server; pass --allow-deletes, or narrow with --channel/--library`);
+    problems.push(`the plan deletes ${deletes} resource(s) from the server; pass --allow-deletes, or narrow the push`);
   }
   return problems;
 }
@@ -799,7 +840,7 @@ function wholeServerProblems(plan: Plan, flags: { allowDeletes?: boolean; force?
 /** `push --plan-only`: report the plan and what would stop it, change nothing. */
 function reportPlanOnly(
   flags: PushFlags,
-  plan: Plan,
+  plan: ShownPlan,
   problems: string[],
   live: Live,
   extra: { target: string; mode: 'scoped' | 'whole-server' | 'adopt'; redeploy?: string[]; notRedeployed?: string[] },
@@ -838,6 +879,57 @@ interface PushFlags extends ConnectionFlags, BackupFlags, JsonFlags {
   force?: boolean;
   yes?: boolean;
   overwriteConfigMap?: boolean;
+  configMapKey?: string[];
+}
+
+const mapKeyLabel = (key: string): string => `configuration-map key "${key}"`;
+
+/**
+ * Save the named keys: read the map again right before the save, so the other
+ * keys go back as the server holds them and a named key edited since `planned`
+ * is caught, then check what was saved. Mirth offers no conditional save, so
+ * an edit landing between that read and the save can't be caught here.
+ */
+async function pushConfigMapKeys(
+  client: MirthClientExt,
+  local: CanonicalConfig,
+  planned: CanonicalConfig,
+  named: string[],
+  changed: string[],
+  baseline: ConfigMapBaseline | undefined,
+  serverId: string,
+  flags: PushFlags,
+): Promise<void> {
+  const current = await client.getServerConfiguration();
+  const moved = configMapMoved(named, planned, current);
+  if (moved.length > 0 && !flags.force) {
+    fail(`changed on the server just before saving the configuration map: ${moved.map(mapKeyLabel).join(', ')}; nothing was saved. Pull and try again, or pass --force`);
+  }
+  try {
+    await client.putConfigurationMap(mergeConfigMap(current, local, changed));
+  } catch (err) {
+    fail(`saving the configuration map failed; nothing else was pushed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let after: CanonicalConfig;
+  try {
+    after = await client.getServerConfiguration();
+  } catch (err) {
+    fail(`saved the configuration map, but could not read it back to check it: ${err instanceof Error ? err.message : String(err)}. Nothing else was pushed. ${exportBrokenHint(flags)}`);
+  }
+  const tree = new Map(configMapOf(local).map((e) => [configMapKeyOf(e), e] as const));
+  const saved = new Map(configMapOf(after).map((e) => [configMapKeyOf(e), e] as const));
+  const wrong = changed.filter((k) => !sameEntry(tree.get(k), saved.get(k)));
+  if (wrong.length > 0) {
+    fail(`saved the configuration map, but these keys do not read back as the tree has them: ${wrong.join(', ')}. Nothing else was pushed. Review the server; the undo command above restores the whole server as it was before this push`);
+  }
+  // Most likely someone saving the map at the same time: undoing would discard their edit too.
+  const others = otherDifferingKeys(current, after, changed);
+  if (others.length > 0) {
+    fail(`saved the named configuration-map keys, but other keys changed at the same time (probably a concurrent edit): ${others.join(', ')}. Nothing else was pushed. Review them on the server before pushing again`);
+  }
+  const next = baselineAfterPush(baseline, after, changed);
+  if (next) await recordConfigMapBaseline(serverId, next);
+  process.stdout.write(`saved ${changed.length} configuration-map key(s): ${changed.join(', ')}\n`);
 }
 
 async function scopedPush(
@@ -852,7 +944,18 @@ async function scopedPush(
   const remote = await client.getServerConfiguration();
   const known = await readKnown(root);
   const plan = planPush(local, remote, scope, known);
-  const problems = [...await bindingProblems(root, live.serverId), ...planProblems(plan, flags), ...await xmlProblems(root, local)];
+  const mapKeys = flags.configMapKey ?? [];
+  const mapBaseline = mapKeys.length > 0 ? await readConfigMapBaseline(live.serverId) : undefined;
+  let mapPlan: ConfigMapPlan = { changes: [], conflicts: [], unchanged: [] };
+  try {
+    if (mapKeys.length > 0) mapPlan = planConfigMap(local, remote, mapKeys, mapBaseline);
+  } catch (err) {
+    if (err instanceof UnknownConfigMapKey) fail(err.message, 'config-map-key-unknown');
+    throw err;
+  }
+  const mapChanged = mapPlan.changes.map((c) => c.id);
+  const shown = withConfigMap(plan, mapPlan);
+  const problems = [...await bindingProblems(root, live.serverId), ...planProblems(shown, flags), ...await xmlProblems(root, local)];
   const names = new Map(
     [...channelsOf(remote), ...channelsOf(local)].map((c) => [String(c['id']), String(c['name'])] as const),
   );
@@ -866,31 +969,37 @@ async function scopedPush(
 
   if (flags.planOnly && flags.json) {
     const redeploy = flags.deploy ? { redeploy: toDeploy.map(nameOf), notRedeployed: notDeployed.map(nameOf) } : {};
-    reportPlanOnly(flags, plan, problems, live, { target, mode: 'scoped', ...redeploy });
+    reportPlanOnly(flags, shown, problems, live, { target, mode: 'scoped', ...redeploy });
     return;
   }
-  if (plan.changes.length === 0) {
+  if (shown.changes.length === 0) {
     process.stdout.write(`nothing to push: ${target} already matches the tree\n`);
   } else {
     process.stdout.write(`Push to ${target}:\n`);
-    printChanges(plan);
+    printChanges(shown);
     if (toDeploy.length > 0) process.stdout.write(`then redeploy: ${toDeploy.map(nameOf).join(', ')}\n`);
     if (notDeployed.length > 0) {
       process.stdout.write(`not redeployed (not deployed on the server now): ${notDeployed.map(nameOf).join(', ')}\n`);
     }
   }
   if (plan.notPushed.length > 0) {
-    process.stdout.write(`not pushed (differs; use --whole-server): ${plan.notPushed.join(', ')}\n`);
+    const mapHint = plan.notPushed.includes('configurationMap') ? ', or --config-map-key for named configuration-map keys' : '';
+    process.stdout.write(`not pushed (differs; use --whole-server${mapHint}): ${plan.notPushed.join(', ')}\n`);
+  }
+  if (mapPlan.unchanged.length > 0) process.stdout.write(`configuration-map keys already as in the tree: ${mapPlan.unchanged.join(', ')}\n`);
+  if (mapKeys.length > 0) {
+    const others = otherDifferingKeys(local, remote, mapKeys);
+    if (others.length > 0) process.stdout.write(`other configuration-map keys differ (not pushed): ${others.join(', ')}\n`);
   }
   if (plan.serverOnly.length > 0) {
     process.stdout.write(`left alone (created on the server since the last pull; pull to get them): ${plan.serverOnly.join(', ')}\n`);
   }
   if (flags.planOnly) {
-    reportPlanOnly(flags, plan, problems, live, { target, mode: 'scoped' });
+    reportPlanOnly(flags, shown, problems, live, { target, mode: 'scoped' });
     return;
   }
   if (problems.length > 0) fail(problems.join('\n'));
-  if (plan.changes.length === 0) return;
+  if (shown.changes.length === 0) return;
   if (!flags.yes && !(await confirm('Continue?'))) {
     process.stdout.write('aborted.\n');
     return;
@@ -901,19 +1010,22 @@ async function scopedPush(
   // revision once more; the gap after that last check can't be closed from
   // here, because Mirth accepts a stale revision.
   const fresh = await client.getServerConfiguration();
-  const moved = changedSince(plan, remote, fresh);
+  const moved = [...configMapMoved(mapKeys, remote, fresh).map(mapKeyLabel), ...changedSince(plan, remote, fresh)];
   if (moved.length > 0 && !flags.force) {
     fail(`changed on the server while this push was being confirmed:\n  ${moved.join('\n  ')}\npull and try again, or pass --force`);
   }
   // Apply against the fresh snapshot, so whatever is sent for resources
   // outside the plan (the rest of the library list) is the server's latest.
-  await backupBeforePush(client, live.conn, flags);
+  // The undo has to put the map back too.
+  await backupBeforePush(client, live.conn, { ...flags, overwriteConfigMap: mapChanged.length > 0 });
   const afterBackup = await client.getServerConfiguration();
-  const changedDuringBackup = changedSince(plan, fresh, afterBackup);
+  const changedDuringBackup = [...configMapMoved(mapKeys, fresh, afterBackup).map(mapKeyLabel), ...changedSince(plan, fresh, afterBackup)];
   if (!flags.force && changedDuringBackup.length) {
     fail(`changed on the server during backup: ${changedDuringBackup.join(', ')}; pull and try again`);
   }
   await assertBinding(client, root);
+  // Before the resources: a channel saved or redeployed by this push may read the new key.
+  if (mapChanged.length > 0) await pushConfigMapKeys(client, local, afterBackup, mapKeys, mapChanged, mapBaseline, live.serverId, flags);
   const result = await applyPlan(client, plan, local, afterBackup, scope, { force: flags.force === true });
   // Record the server's new revisions even after a partial failure, so the
   // resources that did go through don't read as conflicts next time. The
@@ -956,13 +1068,13 @@ async function scopedPush(
   if (result.failed) {
     if (baselineError) process.stderr.write(`warning: could not refresh the local sync baseline: ${scrub(baselineError)}\n`);
     const { change, error } = result.failed;
-    fail(`applied ${result.applied.length} of ${plan.changes.length}; ${change.op} ${change.label} failed: ${error}${againNote}${notRedeployed}`);
+    fail(`applied ${result.applied.length + mapChanged.length} of ${shown.changes.length}; ${change.op} ${change.label} failed: ${error}${againNote}${notRedeployed}`);
   }
   // Someone else's edit landed on a pushed resource; a redeploy would put it live unreviewed.
   if (changedAgain.length > 0) {
-    fail(`applied ${result.applied.length} change(s), but these changed again after saving: ${changedAgain.join(', ')}; pull and review before retrying${notRedeployed}${baselineError ? `\n${baselineError}` : ''}`);
+    fail(`applied ${result.applied.length + mapChanged.length} change(s), but these changed again after saving: ${changedAgain.join(', ')}; pull and review before retrying${notRedeployed}${baselineError ? `\n${baselineError}` : ''}`);
   }
-  process.stdout.write(`pushed ${result.applied.length} change(s)\n`);
+  process.stdout.write(`pushed ${result.applied.length + mapChanged.length} change(s)\n`);
 
   if (toDeploy.length > 0) {
     const { deployed, skipped, failures } = await deployChannels(client, toDeploy, nameOf);
@@ -973,7 +1085,7 @@ async function scopedPush(
   }
   if (baselineError) {
     const note = unverified.length > 0 ? `\nnot checked after saving (these cannot be read one at a time): ${unverified.join(', ')}` : '';
-    fail(`pushed ${result.applied.length} change(s), but could not refresh the local sync baseline: ${baselineError}${note}`);
+    fail(`pushed ${result.applied.length + mapChanged.length} change(s), but could not refresh the local sync baseline: ${baselineError}${note}`);
   }
   printCommitHint(root);
 }
@@ -1116,6 +1228,7 @@ async function wholeServerPush(
   const ids = resourceIds(local);
   await refreshRevisions(root, after, new Set([...Object.keys(ids.channels), ...Object.keys(ids.libraries), ...Object.keys(ids.codeTemplates)]));
   if (known) await writeKnown(root, resourceIds(after));
+  if (flags.overwriteConfigMap) await recordConfigMapBaseline(live.serverId, configMapBaseline(after));
   process.stdout.write(`pushed ${root} -> ${target}\n`);
   printCommitHint(root);
 }
@@ -1235,6 +1348,7 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
       await engine.explode(rebased.config, { root: next });
       await writeMeta(next, target, rebased.config, previous, serverId, adopted.known);
     });
+    await recordConfigMapBaseline(serverId, configMapBaseline(remote));
     process.stdout.write(`adopted installation ${serverId}; review with push --plan-only before writing the server\n`);
   }, { envFile, quiet: flags.json });
 });
@@ -1247,6 +1361,7 @@ addBackupDirFlags(addEnvFlag(addConnectionFlags(
     .option('--channel <name>', 'only this channel (name or id); repeatable', collect)
     .option('--library <name>', 'only this code template library (name or id); repeatable', collect)
     .option('--global-scripts', 'with --channel/--library: also push global scripts')
+    .option('--config-map-key <name>', 'push this configuration-map key (alone: only the named keys); repeatable', collect)
     .option('--allow-deletes', 'delete server resources that are missing from the tree', false)
     .option('--deploy', 'redeploy the changed channels and the channels using changed code templates', false)
     .option('--force', "push even if the server changed since the last pull (overwrites the server's version)", false)
@@ -1273,8 +1388,8 @@ addBackupDirFlags(addEnvFlag(addConnectionFlags(
       ignoreOrigin?: boolean;
     },
   ) => {
-    if (flags.wholeServer && (flags.channel || flags.library || flags.globalScripts)) {
-      fail('--whole-server replaces everything; it cannot be combined with --channel, --library or --global-scripts');
+    if (flags.wholeServer && (flags.channel || flags.library || flags.globalScripts || flags.configMapKey)) {
+      fail('--whole-server replaces everything; it cannot be combined with --channel, --library, --global-scripts or --config-map-key');
     }
     if (flags.overwriteConfigMap && !flags.wholeServer) fail('--overwrite-config-map needs --whole-server');
     const root = path.resolve(dir);
@@ -1293,7 +1408,10 @@ addBackupDirFlags(addEnvFlag(addConnectionFlags(
       await withClient(conn, (client, serverId) => wholeServerPush(client, root, config, target, flags, { conn, serverId, envFile }), { envFile, quiet });
       return;
     }
-    const scope: Scope = { channels: flags.channel, libraries: flags.library, globalScripts: flags.globalScripts };
+    const keysOnly = flags.configMapKey !== undefined && !flags.channel && !flags.library && !flags.globalScripts;
+    const scope: Scope = keysOnly
+      ? { channels: [], libraries: [] }
+      : { channels: flags.channel, libraries: flags.library, globalScripts: flags.globalScripts };
     await withClient(conn, (client, serverId) => scopedPush(client, root, config, scope, target, flags, { conn, serverId, envFile }), { envFile, quiet });
   },
 );
@@ -1547,8 +1665,8 @@ addJsonFlag(addEnvFlag(addConnectionFlags(
   if (staleRevisions.length > 0) {
     messages.push(`${staleRevisions.length} resource(s) have a newer revision on the server; pull to update the tree's baseline, or adopt it when the content already matches`);
   }
-  const treeView = scanSecrets(redactKnownSecrets(normalizeEolDeep(withoutVolatile(tree))), { mode: 'redact', allow });
-  const serverView = scanSecrets(redactKnownSecrets(normalizeEolDeep(withoutVolatile(templatedRemote))), { mode: 'redact', allow });
+  const treeView = scanSecrets(redactKnownSecrets(normalizeEolDeep(withSortedConfigMap(withoutVolatile(tree)))), { mode: 'redact', allow });
+  const serverView = scanSecrets(redactKnownSecrets(normalizeEolDeep(withSortedConfigMap(withoutVolatile(templatedRemote)))), { mode: 'redact', allow });
   if (treeView.findings.length > 0) {
     messages.push(`the tree holds ${treeView.findings.length} unextracted secret(s), redacted below; pull --extract-secrets`);
   }

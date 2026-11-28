@@ -508,7 +508,7 @@ describe('CLI confirmation', () => {
     [[], 'configuration map differs but is kept'],
     [['--overwrite-config-map'], 'also replaced: configurationMap'],
   ])('says whether a whole-server push replaces the configuration map (%j)', async (flags, expected) => {
-    mirth.config['configurationMap'] = { entry: [] };
+    mirth.config['configurationMap'] = { entry: [{ string: 'K', 'com.mirth.connect.util.ConfigurationProperty': { value: 'v', comment: null } }] };
     const running = startCli(pushArgs('--whole-server', ...flags), env, true);
     try {
       await running.waitFor('Continue?');
