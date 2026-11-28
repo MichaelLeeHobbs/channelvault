@@ -385,3 +385,13 @@ describe('configuration-map values Mirth answers as booleans or numbers', () => 
     expect([...treeOnly]).toEqual([]);
   });
 });
+
+describe('configuration-map keys Mirth answers as numbers or booleans', () => {
+  it('still makes the value a placeholder and redacts it', () => {
+    const P = 'com.mirth.connect.util.ConfigurationProperty';
+    const config = { configurationMap: { entry: [{ string: 8443, [P]: { value: 'hunter2-secret', comment: null } }, { string: [true], [P]: { value: 'other-secret', comment: null } }] } } as never;
+    const { envUpdates } = templatize(config, null, {});
+    expect(envUpdates).toEqual({ CONFIG_MAP__8443: 'hunter2-secret', CONFIG_MAP__TRUE: 'other-secret' });
+    expect(JSON.stringify(redactKnownSecrets(config))).not.toMatch(/hunter2-secret|other-secret/);
+  });
+});

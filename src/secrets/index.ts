@@ -121,10 +121,11 @@ function elementSegment(el: Json, index: number): Segment {
   return `[${index}]`;
 }
 
+/** Mirth's JSON answers a key such as `8443` or `true` as a number or boolean, like a value. */
 export function configMapKeyOf(entry: Record<string, Json>): string | undefined {
-  const key = entry['string'];
-  if (typeof key === 'string') return key;
-  return Array.isArray(key) && typeof key[0] === 'string' ? key[0] : undefined;
+  const raw = entry['string'];
+  const key = Array.isArray(raw) ? raw[0] : raw;
+  return typeof key === 'string' || typeof key === 'number' || typeof key === 'boolean' ? String(key) : undefined;
 }
 
 export interface Leaf {

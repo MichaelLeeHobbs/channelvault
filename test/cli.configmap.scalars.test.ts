@@ -13,13 +13,13 @@ import { startFakeMirth, type FakeMirth } from './helpers/fakeMirth.js';
 
 type Obj = Record<string, Json>;
 const PROPERTY = 'com.mirth.connect.util.ConfigurationProperty';
-const entry = (key: string, value: Json): Obj => ({ string: key, [PROPERTY]: { value, comment: null } });
+const entry = (key: Json, value: Json): Obj => ({ string: key, [PROPERTY]: { value, comment: null } });
 
 function fixture(): CanonicalConfig {
   return {
     '@version': '4.5.2',
     channels: { channel: [{ id: 'c1', name: 'Alpha', revision: 1, deployScript: 'return;', exportData: { metadata: { enabled: true } } }] },
-    configurationMap: { entry: [entry('FEATURE_ON', true), entry('PIN', 918273), entry('TEXT', 'plain-text-value')] },
+    configurationMap: { entry: [entry('FEATURE_ON', true), entry('PIN', 918273), entry('TEXT', 'plain-text-value'), entry(8443, 'numeric-key-secret')] },
   };
 }
 
@@ -60,7 +60,12 @@ describe('configuration-map values that are not JSON strings', () => {
     const entries = await treeMap();
     expect(valueOf(entries, 'FEATURE_ON')).toBe('{{env:CONFIG_MAP__FEATURE_ON}}');
     expect(valueOf(entries, 'PIN')).toBe('{{env:CONFIG_MAP__PIN}}');
-    for (const file of treeFiles(tree)) expect(readFileSync(file, 'utf8'), file).not.toContain('918273');
+    expect(entries.find((e) => e['string'] === 8443)?.[PROPERTY]).toMatchObject({ value: '{{env:CONFIG_MAP__8443}}' });
+    for (const file of treeFiles(tree)) {
+      const text = readFileSync(file, 'utf8');
+      expect(text, file).not.toContain('918273');
+      expect(text, file).not.toContain('numeric-key-secret');
+    }
     expect(await readEnvFile(path.join(tree, '.env'))).toMatchObject({ CONFIG_MAP__FEATURE_ON: 'true', CONFIG_MAP__PIN: '918273' });
 
     const result = await diff();
@@ -75,9 +80,19 @@ describe('configuration-map values that are not JSON strings', () => {
     await writeFile(configFile(), JSON.stringify(config, null, 2));
 
     const result = await diff();
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stdout).toContain('<redacted>');
     for (const literal of ['192837', '564738', '918273']) {
       expect(result.stdout + result.stderr).not.toContain(literal);
     }
+  });
+
+  it('pushes a key that Mirth answers as a number', async () => {
+    await updateEnvFile(path.join(tree, '.env'), { CONFIG_MAP__8443: 'rotated-numeric-key-secret' });
+    const pushed = await runCli(['push', tree, '--no-https', '--backup-dir', path.join(dir, 'backups'), '--config-map-key', '8443', '--yes'], env);
+    expect(pushed.status, pushed.stderr).toBe(0);
+    expect((serverMap().find((e) => String(e['string']) === '8443')![PROPERTY] as Obj)['value']).toBe('rotated-numeric-key-secret');
+    expect(pushed.stdout + pushed.stderr).not.toContain('numeric-key-secret');
   });
 
   it('leaves diff clean after a key push that Mirth reads back as a boolean', async () => {

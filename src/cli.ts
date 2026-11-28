@@ -508,9 +508,10 @@ const knownSecrets = new Set<string>();
 const everywhereSecrets = new Set<string>();
 
 function rememberSecret(value: string | undefined, opts: { stdout?: boolean } = {}): void {
-  // Shorter values (a port, "true") would redact ordinary words in error text;
-  // on every line, so would a short password ("admin" in "administrator").
-  if (value === undefined || value.length < 4) return;
+  // Shorter values (a short port) and the flags a configuration map holds
+  // would redact ordinary words in error text; on every line, so would a short
+  // password ("admin" in "administrator").
+  if (value === undefined || value.length < 4 || /^(true|false)$/i.test(value)) return;
   knownSecrets.add(value);
   if (opts.stdout && value.length >= 8) everywhereSecrets.add(value);
 }
