@@ -211,7 +211,7 @@ An agent can safely edit a tree and check its work. Pushing, restoring and anyth
 - Edit the `.js` and `.json` files; leave `id`, `revision`, `channelvault.json` and the `{"@file": …}` / `{"@ref": …}` markers alone. A new channel or template needs its own new UUID for `id`; a copied directory keeps the old one.
 - Mirth runs these scripts in Rhino, not Node: no `async`/`await`, optional chaining (`?.`), classes, `require`, `import` or shorthand object properties (`{ status }`; write `{ status: status }`). `let`, `const` and arrow functions work.
 - `{{env:NAME}}` is a placeholder for a secret kept outside git. Never replace one with a real value, and never read, print or copy `.env`, `.secrets/`, `.backup/`, `~/.channelvault/credentials`, a profile's env file or `~/.channelvault/backups/`.
-- channelvault finds the server itself: the tree's `channelvault.json` names its installation, and the matching connection profile supplies the login. Don't pass `--host`, `--pass` or `--insecure`, and don't set `MIRTH_*` variables. If a command fails with a reason code such as `[no-connection]`, `[no-password]`, `[env-missing]`, `[env-incomplete]` or `[tls-pin-mismatch]`, stop and tell a person; only they can add a profile, set its password or repin its certificate.
+- channelvault finds the server itself: the tree's `channelvault.json` names its installation, and the matching connection profile supplies the login. Don't pass `--host`, `--pass` or `--insecure`, and don't set `MIRTH_*` variables. If a command fails with a reason code such as `[no-connection]`, `[no-password]`, `[env-missing]`, `[env-incomplete]` or `[tls-pin-mismatch]`, stop and tell a person; only they can add, change or remove a profile, set its password or repin its certificate.
 - Check your work with `channelvault diff mirth --json` (exit 0: matches the server, 1: differs) and `channelvault push mirth --plan-only --json`, which shows what a push would change and `wouldStop` reasons.
 - Do not run `channelvault push` (other than with `--plan-only`), `restore` or `pull`, and never pass `--force`, `--allow-deletes` or `--yes`. Summarise the plan and let a person push.
 ```
@@ -225,7 +225,9 @@ If the agent is Claude Code, back those instructions with deny rules in the repo
       "Read(~/.channelvault/credentials)",
       "Edit(~/.channelvault/**)",
       "Bash(channelvault profile add:*)",
+      "Bash(channelvault profile set:*)",
       "Bash(channelvault profile set-password:*)",
+      "Bash(channelvault profile remove:*)",
       "Bash(channelvault profile repin:*)",
       "Bash(channelvault restore:*)"
     ]
@@ -233,7 +235,7 @@ If the agent is Claude Code, back those instructions with deny rules in the repo
 }
 ```
 
-`profile add`, `set-password` and `repin` refuse to run without a terminal anyway; the deny rules stop an agent from trying to drive them another way.
+`profile add`, `set`, `set-password`, `remove` and `repin` refuse to run without a terminal anyway; the deny rules stop an agent from trying to drive them another way.
 
 ## Local test server
 
