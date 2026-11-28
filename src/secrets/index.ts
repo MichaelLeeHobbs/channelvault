@@ -34,7 +34,6 @@ export function hasPlaceholder(value: string): boolean {
   return PLACEHOLDER.test(value);
 }
 
-/** Every placeholder name the config uses. */
 export function placeholderNames(config: CanonicalConfig): Set<string> {
   const names = new Set<string>();
   mapLeaves(config, (value) => {
@@ -42,6 +41,27 @@ export function placeholderNames(config: CanonicalConfig): Set<string> {
     return value;
   });
   return names;
+}
+
+/**
+ * Placeholder names split by whether `server` holds a value at the same
+ * location. Only `compared` names take part in a comparison with the server;
+ * the rest belong to resources the server doesn't have yet.
+ */
+export function placeholderUse(tree: CanonicalConfig, server: CanonicalConfig): { compared: Set<string>; treeOnly: Set<string> } {
+  const onServer = new Set<string>();
+  mapLeaves(server, (value, leaf) => {
+    onServer.add(leaf.location);
+    return value;
+  });
+  const compared = new Set<string>();
+  const treeOnly = new Set<string>();
+  mapLeaves(tree, (value, leaf) => {
+    for (const m of value.matchAll(PLACEHOLDER)) (onServer.has(leaf.location) ? compared : treeOnly).add(m[1]!);
+    return value;
+  });
+  for (const name of compared) treeOnly.delete(name);
+  return { compared, treeOnly };
 }
 
 /** Fill every placeholder in `value`; names with no value are collected in `missing`. */

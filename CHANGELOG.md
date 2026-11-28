@@ -6,7 +6,7 @@ All notable changes to `@ubercode/channelvault` are documented here. The format 
 
 ### Fixed
 
-- **`diff` no longer reports every secret as drifted when the checkout has no env file.** When the tree's placeholders can't all be filled from the env file or the environment, `diff` exits 2 (was 1) before connecting: `[env-missing]` names the env file it looked for, `[env-incomplete]` names the variables an existing env file lacks, and both suggest `--dotenv` or a profile `dotenv`. A scheduled drift check now reads "can't compare secrets" instead of "differences found" ([#26](https://github.com/MichaelLeeHobbs/channelvault/issues/26)).
+- **`diff` no longer reports every secret as drifted when the checkout has no env file.** When a placeholder compared with the server can't be filled from the env file or the environment, `diff` exits 2 (was 1): `[env-missing]` names the env file it looked for, `[env-incomplete]` names the variables an existing env file lacks, and both suggest `--dotenv` or a profile `dotenv`. Placeholders used only by resources the server doesn't have yet are named in a note and don't stop the diff. A scheduled drift check now reads "can't compare secrets" instead of "differences found" ([#26](https://github.com/MichaelLeeHobbs/channelvault/issues/26)).
 
 ## [0.3.0-rc.4] — 2026-11-27
 

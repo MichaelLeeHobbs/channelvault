@@ -2,7 +2,7 @@
  * Differences between servers that are representation, not content: what a
  * tree pulled from one installation must not report against another.
  */
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -118,8 +118,7 @@ describe('diff without the values behind the tree\'s placeholders', () => {
     expect(JSON.parse(diff.stdout)).toMatchObject({ clean: true, secretDrift: [] });
   });
 
-  // A missing env file used to report every secret as drift (exit 1).
-  it('exits 2 with [env-missing], naming the file it looked for, when there is no env file', async () => {
+  it('exits 2 with [env-missing], naming the file it looked for, instead of reporting every secret as drift', async () => {
     await rm(path.join(secretTree, '.env'));
     const diff = await run('diff', secretTree, '--json');
     expect(diff.status).toBe(2);
@@ -136,6 +135,24 @@ describe('diff without the values behind the tree\'s placeholders', () => {
     expect(diff.stderr).toContain('[env-incomplete]');
     expect(diff.stderr).toContain('ALPHA__PASSWORD');
     expect(diff.stderr).not.toContain('hunter2-secret');
+  });
+
+  // An agent adds a channel with a placeholder; a person fills in its value later.
+  it('still diffs a new channel whose placeholder has no value yet', async () => {
+    const channelDir = path.join(secretTree, 'channels', 'Alpha');
+    const newDir = path.join(secretTree, 'channels', 'Beta');
+    await cp(channelDir, newDir, { recursive: true });
+    const file = path.join(newDir, 'channel.json');
+    const channel = JSON.parse(await readFile(file, 'utf8')) as Obj;
+    Object.assign(channel, { id: 'c2', name: 'Beta', password: '{{env:BETA__PASSWORD}}' });
+    await writeFile(file, JSON.stringify(channel, null, 2));
+
+    const diff = await run('diff', secretTree, '--json');
+    expect(diff.status, diff.stderr).toBe(1);
+    const result = JSON.parse(diff.stdout) as { files: Array<{ change: string }>; secretDrift: string[]; notes: string[] };
+    expect(result.files.some((f) => f.change === 'only-in-tree')).toBe(true);
+    expect(result.secretDrift).toEqual([]);
+    expect(result.notes.join('\n')).toContain('no value yet for BETA__PASSWORD');
   });
 
   it('accepts values supplied by the process environment instead of a file', async () => {
