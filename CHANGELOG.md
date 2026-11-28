@@ -2,6 +2,12 @@
 
 All notable changes to `@ubercode/channelvault` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Configuration-map values that Mirth returns as booleans or numbers are now secrets too** ([#30](https://github.com/MichaelLeeHobbs/channelvault/issues/30)). Mirth's JSON answers a stored value such as `true` or `1234` as a JSON boolean or number, and `pull` used to write those into `server/configuration.json` as literals, so a numeric PIN or password landed in git. A key Mirth answers as a number or boolean (`8443`) had the same problem for its value, whatever that value's type, and could not be named in `push --config-map-key`. They now become `{{env:CONFIG_MAP__…}}` placeholders with the value in the env file, `diff` redacts them, and a key push followed by `diff` is clean without a re-pull. Re-pull a tree pulled before this change to move such values out of it, and check your git history for any that were committed.
+
 ## [0.3.0-rc.5] — 2026-11-27
 
 Release candidate, published under the npm `next` tag.
